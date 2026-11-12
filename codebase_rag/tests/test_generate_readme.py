@@ -1,0 +1,373 @@
+from __future__ import annotations
+
+import http.client
+from pathlib import Path
+
+import pytest
+
+from codebase_rag import cli_help as ch
+from codebase_rag import readme_sections
+from codebase_rag.readme_sections import format_cli_commands_table, format_latest_news
+from scripts import generate_readme
+from scripts.generate_readme import (
+    PROJECT_ROOT,
+    SECTION_PATTERN,
+    TARGET_FILES,
+    marked_sections,
+    replace_sections,
+    unconsumed_sections,
+    update_file,
+)
+
+
+class TestReplaceSections:
+    def test_replaces_marked_section(self) -> None:
+        content = "<!-- SECTION:foo -->\nold\n<!-- /SECTION:foo -->"
+        result = replace_sections(content, {"foo": "new"})
+        assert "new" in result
+        assert "old" not in result
+
+    def test_ignores_unknown_section(self) -> None:
+        content = "<!-- SECTION:foo -->\nold\n<!-- /SECTION:foo -->"
+        result = replace_sections(content, {"bar": "new"})
+        assert result == content
+
+
+class TestDocsTargets:
+    def test_docs_pages_are_generated(self) -> None:
+        assert "README.md" in TARGET_FILES
+        assert "docs/architecture/language-support.md" in TARGET_FILES
+        assert "docs/guide/mcp-server.md" in TARGET_FILES
+
+    def test_update_file_rewrites_sections(self, tmp_path: Path) -> None:
+        page = tmp_path / "page.md"
+        page.write_text(
+            "<!-- SECTION:mcp_tools -->\nstale\n<!-- /SECTION:mcp_tools -->",
+            encoding="utf-8",
+        )
+        assert update_file(page, {"mcp_tools": "fresh"}) is True
+        updated = page.read_text(encoding="utf-8")
+        assert "fresh" in updated
+        assert "stale" not in updated
+
+    def test_update_file_skips_write_when_unchanged(self, tmp_path: Path) -> None:
+        page = tmp_path / "page.md"
+        page.write_text(
+            "<!-- SECTION:mcp_tools -->\nfresh\n<!-- /SECTION:mcp_tools -->",
+            encoding="utf-8",
+        )
+        page.chmod(0o444)
+        try:
+            assert update_file(page, {"mcp_tools": "fresh"}) is False
+        finally:
+            page.chmod(0o644)
+
+
+class TestLatestNews:
+    def test_renders_top_n_bullets(self, tmp_path: Path) -> None:
+        news = tmp_path / "NEWS.md"
+        news.write_text(
+            "# News\n\n"
+            "- **A**: first.\n"
+            "- **B**: second.\n"
+            "- **C**: third.\n"
+            "- **D**: fourth.\n",
+            encoding="utf-8",
+        )
+        result = format_latest_news(news, limit=3)
+        assert result == "- **A**: first.\n- **B**: second.\n- **C**: third."
+
+    def test_takes_all_when_fewer_than_limit(self, tmp_path: Path) -> None:
+        news = tmp_path / "NEWS.md"
+        news.write_text("- **A**: only one.\n", encoding="utf-8")
+        assert format_latest_news(news, limit=3) == "- **A**: only one."
+
+    def test_joins_wrapped_continuation_lines(self, tmp_path: Path) -> None:
+        news = tmp_path / "NEWS.md"
+        news.write_text(
+            "- **A**: line one\n  wrapped line two.\n- **B**: second.\n",
+            encoding="utf-8",
+        )
+        assert (
+            format_latest_news(news, limit=1)
+            == "- **A**: line one\n  wrapped line two."
+        )
+
+    def test_blank_line_ends_bullet_and_drops_trailing_prose(
+        self, tmp_path: Path
+    ) -> None:
+        news = tmp_path / "NEWS.md"
+        news.write_text(
+            "# News\n\n- **A**: only entry.\n\nSee CHANGELOG for more.\n",
+            encoding="utf-8",
+        )
+        assert format_latest_news(news, limit=3) == "- **A**: only entry."
+
+    def test_missing_file_returns_empty(self, tmp_path: Path) -> None:
+        assert format_latest_news(tmp_path / "nope.md") == ""
+
+    def test_marker_renders_every_latest_release_entry(self, tmp_path: Path) -> None:
+        # v0.0.720 shipped five highlights but the README showed only three;
+        # the latest-release marker must lift the cap for the marked block.
+        news = tmp_path / "NEWS.md"
+        news.write_text(
+            "# News\n\n"
+            "- **A**: first.\n"
+            "- **B**: second.\n"
+            "- **C**: third.\n"
+            "- **D**: fourth.\n"
+            "- **E**: fifth.\n"
+            "<!-- latest-release-end -->\n"
+            "- **F**: older release.\n",
+            encoding="utf-8",
+        )
+        result = format_latest_news(news, limit=3)
+        assert result == (
+            "- **A**: first.\n"
+            "- **B**: second.\n"
+            "- **C**: third.\n"
+            "- **D**: fourth.\n"
+            "- **E**: fifth."
+        )
+        assert "latest-release-end" not in result
+
+    def test_marker_is_not_swallowed_as_continuation_line(self, tmp_path: Path) -> None:
+        # The marker follows a bullet with no blank line between them; it must
+        # terminate that bullet, not be absorbed as wrapped continuation text.
+        news = tmp_path / "NEWS.md"
+        news.write_text(
+            "- **A**: line one\n  wrapped line two.\n"
+            "<!-- latest-release-end -->\n"
+            "- **B**: older.\n",
+            encoding="utf-8",
+        )
+        assert format_latest_news(news, limit=3) == (
+            "- **A**: line one\n  wrapped line two."
+        )
+
+    def test_only_the_first_marker_counts(self, tmp_path: Path) -> None:
+        # NEWS.md accumulates a marker per release; only the newest block is
+        # the latest release, so a second marker lower down changes nothing.
+        news = tmp_path / "NEWS.md"
+        news.write_text(
+            "- **A**: newest.\n"
+            "<!-- latest-release-end -->\n"
+            "- **B**: older.\n"
+            "<!-- latest-release-end -->\n"
+            "- **C**: oldest.\n",
+            encoding="utf-8",
+        )
+        assert format_latest_news(news, limit=3) == "- **A**: newest."
+
+    def test_a_blank_line_before_the_marker_still_closes_the_entry(
+        self, tmp_path: Path
+    ) -> None:
+        # The blank line closes the bullet first, so the marker arrives with
+        # nothing open and must still record the count.
+        news = tmp_path / "NEWS.md"
+        news.write_text(
+            "- **A**: x\n  cont.\n\n<!-- latest-release-end -->\n- **B**: older.\n",
+            encoding="utf-8",
+        )
+        assert format_latest_news(news, limit=3) == "- **A**: x\n  cont."
+        # The marker must count the entry the blank line already closed: a
+        # count of 0 falls back to `limit`, which at 3 would also render the
+        # older release's entry. So the limit=3 assertion above is the
+        # discriminating one, not decoration.
+
+    def test_an_empty_file_renders_nothing(self, tmp_path: Path) -> None:
+        news = tmp_path / "NEWS.md"
+        news.write_text("", encoding="utf-8")
+        assert format_latest_news(news, limit=3) == ""
+
+    def test_a_file_with_no_bullets_renders_nothing(self, tmp_path: Path) -> None:
+        news = tmp_path / "NEWS.md"
+        news.write_text("# News\n\nJust prose, no entries.\n", encoding="utf-8")
+        assert format_latest_news(news, limit=3) == ""
+
+    def test_an_indented_marker_is_recognised(self, tmp_path: Path) -> None:
+        # The marker is matched on the STRIPPED line, so indentation does not
+        # turn it into continuation text of the bullet above.
+        news = tmp_path / "NEWS.md"
+        news.write_text(
+            "- **A**: x.\n  <!-- latest-release-end -->\n- **B**: older.\n",
+            encoding="utf-8",
+        )
+        assert format_latest_news(news, limit=3) == "- **A**: x."
+
+    def test_a_zero_limit_renders_nothing_without_a_marker(
+        self, tmp_path: Path
+    ) -> None:
+        # `count = marker_count if marker_count else limit` is falsy-tested,
+        # so limit=0 yields no entries rather than every entry.
+        news = tmp_path / "NEWS.md"
+        news.write_text("- **A**: x.\n- **B**: y.\n", encoding="utf-8")
+        assert format_latest_news(news, limit=0) == ""
+
+    def test_a_blank_line_between_bullets_does_not_stop_collection(
+        self, tmp_path: Path
+    ) -> None:
+        news = tmp_path / "NEWS.md"
+        news.write_text("- **A**: x.\n\n- **B**: y.\n", encoding="utf-8")
+        assert format_latest_news(news, limit=5) == "- **A**: x.\n- **B**: y."
+
+    def test_marker_without_entries_above_falls_back_to_limit(
+        self, tmp_path: Path
+    ) -> None:
+        news = tmp_path / "NEWS.md"
+        news.write_text(
+            "# News\n\n"
+            "<!-- latest-release-end -->\n"
+            "- **A**: first.\n"
+            "- **B**: second.\n"
+            "- **C**: third.\n"
+            "- **D**: fourth.\n",
+            encoding="utf-8",
+        )
+        result = format_latest_news(news, limit=3)
+        assert result == "- **A**: first.\n- **B**: second.\n- **C**: third."
+
+
+def test_cli_command_table_has_one_markdown_row_per_command() -> None:
+    lines = format_cli_commands_table().splitlines()
+
+    assert len(lines) == len(ch.CLI_COMMANDS) + 2
+    assert all(line.startswith("|") and line.endswith("|") for line in lines)
+
+
+class TestEveryGeneratedSectionReachesAMarker:
+    """Issue #1929: four generated sections were computed on every run and
+    discarded, because no target file carried their marker."""
+
+    def test_every_generated_section_has_a_marker_in_some_target_file(self) -> None:
+        from codebase_rag.readme_sections import generate_all_sections
+
+        # The expected side is what the FILES carry, scanned independently
+        # of the generator, so the assertion cannot be satisfied by the
+        # generator's own dict.
+        found: set[str] = set()
+        for relative_path in TARGET_FILES:
+            content = (PROJECT_ROOT / relative_path).read_text(encoding="utf-8")
+            found |= {m.group(2) for m in SECTION_PATTERN.finditer(content)}
+        generated = set(generate_all_sections(PROJECT_ROOT))
+        assert generated - found == set()
+        # And the scan is not vacuous: the four that were missing are there.
+        assert {
+            "node_schemas",
+            "relationship_schemas",
+            "cli_commands",
+            "makefile_commands",
+        } <= found
+
+    def test_an_unconsumed_section_is_named(self, tmp_path: Path) -> None:
+        page = tmp_path / "page.md"
+        page.write_text(
+            "<!-- SECTION:foo -->\nx\n<!-- /SECTION:foo -->", encoding="utf-8"
+        )
+        assert marked_sections(page.read_text(encoding="utf-8")) == {"foo"}
+        assert unconsumed_sections({"foo": "a", "bar": "b"}, [page]) == ["bar"]
+        assert unconsumed_sections({"foo": "a"}, [page]) == []
+
+    def test_main_fails_on_an_unconsumed_section(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        page = tmp_path / "page.md"
+        page.write_text(
+            "<!-- SECTION:foo -->\nold\n<!-- /SECTION:foo -->", encoding="utf-8"
+        )
+        monkeypatch.setattr(generate_readme, "PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(generate_readme, "TARGET_FILES", ("page.md",))
+        monkeypatch.setattr(
+            "codebase_rag.readme_sections.generate_all_sections",
+            lambda _root: {"foo": "new", "orphan": "dropped"},
+        )
+        with pytest.raises(SystemExit) as raised:
+            generate_readme.main()
+        assert raised.value.code == 1
+        # The consumed section was still written before the failure.
+        assert "new" in page.read_text(encoding="utf-8")
+
+
+class TestDependencySummaryFallback:
+    """An unreachable PyPI must not blank the committed summaries: the
+    Windows unit-test job reported installation.md as stale when its
+    per-package fetches timed out (seen on #2311)."""
+
+    @pytest.fixture(autouse=True)
+    def _no_cache_file(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(readme_sections, "_load_pypi_cache", dict)
+        monkeypatch.setattr(readme_sections, "_save_pypi_cache", lambda _cache: None)
+
+    def test_committed_summaries_are_parsed_from_the_doc(self, tmp_path: Path) -> None:
+        doc = tmp_path / "installation.md"
+        doc.write_text(
+            "- **cmake** (required for building)\n"
+            "- **loguru**: Python logging made (stupidly) simple\n"
+            "- **typer**: Build great CLIs\n",
+            encoding="utf-8",
+        )
+        assert readme_sections.committed_dependency_summaries(doc) == {
+            "loguru": "Python logging made (stupidly) simple",
+            "typer": "Build great CLIs",
+        }
+
+    def test_a_missing_doc_has_no_summaries(self, tmp_path: Path) -> None:
+        missing = tmp_path / "absent.md"
+        assert readme_sections.committed_dependency_summaries(missing) == {}
+
+    def test_a_failed_fetch_keeps_the_committed_summary(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            readme_sections, "fetch_pypi_summary", lambda _name, _cache: ""
+        )
+        rendered = readme_sections.format_dependencies(
+            ["loguru", "typer"], {"loguru": "Python logging"}
+        )
+        assert rendered == "- **loguru**: Python logging\n- **typer**"
+
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            http.client.IncompleteRead(b"{", 114996),
+            ConnectionResetError("reset by peer"),
+        ],
+        ids=["truncated_body", "connection_reset"],
+    )
+    def test_a_broken_response_counts_as_a_failed_fetch(
+        self, monkeypatch: pytest.MonkeyPatch, failure: Exception
+    ) -> None:
+        # A Windows CI job got a body cut short by PyPI, and the raise
+        # escaped the generator instead of falling back to the committed
+        # summary.
+        def broken(url: str, timeout: float) -> None:
+            raise failure
+
+        monkeypatch.setattr(readme_sections.urllib.request, "urlopen", broken)
+        assert readme_sections.fetch_pypi_summary("loguru", {}) == ""
+
+    def test_a_fetched_summary_wins_over_the_committed_one(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            readme_sections, "fetch_pypi_summary", lambda _name, _cache: "Fresh"
+        )
+        rendered = readme_sections.format_dependencies(["loguru"], {"loguru": "Old"})
+        assert rendered == "- **loguru**: Fresh"
+
+    def test_the_committed_doc_regenerates_offline(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # With every fetch failing, the section rebuilt from the committed
+        # summaries is exactly the committed section.
+        monkeypatch.setattr(
+            readme_sections, "fetch_pypi_summary", lambda _name, _cache: ""
+        )
+        committed = (PROJECT_ROOT / readme_sections.DEPENDENCIES_DOC).read_text(
+            encoding="utf-8"
+        )
+        sections = readme_sections.generate_all_sections(PROJECT_ROOT)
+        assert (
+            replace_sections(committed, {"dependencies": sections["dependencies"]})
+            == committed
+        )

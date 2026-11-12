@@ -1,0 +1,374 @@
+from __future__ import annotations
+
+import asyncio
+import re
+from pathlib import Path
+from typing import TYPE_CHECKING, Protocol
+
+from loguru import logger
+from pydantic_ai import (
+    Agent,
+    DeferredToolRequests,
+    DeferredToolResults,
+    Tool,
+    ToolDenied,
+)
+from pydantic_ai.agent import AgentRetries, AgentRunResult
+from pydantic_ai.exceptions import ModelAPIError
+
+from .. import constants as cs
+from .. import exceptions as ex
+from .. import logs as ls
+from ..config import ModelConfig, load_cgr_instructions, settings
+from ..prompts import (
+    build_cypher_repair_request,
+    build_cypher_system_prompt,
+    build_local_cypher_system_prompt,
+    build_rag_orchestrator_prompt,
+    build_research_agent_prompt,
+)
+from ..providers.base import get_provider_from_config
+from .cypher_guard import is_allowed_procedure, mask_literals_and_comments
+
+if TYPE_CHECKING:
+    from pydantic_ai.models import Model
+
+
+def _create_provider_model(config: ModelConfig) -> Model:
+    provider = get_provider_from_config(config)
+    return provider.create_model(config.model_id)
+
+
+def _fenced_block(query: str) -> str | None:
+    """The query inside a ``` fence, or None if there is no complete fence.
+
+    An opening fence with no closing one leaves fewer than three parts; that is
+    not a fence, so the caller keeps the text as it stands rather than treating
+    the remainder as code.
+    """
+    parts = query.split(cs.CYPHER_FENCE)
+    if len(parts) < 3:
+        return None
+    block = parts[1]
+    if block.lower().startswith(cs.CYPHER_PREFIX):
+        block = block[len(cs.CYPHER_PREFIX) :]
+    return block.strip()
+
+
+def _strip_bold_spans(query: str) -> str:
+    """Drop `**...**` labels, and the `:` that usually follows one."""
+    while cs.CYPHER_BOLD in query:
+        start = query.index(cs.CYPHER_BOLD)
+        end = query.find(cs.CYPHER_BOLD, start + len(cs.CYPHER_BOLD))
+        if end == -1:
+            break
+        after = end + len(cs.CYPHER_BOLD)
+        if after < len(query) and query[after] == cs.CYPHER_COLON:
+            after += 1
+        query = query[:start] + query[after:].lstrip()
+    return query
+
+
+def _strip_markdown(query: str) -> str:
+    """Remove the decoration an unfenced response carries.
+
+    Order matters: the leading-`cypher` check runs on the text left after the
+    bold spans go, so `**Q:** cypher MATCH ...` loses both.
+    """
+    query = _strip_bold_spans(query)
+    query = query.replace(cs.CYPHER_BACKTICK, "")
+    if query.lower().startswith(cs.CYPHER_PREFIX):
+        query = query[len(cs.CYPHER_PREFIX) :].strip()
+    return query
+
+
+def _clean_cypher_response(response_text: str) -> str:
+    query = response_text.strip()
+
+    if cs.CYPHER_FENCE in query:
+        # `is not None`, never `or`: an empty fence yields "", which is a
+        # successful extraction and must not fall back to the raw text.
+        block = _fenced_block(query)
+        query = query if block is None else block
+    else:
+        query = _strip_markdown(query)
+
+    if not query.endswith(cs.CYPHER_SEMICOLON):
+        query += cs.CYPHER_SEMICOLON
+    return query
+
+
+_COMMENT_OR_WS = r"(?:\s|//[^\n]*|/\*.*?\*/)+"
+
+
+def _build_keyword_pattern(keyword: str) -> re.Pattern[str]:
+    parts = keyword.split()
+    if len(parts) == 1:
+        return re.compile(rf"\b{re.escape(parts[0])}\b")
+    joined = _COMMENT_OR_WS.join(re.escape(p) for p in parts)
+    return re.compile(rf"\b{joined}\b", re.DOTALL)
+
+
+_CYPHER_DANGEROUS_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
+    (kw, _build_keyword_pattern(kw)) for kw in cs.CYPHER_DANGEROUS_KEYWORDS
+]
+
+
+# A relationship bracket (`-[...]`) holding a variable-length `*`; group 1
+# is everything after the first `*`, which may carry a properties map after
+# the bounds (`*1..3 {w: 1}`), so only its leading bounds are inspected.
+_VARLEN_PATTERN = re.compile(r"-\s*\[[^\]*]*\*([^\]]*)\]")
+_VARLEN_BOUNDS = re.compile(r"\s*(\d*)\s*(\.\.\s*(\d*))?")
+# Runs on masked text, where comments are spaces and backtick identifiers
+# are bare, so `CALL /*x*/ `mg.x`()` is seen as `CALL mg.x()`. Whitespace
+# around the dots is legal Cypher and removed before the allowlist check.
+_PROCEDURE_CALL_PATTERN = re.compile(r"\bCALL\s+(\w+(?:\s*\.\s*\w+)*)", re.IGNORECASE)
+_WHITESPACE = re.compile(r"\s+")
+
+
+def _validate_cypher_read_only(query: str) -> None:
+    upper_query = mask_literals_and_comments(query).upper()
+    for keyword, pattern in _CYPHER_DANGEROUS_PATTERNS:
+        if pattern.search(upper_query):
+            raise ex.LLMGenerationError(
+                ex.LLM_DANGEROUS_QUERY.format(keyword=keyword, query=query)
+            )
+
+
+def _validate_no_unbounded_paths(query: str) -> None:
+    # Masked text, so a `*` inside a string literal is never read as the
+    # operator. A bare `*`, an open range (`*1..`, `*..`) or a `*` followed
+    # only by a properties map (`*{w: 1}`) is unbounded; a lone hop count
+    # (`*5`) or a range with an upper bound (`*1..3`, `*..3`) is not.
+    for match in _VARLEN_PATTERN.finditer(mask_literals_and_comments(query)):
+        bounds = _VARLEN_BOUNDS.match(match.group(1))
+        if bounds is None or not (
+            bounds.group(3) if bounds.group(2) else bounds.group(1)
+        ):
+            raise ex.LLMGenerationError(ex.LLM_UNBOUNDED_PATH.format(query=query))
+
+
+def _validate_call_procedures(query: str) -> None:
+    for match in _PROCEDURE_CALL_PATTERN.finditer(mask_literals_and_comments(query)):
+        name = _WHITESPACE.sub("", match.group(1))
+        if not is_allowed_procedure(name):
+            raise ex.LLMGenerationError(
+                ex.LLM_DISALLOWED_PROCEDURE.format(name=name, query=query)
+            )
+
+
+class CypherAgent(Protocol):
+    """The one call CypherGenerator makes on its agent, so a wrapper can
+    stand in for it (the agentic QA eval meters its token spend)."""
+
+    async def run(self, user_prompt: str) -> AgentRunResult[str]: ...
+
+
+class CypherGenerator:
+    __slots__ = ("agent",)
+
+    def __init__(self, active_projects: list[str] | None = None) -> None:
+        """Build the Cypher agent, scoped to the given projects if any."""
+        try:
+            config = settings.active_cypher_config
+            llm = _create_provider_model(config)
+
+            system_prompt = (
+                build_local_cypher_system_prompt(active_projects)
+                if config.provider == cs.Provider.OLLAMA
+                else build_cypher_system_prompt(active_projects)
+            )
+
+            self.agent: CypherAgent = Agent(
+                model=llm,
+                system_prompt=system_prompt,
+                output_type=str,
+                retries=settings.AGENT_RETRIES,
+            )
+        except Exception as e:
+            raise ex.LLMGenerationError(ex.LLM_INIT_CYPHER.format(error=e)) from e
+
+    async def generate(self, natural_language_query: str) -> str:
+        """Translate a natural-language question into a read-only Cypher query."""
+        logger.info(ls.CYPHER_GENERATING.format(query=natural_language_query))
+        try:
+            result = await self.agent.run(natural_language_query)
+            if (
+                not isinstance(result.output, str)
+                or cs.CYPHER_MATCH_KEYWORD not in result.output.upper()
+            ):
+                raise ex.LLMGenerationError(
+                    ex.LLM_INVALID_QUERY.format(output=result.output)
+                )
+
+            query = _clean_cypher_response(result.output)
+            _validate_cypher_read_only(query)
+            _validate_no_unbounded_paths(query)
+            _validate_call_procedures(query)
+            logger.info(ls.CYPHER_GENERATED.format(query=query))
+            return query
+        except ModelAPIError as e:
+            # The request never got an answer: the provider was unreachable,
+            # refused the key, or has no such model. Nothing was translated,
+            # so this is the same refusal as a model that could not be built
+            # (issue #2518), not a translation that went wrong.
+            logger.error(ls.CYPHER_ERROR.format(error=e))
+            raise ex.CypherModelUnavailableError(
+                ex.LLM_CYPHER_UNAVAILABLE.format(error=e)
+            ) from e
+        except Exception as e:
+            logger.error(ls.CYPHER_ERROR.format(error=e))
+            raise ex.LLMGenerationError(ex.LLM_GENERATION_FAILED.format(error=e)) from e
+
+    async def repair(
+        self, natural_language_query: str, failed_query: str, error: str
+    ) -> str:
+        """Ask for a new query after the database rejected `failed_query`."""
+        return await self.generate(
+            build_cypher_repair_request(natural_language_query, failed_query, error)
+        )
+
+
+class CypherQueryGenerator(Protocol):
+    """What the graph-query tool needs from a generator, so the MCP server
+    can hand it one that builds its model on first use."""
+
+    async def generate(self, natural_language_query: str) -> str: ...
+
+    async def repair(
+        self, natural_language_query: str, failed_query: str, error: str
+    ) -> str: ...
+
+
+class LazyCypherGenerator:
+    """A CypherGenerator built on the first query instead of up front.
+
+    Only natural-language queries need the Cypher model; the MCP server's
+    indexing and deterministic tools do not, and building the model at
+    start-up let an unreachable provider stop the whole server (issue
+    #2518). A failed build is not kept, so a provider started later is
+    picked up on the next query without a restart.
+    """
+
+    __slots__ = ("_active_projects", "_generator")
+
+    def __init__(self, active_projects: list[str] | None = None) -> None:
+        self._active_projects = active_projects
+        self._generator: CypherGenerator | None = None
+
+    async def generate(self, natural_language_query: str) -> str:
+        if self._generator is None:
+            try:
+                # Building probes the provider over the network (Ollama's
+                # health check), which must not stall the server's event loop.
+                self._generator = await asyncio.to_thread(
+                    CypherGenerator, active_projects=self._active_projects
+                )
+            except ex.LLMGenerationError as e:
+                raise ex.CypherModelUnavailableError(
+                    ex.LLM_CYPHER_UNAVAILABLE.format(error=e)
+                ) from e
+        return await self._generator.generate(natural_language_query)
+
+    async def repair(
+        self, natural_language_query: str, failed_query: str, error: str
+    ) -> str:
+        return await self.generate(
+            build_cypher_repair_request(natural_language_query, failed_query, error)
+        )
+
+
+def create_research_agent(tools: list[Tool]) -> Agent:
+    """Build the leaf research sub-agent, the trust boundary for external web
+    content (issue #1128).
+
+    This agent holds ONLY the external-content tools it is handed: no
+    repository reads, no shell, so a poisoned page has no repository tool to
+    steer. Its transcript never reaches the orchestrator; only the final
+    summary crosses back, wrapped as data by the research tool.
+    """
+    try:
+        config = settings.active_orchestrator_config
+        llm = _create_provider_model(config)
+        return Agent(
+            model=llm,
+            system_prompt=build_research_agent_prompt(),
+            tools=tools,
+            retries=settings.AGENT_RETRIES,
+            output_type=str,
+        )
+    except Exception as e:
+        raise ex.LLMGenerationError(ex.LLM_INIT_RESEARCH.format(error=e)) from e
+
+
+async def run_to_text_answer(
+    agent: Agent[None, str | DeferredToolRequests],
+    prompt: str,
+    *,
+    approve: bool,
+    denial: str,
+) -> str:
+    """Run `agent` until it answers in text, settling every approval request
+    without an operator: all approved, or all denied with `denial`, which the
+    model reads as the tool's result and can answer around.
+
+    Only the chat loop can ask the user. A run that stopped at the first
+    `DeferredToolRequests` handed its repr back as the answer, with nothing
+    applied and nothing to say so (issue #2657).
+    """
+    result = await agent.run(prompt, message_history=[])
+    output = result.output
+    rounds = 0
+    while isinstance(output, DeferredToolRequests):
+        if rounds == cs.NONINTERACTIVE_APPROVAL_ROUNDS:
+            raise RuntimeError(cs.NONINTERACTIVE_APPROVAL_LOOP.format(rounds=rounds))
+        rounds += 1
+        settled = DeferredToolResults()
+        for call in output.approvals:
+            settled.approvals[call.tool_call_id] = (
+                True if approve else ToolDenied(denial)
+            )
+        result = await agent.run(
+            message_history=result.all_messages(), deferred_tool_results=settled
+        )
+        output = result.output
+    return output
+
+
+def create_rag_orchestrator(
+    tools: list[Tool[None]],
+    project_root: Path | None = None,
+    load_instructions: bool = True,
+    active_projects: list[str] | None = None,
+    backend: str | None = None,
+) -> tuple[Agent[None, str | DeferredToolRequests], str]:
+    """Build the main agent and return it with its system prompt."""
+    try:
+        config = settings.active_orchestrator_config
+        llm = _create_provider_model(config)
+
+        project_instructions = (
+            load_cgr_instructions(project_root) if load_instructions else None
+        )
+        system_prompt = build_rag_orchestrator_prompt(
+            tools,
+            project_instructions=project_instructions,
+            active_projects=active_projects,
+            backend=backend,
+        )
+
+        # Specialised explicitly: the checker cannot infer the output type
+        # from a list of output types.
+        agent = Agent[None, str | DeferredToolRequests](
+            model=llm,
+            system_prompt=system_prompt,
+            tools=tools,
+            retries=AgentRetries(
+                tools=settings.AGENT_RETRIES,
+                output=settings.ORCHESTRATOR_OUTPUT_RETRIES,
+            ),
+            output_type=[str, DeferredToolRequests],
+        )
+        return agent, system_prompt
+    except Exception as e:
+        raise ex.LLMGenerationError(ex.LLM_INIT_ORCHESTRATOR.format(error=e)) from e

@@ -1,0 +1,63 @@
+# Ports publish on loopback by default: Memgraph Bolt, Memgraph Lab, and
+# Qdrant are unauthenticated unless credentials are set (see `environment`
+# below), so a bare "host:container" mapping (which Docker binds to 0.0.0.0)
+# puts the whole code graph on the local network (issue #1012). Set
+# CGR_STACK_BIND_HOST=0.0.0.0 to expose the stack deliberately.
+services:
+  memgraph:
+    # Pinned by digest: engine upgrades change accepted Cypher syntax (issue
+    # #1257, Memgraph 3.x dropped pattern-in-WHERE), and memgraph-mage has no
+    # patch-level tags, so even `3.3` can float to a rebuilt image. Bump
+    # deliberately and run the integration suite against the new digest.
+    image: memgraph/memgraph-mage:3.7@sha256:91ab47cfee0eb0fa87d04bbd5b0352ef46374eef7dc4dbe676dbeec7d2facc72
+    # Memgraph reports the host's CPU and memory and the graph's vertex and
+    # edge counts to its vendor by default; a local index of private code
+    # stays local (issue #2675). Delete this line to share them.
+    command: ["--telemetry-enabled=false"]
+    ports:
+      - "${CGR_STACK_BIND_HOST:-127.0.0.1}:${MEMGRAPH_PORT:-7687}:7687"
+      - "${CGR_STACK_BIND_HOST:-127.0.0.1}:${MEMGRAPH_HTTP_PORT:-7444}:7444"
+    volumes:
+      - memgraph_data:/var/lib/memgraph
+      - memgraph_log:/var/log/memgraph
+    # Listed without values, so each is set only when the environment
+    # `docker compose` runs in provides it; `cgr daemon up` fills them from
+    # MEMGRAPH_USERNAME and MEMGRAPH_PASSWORD. Memgraph creates this user on
+    # its next start and requires it from then on, even if the variables are
+    # later unset, and never changes an existing user's password from them.
+    environment:
+      - MEMGRAPH_USER
+      - MEMGRAPH_PASSWORD
+  lab:
+    # Pinned like Memgraph: an untagged image resolves to whatever `:latest`
+    # is on the day of the first pull, so two machines on one cgr version
+    # ran different servers, and resolving the tag needs a Docker Hub
+    # manifest request the pull rate limit can refuse (issue #2409).
+    # Dependabot proposes bumps.
+    image: memgraph/lab:3.14.1@sha256:ac7369540cdf39a40167d55279cbee52952c117df75f0c083612ab3663210442
+    ports:
+      - "${CGR_STACK_BIND_HOST:-127.0.0.1}:${LAB_PORT:-3000}:3000"
+    environment:
+      QUICK_CONNECT_MG_HOST: memgraph
+  qdrant:
+    # Pinned for the reason Memgraph is: a new Qdrant (storage format, API,
+    # auth) must not reach users untested, and a volume written by a newer
+    # server may not open after a downgrade (issue #2409). Bump deliberately
+    # and run the integration suite against the new digest.
+    image: qdrant/qdrant:v1.20.0@sha256:9bfc89f9914fc14876a88c05270685921a55b8877b254a98bcc1cc2f0a424cd2
+    ports:
+      - "${CGR_STACK_BIND_HOST:-127.0.0.1}:${QDRANT_HTTP_PORT:-6333}:6333"
+      - "${CGR_STACK_BIND_HOST:-127.0.0.1}:${QDRANT_GRPC_PORT:-6334}:6334"
+    volumes:
+      - qdrant_storage:/qdrant/storage
+    # Filled from QDRANT_API_KEY by `cgr daemon up`; unset leaves Qdrant open.
+    # Qdrant reports usage to telemetry.qdrant.io by default (issue #2675);
+    # set QDRANT__TELEMETRY_DISABLED=false to share it.
+    environment:
+      - QDRANT__SERVICE__API_KEY
+      - QDRANT__TELEMETRY_DISABLED=true
+
+volumes:
+  qdrant_storage:
+  memgraph_data:
+  memgraph_log:

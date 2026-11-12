@@ -1,0 +1,607 @@
+# Python tree-sitter node types and language constants.
+
+# Python tree-sitter node types for type inference
+TS_PY_IDENTIFIER = "identifier"
+TS_PY_TYPED_PARAMETER = "typed_parameter"
+TS_PY_TYPED_DEFAULT_PARAMETER = "typed_default_parameter"
+TS_PY_ATTRIBUTE = "attribute"
+TS_PY_FIELD_ATTRIBUTE = "attribute"
+TS_PY_CALL = "call"
+TS_PY_LIST = "list"
+TS_PY_DICTIONARY = "dictionary"
+TS_PY_PAIR = "pair"
+TS_PY_SET = "set"
+TS_PY_TUPLE = "tuple"
+TS_PY_PARENTHESIZED_EXPRESSION = "parenthesized_expression"
+TS_PY_EXPRESSION_LIST = "expression_list"
+TS_PY_LIST_COMPREHENSION = "list_comprehension"
+TS_PY_SET_COMPREHENSION = "set_comprehension"
+TS_PY_DICTIONARY_COMPREHENSION = "dictionary_comprehension"
+TS_PY_GENERATOR_EXPRESSION = "generator_expression"
+TS_PY_FOR_STATEMENT = "for_statement"
+TS_PY_FOR_IN_CLAUSE = "for_in_clause"
+TS_PY_ASSIGNMENT = "assignment"
+# Unpacking targets: `a, b = ...`, `(a, b) = ...`, `[a, b] = ...`.
+TS_PY_PATTERN_LIST = "pattern_list"
+TS_PY_TUPLE_PATTERN = "tuple_pattern"
+TS_PY_LIST_PATTERN = "list_pattern"
+PY_UNPACKING_TARGET_TYPES = frozenset(
+    {TS_PY_PATTERN_LIST, TS_PY_TUPLE_PATTERN, TS_PY_LIST_PATTERN}
+)
+PY_ASSIGNMENT_QUERY = "(assignment) @assignment"
+PY_RETURN_QUERY = "(return_statement) @return_stmt"
+TS_PY_CLASS_DEFINITION = "class_definition"
+TS_PY_BLOCK = "block"
+TS_PY_FUNCTION_DEFINITION = "function_definition"
+TS_PY_LAMBDA = "lambda"
+TS_PY_RETURN_STATEMENT = "return_statement"
+TS_PY_RETURN = "return"
+TS_PY_KEYWORD = "keyword"
+TS_PY_MODULE = "module"
+TS_PY_IMPORT_STATEMENT = "import_statement"
+TS_PY_IMPORT_FROM_STATEMENT = "import_from_statement"
+TS_PY_WITH_STATEMENT = "with_statement"
+TS_PY_AS_PATTERN = "as_pattern"
+TS_PY_AS_PATTERN_TARGET = "as_pattern_target"
+# The keyword child of an `async with` (and of `async for` / `async def`).
+TS_PY_ASYNC = "async"
+# What a with statement calls on its context manager, whose result its `as`
+# target is bound to: `with` calls `__enter__`, `async with` awaits `__aenter__`.
+PY_DUNDER_ENTER = "__enter__"
+PY_DUNDER_AENTER = "__aenter__"
+# ...and what it calls when the block is left, however it is left.
+PY_DUNDER_EXIT = "__exit__"
+PY_DUNDER_AEXIT = "__aexit__"
+# `name` then, on the same line and statement, an `=`: a plain, annotated,
+# chained, unpacking or walrus assignment to it (and some comparisons and
+# keyword arguments, harmlessly). `{name}` is the escaped name.
+PY_ASSIGNED_NAME_PATTERN = r"\b{name}\b[^=\n;]*="
+# The `if TYPE_CHECKING:` guard (bare or `typing.`-qualified): its body is
+# read by type checkers only and binds nothing at runtime.
+PY_TYPE_CHECKING = "TYPE_CHECKING"
+TS_PY_EXPRESSION_STATEMENT = "expression_statement"
+TS_PY_STRING = "string"
+TS_PY_INTERPOLATION = "interpolation"
+TS_PY_DECORATED_DEFINITION = "decorated_definition"
+TS_PY_DECORATOR = "decorator"
+TS_PY_KEYWORD_ARGUMENT = "keyword_argument"
+TS_PY_LIST_SPLAT = "list_splat"
+TS_PY_DICTIONARY_SPLAT = "dictionary_splat"
+TS_PY_DEFAULT_PARAMETER = "default_parameter"
+TS_PY_LIST_SPLAT_PATTERN = "list_splat_pattern"
+# `from __future__ import annotations` (PEP 563) keeps every annotation in
+# its module as a string that never runs.
+TS_PY_FUTURE_IMPORT_STATEMENT = "future_import_statement"
+PY_FUTURE_ANNOTATIONS = "annotations"
+# The literal sequence values an unpacking assignment pairs its targets with
+# by position (`a, b = x, y`, `(a, b) = (x, y)`, `[a, b] = [x, y]`).
+PY_UNPACKING_VALUE_TYPES = frozenset({"expression_list", "tuple", "list"})
+TS_PY_DICTIONARY_SPLAT_PATTERN = "dictionary_splat_pattern"
+TS_PY_POSITIONAL_SEPARATOR = "positional_separator"
+TS_PY_KEYWORD_SEPARATOR = "keyword_separator"
+# A definition's parameter list node, and the splats an argument list can
+# carry (`f(*args)`, `f(**opts)`); the `_pattern` forms above are the
+# definition-side spellings.
+TS_PY_PARAMETERS = "parameters"
+TS_PY_LAMBDA_PARAMETERS = "lambda_parameters"
+TS_PY_LIST_SPLAT = "list_splat"
+TS_PY_DICTIONARY_SPLAT = "dictionary_splat"
+# Scopes nested in a function body, where a parameter's name may be re-bound
+# rather than read, and the statements that re-bind a name in place.
+TS_PY_SET_COMPREHENSION = "set_comprehension"
+TS_PY_DICTIONARY_COMPREHENSION = "dictionary_comprehension"
+TS_PY_GENERATOR_EXPRESSION = "generator_expression"
+TS_PY_NONLOCAL_STATEMENT = "nonlocal_statement"
+# `typing` names a literal-versus-annotation check understands.
+PY_TYPING_OPTIONAL = "Optional"
+PY_TYPING_UNION = "Union"
+# The first parameter of a method that names the instance or class; a
+# signature change keeps it in place and never remaps it.
+PY_RECEIVER_NAMES = frozenset({"self", "cls"})
+# A method reached through the class rather than an instance passes its
+# receiver explicitly: `type(obj).f(obj, a)`, `obj.__class__.f(obj, a)`.
+PY_TYPE_BUILTIN = "type"
+PY_CLASS_ATTRIBUTE = "__class__"
+TS_PY_SUBSCRIPT = "subscript"
+# The `subscript` node's index field (`os.environ["K"]` -> the `"K"` string).
+TS_PY_FIELD_SUBSCRIPT = "subscript"
+TS_PY_AUGMENTED_ASSIGNMENT = "augmented_assignment"
+# Walrus operator `(os := value)` -- a `name` field binds the identifier.
+TS_PY_NAMED_EXPRESSION = "named_expression"
+TS_PY_COMPARISON_OPERATOR = "comparison_operator"
+TS_FIELD_OPERATORS = "operators"
+TS_PY_IF_STATEMENT = "if_statement"
+TS_PY_TRY_STATEMENT = "try_statement"
+TS_PY_GLOBAL_STATEMENT = "global_statement"
+# `del x` and `type X = ...`: both bind (or unbind) the name they hold.
+TS_PY_DELETE_STATEMENT = "delete_statement"
+TS_PY_TYPE_ALIAS_STATEMENT = "type_alias_statement"
+TS_PY_NONLOCAL_STATEMENT = "nonlocal_statement"
+# Match statement: arms are exclusive; an UNGUARDED `case _` (empty
+# case_pattern) always matches, removing the implicit no-match path.
+TS_PY_MATCH_STATEMENT = "match_statement"
+TS_PY_CASE_CLAUSE = "case_clause"
+# Every clause of a compound statement (elif/else/except/finally/case) ends
+# with this, so a class-body scan can reach the blocks under any of them.
+TS_PY_CLAUSE_SUFFIX = "_clause"
+TS_PY_CASE_PATTERN = "case_pattern"
+TS_PY_FIELD_GUARD = "guard"
+FIELD_SUBJECT = "subject"
+# A bare name in a case pattern parses as dotted_name with ONE identifier
+# and is a CAPTURE (irrefutable); multi-part dotted names are value
+# patterns that compare.
+TS_PY_DOTTED_NAME = "dotted_name"
+# `a | b` case alternatives; the bare `_` alternative is an ANONYMOUS
+# node, invisible to named_children.
+TS_PY_UNION_PATTERN = "union_pattern"
+# `Foo(x=<pattern>)`, `*rest` / `**rest` inside a case pattern.
+TS_PY_KEYWORD_PATTERN = "keyword_pattern"
+TS_PY_SPLAT_PATTERN = "splat_pattern"
+# `Foo(...)` in a case pattern: the class whose instances the arm matches.
+TS_PY_CLASS_PATTERN = "class_pattern"
+# `import x as y` / `from m import x as y`; the alias is a local binding.
+TS_PY_ALIASED_IMPORT = "aliased_import"
+TS_PY_WILDCARD_NODE = "_"
+TS_PY_WHILE_STATEMENT = "while_statement"
+TS_PY_ELIF_CLAUSE = "elif_clause"
+TS_PY_ELSE_CLAUSE = "else_clause"
+TS_PY_EXCEPT_CLAUSE = "except_clause"
+TS_PY_FINALLY_CLAUSE = "finally_clause"
+# Statements whose bodies hold further statements: the walk that finds every
+# block of a module descends through these and never into an expression.
+PY_STATEMENT_CONTAINERS = frozenset(
+    {
+        TS_PY_BLOCK,
+        TS_PY_IF_STATEMENT,
+        TS_PY_ELIF_CLAUSE,
+        TS_PY_ELSE_CLAUSE,
+        TS_PY_TRY_STATEMENT,
+        TS_PY_EXCEPT_CLAUSE,
+        TS_PY_FINALLY_CLAUSE,
+        TS_PY_WITH_STATEMENT,
+        TS_PY_FOR_STATEMENT,
+        TS_PY_WHILE_STATEMENT,
+        TS_PY_MATCH_STATEMENT,
+        TS_PY_CASE_CLAUSE,
+        TS_PY_FUNCTION_DEFINITION,
+        TS_PY_CLASS_DEFINITION,
+        TS_PY_DECORATED_DEFINITION,
+    }
+)
+# `typing.overload` and the modules exporting it: a stub it decorates is
+# folded into the implementation that follows (issue #2590).
+PY_OVERLOAD = "overload"
+PY_OVERLOAD_MODULES = frozenset({"typing", "typing_extensions"})
+TS_PY_CONDITIONAL_EXPRESSION = "conditional_expression"
+TS_PY_BOOLEAN_OPERATOR = "boolean_operator"
+TS_PY_BINARY_OPERATOR = "binary_operator"
+TS_PY_NOT_OPERATOR = "not_operator"
+TS_FIELD_CONDITION = "condition"
+TS_FIELD_CONSEQUENCE = "consequence"
+TS_FIELD_ARGUMENT = "argument"
+TS_PY_UNARY_OPERATOR = "unary_operator"
+TS_PY_CONCATENATED_STRING = "concatenated_string"
+# Argument values that run no code when evaluated, so `change_signature` may
+# reorder a call site made only of them (issue #1533).
+TS_PY_INTEGER = "integer"
+TS_PY_FLOAT = "float"
+TS_PY_TRUE = "true"
+TS_PY_FALSE = "false"
+TS_PY_NONE = "none"
+# Read positions the binding scan of `python_name_binding_sites` recognises.
+TS_PY_SLICE = "slice"
+TS_PY_ASSERT_STATEMENT = "assert_statement"
+TS_PY_RAISE_STATEMENT = "raise_statement"
+TS_PY_YIELD = "yield"
+TS_PY_WITH_ITEM = "with_item"
+TS_PY_IF_CLAUSE = "if_clause"
+TS_PY_TYPE = "type"
+TS_PY_AWAIT = "await"
+TS_PY_LIST_SPLAT = "list_splat"
+TS_PY_DICTIONARY_SPLAT = "dictionary_splat"
+TS_PY_GENERATOR_EXPRESSION = "generator_expression"
+TS_PY_SET_COMPREHENSION = "set_comprehension"
+TS_PY_DICTIONARY_COMPREHENSION = "dictionary_comprehension"
+# The `interpolation` node's value field (`f"{t!r:>8}"` -> `t`).
+TS_PY_FIELD_EXPRESSION = "expression"
+# A dynamic format spec (`f"{t:{fill}>{width}}"`): the interpolation's
+# `format_specifier` field holds a `format_expression` per nested `{...}`,
+# each with its own `expression` field and, nested once more, its own
+# `format_specifier`.
+TS_PY_FIELD_FORMAT_SPECIFIER = "format_specifier"
+TS_PY_FORMAT_SPECIFIER = "format_specifier"
+TS_PY_FORMAT_EXPRESSION = "format_expression"
+
+# The FLOWS_TO walk carries taint through any call it cannot see into, but
+# these results reveal nothing of their input's content (a size, a truth
+# value, an identity or type, a one-way digest), so taint stops at them
+# (issue #2588). Escaping and quoting are deliberately absent: FLOWS_TO
+# tracks where a value came from, and an escaped secret written to stdout
+# still leaks the secret.
+PY_TAINT_CLEARING_CALLS = frozenset(
+    {
+        "len",
+        "bool",
+        "id",
+        "hash",
+        "type",
+        "isinstance",
+        "issubclass",
+        "callable",
+        "hasattr",
+        "any",
+        "all",
+        "hashlib.new",
+        "hashlib.md5",
+        "hashlib.sha1",
+        "hashlib.sha224",
+        "hashlib.sha256",
+        "hashlib.sha384",
+        "hashlib.sha512",
+        "hashlib.sha3_256",
+        "hashlib.sha3_512",
+        "hashlib.blake2b",
+        "hashlib.blake2s",
+        "hashlib.pbkdf2_hmac",
+        "hashlib.scrypt",
+        "hmac.new",
+        "hmac.digest",
+        "hmac.compare_digest",
+        "secrets.compare_digest",
+    }
+)
+# str predicates and position/count lookups return a bool or an int, so on a
+# receiver known to be a string they clear both the receiver's and the
+# arguments' taint. On any other object (`client.find(secret)`) the method is
+# that object's own, and its result may carry the object's data or the
+# argument, so nothing clears.
+PY_TAINT_CLEARING_METHODS = frozenset(
+    {
+        "startswith",
+        "endswith",
+        "isalnum",
+        "isalpha",
+        "isascii",
+        "isdecimal",
+        "isdigit",
+        "isidentifier",
+        "islower",
+        "isnumeric",
+        "isprintable",
+        "isspace",
+        "istitle",
+        "isupper",
+        "count",
+        "find",
+        "rfind",
+        "index",
+        "rindex",
+    }
+)
+# The annotation that makes a parameter or local a string.
+PY_TYPE_STR = "str"
+PY_BUILTINS_MODULE = "builtins"
+# Builtins whose result is always a string, so a name bound to one is a
+# string receiver for the lookups above, as long as nothing the call can see
+# rebinds the name (keyed by import-normalised name).
+PY_STR_RESULT_CALLS = frozenset(
+    {
+        "str",
+        "repr",
+        "input",
+        "builtins.str",
+        "builtins.repr",
+        "builtins.input",
+    }
+)
+# `os.getenv(key, default)` / `os.environ.get(key, default)`: the default is
+# returned when the variable is unset.
+PY_ENV_DEFAULT_KEYWORD = "default"
+# str (and bytes) methods that return a str or bytes when their receiver is
+# one: `t.strip().lower()` on a string is still a string.
+PY_STR_RESULT_METHODS = frozenset(
+    {
+        "strip",
+        "lstrip",
+        "rstrip",
+        "lower",
+        "upper",
+        "casefold",
+        "title",
+        "capitalize",
+        "swapcase",
+        "replace",
+        "removeprefix",
+        "removesuffix",
+        "format",
+        "join",
+        "zfill",
+        "center",
+        "ljust",
+        "rjust",
+        "encode",
+        "decode",
+    }
+)
+
+# Python operator syntax dispatches to dunder methods at runtime; these names
+# let the call extractor synthesise the implied <operand>.__dunder__ call.
+PY_OP_IN = "in"
+PY_OP_AND = "and"
+# `left <op> right` dispatches to `left.__dunder__`, so the expression's type is
+# whatever that method returns -- which an overloaded operator can make a
+# different class from either operand (`Factory / Config -> Product`).
+PY_BINARY_OPERATOR_DUNDERS: dict[str, str] = {
+    "+": "__add__",
+    "-": "__sub__",
+    "*": "__mul__",
+    "/": "__truediv__",
+    "//": "__floordiv__",
+    "%": "__mod__",
+    "@": "__matmul__",
+    "**": "__pow__",
+    "|": "__or__",
+    "&": "__and__",
+    "^": "__xor__",
+    "<<": "__lshift__",
+    ">>": "__rshift__",
+}
+PY_BUILTIN_LEN = "len"
+PY_BUILTIN_GETATTR = "getattr"
+TS_PY_STRING_CONTENT = "string_content"
+PY_DUNDER_GETITEM = "__getitem__"
+PY_DUNDER_SETITEM = "__setitem__"
+PY_DUNDER_CONTAINS = "__contains__"
+PY_DUNDER_LEN = "__len__"
+PY_DUNDER_BOOL = "__bool__"
+# `obj(...)` on an instance runs `type(obj).__call__`.
+PY_DUNDER_CALL = "__call__"
+# Operands with these characters are not simple attribute/name chains (calls,
+# nested subscripts, whitespace), so the operator-dispatch synthesiser skips them.
+PY_OPERAND_REJECT_CHARS = "()[]{}\n\t "
+# Optional annotation handling: X | None names a single concrete class.
+PY_UNION_SEPARATOR = "|"
+PY_NONE = "None"
+# `-> Self` names the enclosing class, not a class called Self.
+PY_ANNOTATION_SELF = "Self"
+# Homogeneous-container return annotations (`-> list[Widget]`): the container
+# spelling is irrelevant downstream, only "iterable of element" survives, in
+# the canonical `list[<element>]` marker consumed by loop-variable inference.
+PY_GENERIC_CONTAINER_PATTERN = (
+    r"^(?:typing\.)?(?P<name>list|List|set|Set|frozenset|FrozenSet|tuple|Tuple|"
+    r"Sequence|Collection|Iterable|Iterator|Generator|AsyncGenerator|"
+    r"AsyncIterator|AsyncIterable)\[(?P<inner>.+)\]$"
+)
+PY_TUPLE_CONTAINERS = frozenset({"tuple", "Tuple"})
+# Yield type first; Generator[Y, S, R] takes up to three parameters while
+# AsyncGenerator[Y, S] takes up to two.
+PY_GENERATOR_ARG_LIMITS = {"Generator": 3, "AsyncGenerator": 2}
+PY_ELLIPSIS = "..."
+PY_OPTIONAL_PATTERN = r"^(?:typing\.)?Optional\[(?P<inner>.+)\]$"
+PY_LIST_TYPE_PREFIX = "list["
+PY_LIST_TYPE_FORMAT = "list[{element}]"
+
+PY_KEYWORD_SELF = "self"
+PY_KEYWORD_CLS = "cls"
+# Visibility by naming convention: a leading underscore marks a private
+# symbol, while a dunder (__x__) is public API invoked by the runtime.
+PY_NAME_UNDERSCORE = "_"
+PY_NAME_DUNDER = "__"
+# `enum` classes whose subclasses are enums (issue #2583), as a base resolves
+# through the module's imports: `from enum import IntFlag as F` and
+# `import enum as e; e.Flag` both land here.
+PY_ENUM_BASE_QNS: frozenset[str] = frozenset(
+    {
+        "enum.Enum",
+        "enum.IntEnum",
+        "enum.StrEnum",
+        "enum.Flag",
+        "enum.IntFlag",
+        "enum.ReprEnum",
+    }
+)
+# The class attribute naming what the enum machinery must NOT turn into
+# members: a list of names, or one string of names split on commas/spaces.
+PY_ENUM_IGNORE_ATTR = "_ignore_"
+# Callables whose result is a descriptor or an explicit non-member, so an
+# enum body assignment of their call stays a plain attribute. `member()` is
+# the opposite wrapper and is deliberately absent. Matched by what the callee
+# resolves to through the module's imports, so an alias (`cached_property as
+# cp`) still counts and a same-named first-party function does not; a bare
+# name the module does not import is a builtin.
+PY_ENUM_NON_MEMBER_CALLEES: frozenset[str] = frozenset(
+    {
+        "builtins.property",
+        "builtins.staticmethod",
+        "builtins.classmethod",
+        "functools.cached_property",
+        "enum.nonmember",
+        "enum.property",
+        "types.DynamicClassAttribute",
+    }
+)
+PY_BUILTINS_MODULE = "builtins"
+# typing.Protocol base name and the conventional XxxProtocol class suffix
+# used to map a Protocol to its concrete implementer.
+PY_PROTOCOL = "Protocol"
+PY_METHOD_INIT = "__init__"
+DECORATOR_AT = "@"
+PROPERTY_DECORATORS: frozenset[str] = frozenset({"property", "cached_property"})
+ABSTRACT_DECORATORS: frozenset[str] = frozenset({"abstractmethod", "abstractproperty"})
+# A static method takes no receiver: a first parameter named `self` is explicit.
+STATIC_DECORATORS: frozenset[str] = frozenset({"staticmethod"})
+# A class method binds `cls` even when called through its class.
+CLASSMETHOD_DECORATORS: frozenset[str] = frozenset({"classmethod"})
+# contextlib's generator-based context manager factories: a `with` target
+# takes the generator's yield type, not the factory's return type (#3340).
+PY_CONTEXTLIB_MODULE = "contextlib"
+# Where generator annotations live: an aliased annotation base counts only
+# when the import map resolves it here (#3340).
+PY_GENERATOR_ANNOTATION_MODULES: frozenset[str] = frozenset(
+    {"typing", "typing_extensions", "collections.abc"}
+)
+CONTEXTMANAGER_DECORATORS: frozenset[str] = frozenset(
+    {"contextmanager", "asynccontextmanager"}
+)
+# The return annotations a contextmanager factory carries, each yielding
+# its first type argument.
+PY_GENERATOR_ANNOTATIONS: frozenset[str] = frozenset(
+    {"Iterator", "Generator", "AsyncIterator", "AsyncGenerator"}
+)
+# The fully qualified spellings, precomputed once: the decorator and
+# yield-type checks rebuilt these sets on every call (#3340).
+PY_CONTEXTMANAGER_DECORATOR_QNS: frozenset[str] = frozenset(
+    f"{PY_CONTEXTLIB_MODULE}.{name}" for name in CONTEXTMANAGER_DECORATORS
+)
+PY_GENERATOR_ANNOTATION_QNS: frozenset[str] = frozenset(
+    f"{module}.{name}"
+    for module in PY_GENERATOR_ANNOTATION_MODULES
+    for name in PY_GENERATOR_ANNOTATIONS
+)
+
+# Eager builtins that invoke a callable argument synchronously in the caller's
+# stack frame, so the trace attributes the call to the enclosing function (no
+# Python frame exists for the builtin). Lazy higher-order builtins (map/filter)
+# are excluded: they defer invocation until the result is consumed, elsewhere.
+HIGHER_ORDER_BUILTINS: frozenset[str] = frozenset({"sorted", "min", "max", "reduce"})
+
+PY_SELF_PREFIX = "self."
+PY_CLS_PREFIX = "cls."
+
+PY_VAR_PATTERN_ALL = "all_"
+PY_VAR_SUFFIX_PLURAL = "s"
+PY_CLASS_REPOSITORY = "Repository"
+PY_MODELS_BASE_PATH = ".models.base."
+PY_METHOD_CREATE = "create"
+
+# The bound receiver is the enclosing class, never what its name resembles:
+# `"self".endswith("f")` typed every `self` as an imported `F` (issue #2608).
+PY_RECEIVER_PARAM_NAMES: frozenset[str] = frozenset({PY_KEYWORD_SELF, PY_KEYWORD_CLS})
+# Shortest class name an untyped parameter's own name may type: `a` or `f` is
+# an ordinary variable far more often than an `A` or `F` (issue #2608).
+PY_PARAM_NAME_MIN_CLASS_LEN = 3
+
+TYPE_INFERENCE_LIST = "list"
+TYPE_INFERENCE_BASE_MODEL = "BaseModel"
+
+ATTR_TYPE_INFERENCE_IN_PROGRESS = "_type_inference_in_progress"
+GUARD_INHERITED_METHOD = "_inherited_method_guard"
+GUARD_NESTED_JAVA_CALL = "_nested_java_call_guard"
+# Java type inference and call resolution recurse once per step of a call
+# chain and once per nesting level of call arguments; generated code reaches
+# hundreds of either. Past this depth a step is left untyped rather than
+# letting a RecursionError discard the whole method's variable types.
+GUARD_JAVA_INFERENCE_DEPTH = "_java_inference_depth_guard"
+JAVA_MAX_INFERENCE_DEPTH = 64
+
+# A Python `__all__` assignment (group 1 is the bracketed body) and one string
+# entry in it. Shared by the rename that rewrites the entries, its rollback
+# check, and the structural delta that reports entries naming a removed symbol
+# (issue #2516), so the three cannot disagree about what an entry is.
+PY_DUNDER_ALL_BLOCK_PATTERN = r"__all__\s*(?::[^=]+)?=\s*[\[(]([^\])]*)[\])]"
+PY_DUNDER_ALL_ENTRY_PATTERN = r"""(['"])(?P<name>[A-Za-z_]\w*)\1"""
+# The module attribute `from module import *` reads, its two list methods a
+# module may grow it with, and the prefix that keeps a name out of a wildcard
+# import of a module without one.
+PY_DUNDER_ALL = "__all__"
+PY_LIST_EXTEND = "extend"
+PY_LIST_APPEND = "append"
+PY_PRIVATE_PREFIX = "_"
+
+# Forward references in an annotation (`n: "Node"`, issue #2837): the quotes
+# that mark one, the `ast.parse` mode that reads the expression it spells, and
+# the two subscripts whose string arguments are values, not types
+# (`Literal["a"]`, the metadata of `Annotated[T, "doc"]`).
+PY_DOUBLE_QUOTE = '"'
+PY_SINGLE_QUOTE = "'"
+PY_AST_EVAL_MODE = "eval"
+PY_TYPING_LITERAL = "Literal"
+PY_TYPING_ANNOTATED = "Annotated"
+
+# The Python scope walks (parsers/py/ast_analyzer.py), which the Rust tree
+# bridge applies too (native_trees.rules).
+# The def, class or module whose body a node sits in directly.
+PY_SCOPE_TYPES = frozenset(
+    {TS_PY_FUNCTION_DEFINITION, TS_PY_CLASS_DEFINITION, TS_PY_MODULE}
+)
+# Target shapes that bind plain names, and so are descended into for them:
+# `a, (b, c)`, `[a, b]`, `a, *rest`, and a with statement's `as` target,
+# which tree-sitter parses as a `tuple` / `list` EXPRESSION, not a pattern.
+# An attribute or subscript target (`self.x = ...`, `p[0] = ...`) binds no
+# local.
+PY_BINDING_PATTERN_TYPES = PY_UNPACKING_TARGET_TYPES | {
+    TS_PY_LIST_SPLAT_PATTERN,
+    TS_PY_AS_PATTERN_TARGET,
+    TS_PY_TUPLE,
+    TS_PY_LIST,
+}
+# Statements whose `left` field is the target they bind.
+PY_LEFT_BINDERS = frozenset(
+    {TS_PY_ASSIGNMENT, TS_PY_AUGMENTED_ASSIGNMENT, TS_PY_FOR_STATEMENT}
+)
+# Nodes whose `name` field is the one identifier they bind: a walrus, and a
+# def or class, whose NAME is the enclosing body's while its body is not.
+PY_NAME_BINDERS = frozenset(
+    {TS_PY_NAMED_EXPRESSION, TS_PY_FUNCTION_DEFINITION, TS_PY_CLASS_DEFINITION}
+)
+PY_IMPORT_TYPES = frozenset({TS_PY_IMPORT_STATEMENT, TS_PY_IMPORT_FROM_STATEMENT})
+# A body of its own: what is bound inside it is not the enclosing body's.
+PY_NESTED_SCOPE_TYPES = frozenset(
+    {TS_PY_FUNCTION_DEFINITION, TS_PY_CLASS_DEFINITION, TS_PY_LAMBDA}
+)
+PY_DECLARATION_TYPES = frozenset({TS_PY_GLOBAL_STATEMENT, TS_PY_NONLOCAL_STATEMENT})
+# A comprehension is a scope of its own; a lambda is one too, but unlike a
+# def its calls are the enclosing function's (issue #2666).
+PY_COMPREHENSION_TYPES = frozenset(
+    {
+        TS_PY_LIST_COMPREHENSION,
+        TS_PY_SET_COMPREHENSION,
+        TS_PY_DICTIONARY_COMPREHENSION,
+        TS_PY_GENERATOR_EXPRESSION,
+    }
+)
+# Nodes whose parts may not be evaluated at all: the right operand of
+# `and` / `or`, either arm of `a if c else b`, a comprehension's body and
+# filters, an `elif` condition and a `case` pattern or guard. A binding
+# inside one may never run (#3340).
+PY_MAYBE_SKIPPED_TYPES = (
+    frozenset(
+        {
+            TS_PY_BOOLEAN_OPERATOR,
+            TS_PY_CONDITIONAL_EXPRESSION,
+            TS_PY_ELIF_CLAUSE,
+            TS_PY_CASE_CLAUSE,
+        }
+    )
+    | PY_COMPREHENSION_TYPES
+)
+# Trees whose scope walks stay cached (`ast_analyzer.scope_facts`). A cached
+# tree stays alive outside the AST cache's memory cap, so the cache holds a
+# few trees, all of whose scopes it keeps, rather than a number of scopes.
+PY_SCOPE_CACHE_TREES = 8
+# Trees whose definition indexes stay cached (`PythonDefinitionIndexes`), for
+# the same reason. Lookups cluster by file: indexing code-graph-rag's own tree
+# made 12,944 lookups into 1,375 files, and keeping 8 trees answered 83% of
+# them from an index (keeping every tree, 89%).
+PY_DEFINITION_INDEX_TREES = 8
+# The callable-parameter scan (`parsers/utils.py`, and the tree bridge's port
+# of it for the interface fingerprint): the scopes that capture an enclosing
+# def's parameters, and the ones it never enters.
+PY_CALLABLE_CLOSURE_TYPES = frozenset({TS_PY_FUNCTION_DEFINITION, TS_PY_LAMBDA})
+PY_CALLABLE_OPAQUE_TYPES = frozenset({TS_PY_CLASS_DEFINITION})
+# Parameters whose name sits in their `name` field.
+PY_NAMED_PARAMETER_TYPES = frozenset(
+    {TS_PY_DEFAULT_PARAMETER, TS_PY_TYPED_DEFAULT_PARAMETER}
+)
+# A nested def or class: its name binds in the enclosing body, its body is a
+# scope of its own.
+PY_SCOPE_BOUNDARY_TYPES = frozenset(
+    {TS_PY_FUNCTION_DEFINITION, TS_PY_CLASS_DEFINITION, TS_PY_DECORATED_DEFINITION}
+)
+# Statements whose `left` binds names in a nested function that shadow a
+# parameter it would otherwise capture (the callable-parameter scan).
+PY_CAPTURE_SHADOW_BINDERS = frozenset({TS_PY_ASSIGNMENT, TS_PY_FOR_STATEMENT})
+# The definitions a `decorated_definition` wraps, whose name it binds.
+PY_DECORATED_DEFINITION_TYPES = frozenset(
+    {TS_PY_FUNCTION_DEFINITION, TS_PY_CLASS_DEFINITION}
+)

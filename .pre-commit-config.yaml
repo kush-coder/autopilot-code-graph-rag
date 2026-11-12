@@ -1,0 +1,101 @@
+# pre-commit.ci runs these hooks on every PR and pushes the fixes back to the
+# branch, so lint/format drift from clones without `pre-commit install` (cloud
+# sessions, fork contributors) is corrected server-side instead of failing CI.
+ci:
+  autofix_prs: true
+  autofix_commit_msg: "style: pre-commit.ci auto-fixes"
+  autoupdate_commit_msg: "chore: pre-commit autoupdate"
+  autoupdate_schedule: monthly
+  # ty and generate-readme are `language: system` hooks that need uv and the
+  # project venv; pre-commit.ci's isolated runners cannot run them. CI's Type
+  # Check job still covers ty on every PR.
+  skip: [ty, generate-readme]
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      # The fuzz corpora are binary: a seed's trailing byte is atheris'
+      # language/plan selector and its leading byte is the string_spec, so
+      # "fixing" whitespace or appending a newline silently re-points the
+      # seed at another grammar. Both hooks did exactly that once, and
+      # pre-commit.ci would have redone it server-side on every PR
+      # (autofix_prs is on).
+      - id: trailing-whitespace
+        exclude: ^fuzz/corpus/
+      - id: end-of-file-fixer
+        exclude: ^fuzz/corpus/
+      - id: check-yaml
+        args: [--unsafe]
+      - id: check-toml
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.22
+    hooks:
+      - id: ruff
+        args: [--fix, --exit-non-zero-on-fix]
+        exclude: ^(codec/schema_pb2\.(py|pyi)|benchmarks/|optimize/)$
+      - id: ruff-format
+        exclude: ^(codec/schema_pb2\.(py|pyi)|benchmarks/|optimize/)$
+  - repo: local
+    hooks:
+      - id: ty
+        name: ty check
+        entry: uv run --frozen --no-sync ty check --exclude codebase_rag/tests/ --exclude benchmarks/ --exclude optimize/ --exclude codec/ --exclude grammars/ --exclude query_modules/ --exclude fuzz/
+        language: system
+        types: [python]
+        exclude: ^(codec/.*_pb2\.py|benchmarks/|optimize/|grammars/|query_modules/|fuzz/)$
+        pass_filenames: false
+  - repo: local
+    hooks:
+      - id: validate-labels
+        name: validate labels.yml and issue form labels
+        entry: uv run --frozen --no-sync python scripts/validate_labels.py
+        language: system
+        files: ^(\.github/(labels\.yml|ISSUE_TEMPLATE/.*)|scripts/validate_labels\.py)$
+        pass_filenames: false
+  - repo: local
+    hooks:
+      - id: validate-coderabbit-config
+        name: validate .coderabbit.yaml
+        entry: uv run --frozen --no-sync python scripts/validate_coderabbit_config.py
+        language: system
+        files: ^\.coderabbit\.yaml$
+        pass_filenames: false
+  - repo: local
+    hooks:
+      - id: generate-readme
+        name: generate README sections
+        entry: uv run --frozen --no-sync python scripts/hooks/generate_readme.py
+        language: system
+        pass_filenames: false
+        always_run: true
+  - repo: https://github.com/PyCQA/bandit
+    rev: 1.9.4
+    hooks:
+      - id: bandit
+        args: ["-c", "pyproject.toml", "--severity-level", "high"]
+        additional_dependencies: ["bandit[toml]"]
+        exclude: ^(codebase_rag/tests/|scripts/|benchmarks/|optimize/)
+  # Security audit of the workflows. It runs offline, so the audits that
+  # query GitHub (impostor commits, known-vulnerable actions) are left out.
+  # zizmor goes online whenever a GitHub token is in the environment, so
+  # --offline is explicit; args set here replace the hook's own, so its
+  # --no-progress is repeated.
+  - repo: https://github.com/zizmorcore/zizmor-pre-commit
+    rev: v1.31.1
+    hooks:
+      - id: zizmor
+        args: [--no-progress, --offline]
+        files: ^\.github/workflows/[^/]+\.ya?ml$
+  - repo: https://github.com/compilerla/conventional-pre-commit
+    rev: v4.4.0
+    hooks:
+      - id: conventional-pre-commit
+        stages: [commit-msg]
+  - repo: local
+    hooks:
+      - id: single-line-commit
+        name: single-line commit message
+        entry: scripts/hooks/check-single-line-commit.sh
+        language: script
+        stages: [commit-msg]

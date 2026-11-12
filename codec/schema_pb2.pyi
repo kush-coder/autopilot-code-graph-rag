@@ -1,0 +1,733 @@
+from google.protobuf import struct_pb2 as _struct_pb2
+from google.protobuf.internal import containers as _containers
+from google.protobuf.internal import enum_type_wrapper as _enum_type_wrapper
+from google.protobuf import descriptor as _descriptor
+from google.protobuf import message as _message
+from collections.abc import Iterable as _Iterable, Mapping as _Mapping
+from typing import ClassVar as _ClassVar, Optional as _Optional, Union as _Union
+
+DESCRIPTOR: _descriptor.FileDescriptor
+
+class GraphCodeIndex(_message.Message):
+    __slots__ = ("nodes", "relationships")
+    NODES_FIELD_NUMBER: _ClassVar[int]
+    RELATIONSHIPS_FIELD_NUMBER: _ClassVar[int]
+    nodes: _containers.RepeatedCompositeFieldContainer[Node]
+    relationships: _containers.RepeatedCompositeFieldContainer[Relationship]
+    def __init__(self, nodes: _Optional[_Iterable[_Union[Node, _Mapping]]] = ..., relationships: _Optional[_Iterable[_Union[Relationship, _Mapping]]] = ...) -> None: ...
+
+class Node(_message.Message):
+    __slots__ = ("project", "package", "folder", "module", "class_node", "function", "method", "file", "external_package", "module_implementation", "module_interface", "interface_node", "enum_node", "type_node", "union_node", "external_module", "resource", "section", "pattern", "code_smell", "security_issue", "gloss", "parameter", "field", "enum_variant", "constant")
+    PROJECT_FIELD_NUMBER: _ClassVar[int]
+    PACKAGE_FIELD_NUMBER: _ClassVar[int]
+    FOLDER_FIELD_NUMBER: _ClassVar[int]
+    MODULE_FIELD_NUMBER: _ClassVar[int]
+    CLASS_NODE_FIELD_NUMBER: _ClassVar[int]
+    FUNCTION_FIELD_NUMBER: _ClassVar[int]
+    METHOD_FIELD_NUMBER: _ClassVar[int]
+    FILE_FIELD_NUMBER: _ClassVar[int]
+    EXTERNAL_PACKAGE_FIELD_NUMBER: _ClassVar[int]
+    MODULE_IMPLEMENTATION_FIELD_NUMBER: _ClassVar[int]
+    MODULE_INTERFACE_FIELD_NUMBER: _ClassVar[int]
+    INTERFACE_NODE_FIELD_NUMBER: _ClassVar[int]
+    ENUM_NODE_FIELD_NUMBER: _ClassVar[int]
+    TYPE_NODE_FIELD_NUMBER: _ClassVar[int]
+    UNION_NODE_FIELD_NUMBER: _ClassVar[int]
+    EXTERNAL_MODULE_FIELD_NUMBER: _ClassVar[int]
+    RESOURCE_FIELD_NUMBER: _ClassVar[int]
+    SECTION_FIELD_NUMBER: _ClassVar[int]
+    PATTERN_FIELD_NUMBER: _ClassVar[int]
+    CODE_SMELL_FIELD_NUMBER: _ClassVar[int]
+    SECURITY_ISSUE_FIELD_NUMBER: _ClassVar[int]
+    GLOSS_FIELD_NUMBER: _ClassVar[int]
+    PARAMETER_FIELD_NUMBER: _ClassVar[int]
+    FIELD_FIELD_NUMBER: _ClassVar[int]
+    ENUM_VARIANT_FIELD_NUMBER: _ClassVar[int]
+    CONSTANT_FIELD_NUMBER: _ClassVar[int]
+    project: Project
+    package: Package
+    folder: Folder
+    module: Module
+    class_node: Class
+    function: Function
+    method: Method
+    file: File
+    external_package: ExternalPackage
+    module_implementation: ModuleImplementation
+    module_interface: ModuleInterface
+    interface_node: Interface
+    enum_node: Enum
+    type_node: Type
+    union_node: Union
+    external_module: ExternalModule
+    resource: Resource
+    section: Section
+    pattern: Pattern
+    code_smell: CodeSmell
+    security_issue: SecurityIssue
+    gloss: Gloss
+    parameter: Parameter
+    field: Field
+    enum_variant: EnumVariant
+    constant: Constant
+    def __init__(self, project: _Optional[_Union[Project, _Mapping]] = ..., package: _Optional[_Union[Package, _Mapping]] = ..., folder: _Optional[_Union[Folder, _Mapping]] = ..., module: _Optional[_Union[Module, _Mapping]] = ..., class_node: _Optional[_Union[Class, _Mapping]] = ..., function: _Optional[_Union[Function, _Mapping]] = ..., method: _Optional[_Union[Method, _Mapping]] = ..., file: _Optional[_Union[File, _Mapping]] = ..., external_package: _Optional[_Union[ExternalPackage, _Mapping]] = ..., module_implementation: _Optional[_Union[ModuleImplementation, _Mapping]] = ..., module_interface: _Optional[_Union[ModuleInterface, _Mapping]] = ..., interface_node: _Optional[_Union[Interface, _Mapping]] = ..., enum_node: _Optional[_Union[Enum, _Mapping]] = ..., type_node: _Optional[_Union[Type, _Mapping]] = ..., union_node: _Optional[_Union[Union, _Mapping]] = ..., external_module: _Optional[_Union[ExternalModule, _Mapping]] = ..., resource: _Optional[_Union[Resource, _Mapping]] = ..., section: _Optional[_Union[Section, _Mapping]] = ..., pattern: _Optional[_Union[Pattern, _Mapping]] = ..., code_smell: _Optional[_Union[CodeSmell, _Mapping]] = ..., security_issue: _Optional[_Union[SecurityIssue, _Mapping]] = ..., gloss: _Optional[_Union[Gloss, _Mapping]] = ..., parameter: _Optional[_Union[Parameter, _Mapping]] = ..., field: _Optional[_Union[Field, _Mapping]] = ..., enum_variant: _Optional[_Union[EnumVariant, _Mapping]] = ..., constant: _Optional[_Union[Constant, _Mapping]] = ...) -> None: ...
+
+class Relationship(_message.Message):
+    __slots__ = ("type", "source_id", "target_id", "properties", "source_label", "target_label")
+    class RelationshipType(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+        __slots__ = ()
+        RELATIONSHIP_TYPE_UNSPECIFIED: _ClassVar[Relationship.RelationshipType]
+        CONTAINS_PACKAGE: _ClassVar[Relationship.RelationshipType]
+        CONTAINS_FOLDER: _ClassVar[Relationship.RelationshipType]
+        CONTAINS_FILE: _ClassVar[Relationship.RelationshipType]
+        CONTAINS_MODULE: _ClassVar[Relationship.RelationshipType]
+        DEFINES: _ClassVar[Relationship.RelationshipType]
+        DEFINES_METHOD: _ClassVar[Relationship.RelationshipType]
+        IMPORTS: _ClassVar[Relationship.RelationshipType]
+        INHERITS: _ClassVar[Relationship.RelationshipType]
+        OVERRIDES: _ClassVar[Relationship.RelationshipType]
+        CALLS: _ClassVar[Relationship.RelationshipType]
+        DEPENDS_ON_EXTERNAL: _ClassVar[Relationship.RelationshipType]
+        IMPLEMENTS_MODULE: _ClassVar[Relationship.RelationshipType]
+        IMPLEMENTS: _ClassVar[Relationship.RelationshipType]
+        EXPORTS: _ClassVar[Relationship.RelationshipType]
+        EXPORTS_MODULE: _ClassVar[Relationship.RelationshipType]
+        READS_FROM: _ClassVar[Relationship.RelationshipType]
+        WRITES_TO: _ClassVar[Relationship.RelationshipType]
+        CONTAINS_SECTION: _ClassVar[Relationship.RelationshipType]
+        EXPOSES: _ClassVar[Relationship.RelationshipType]
+        FLOWS_TO: _ClassVar[Relationship.RelationshipType]
+        HAS_SMELL: _ClassVar[Relationship.RelationshipType]
+        HAS_VULNERABILITY: _ClassVar[Relationship.RelationshipType]
+        IMPLEMENTS_PATTERN: _ClassVar[Relationship.RelationshipType]
+        INSTANTIATES: _ClassVar[Relationship.RelationshipType]
+        LINKS_TO: _ClassVar[Relationship.RelationshipType]
+        REFERENCES: _ClassVar[Relationship.RelationshipType]
+        RESOLVES_TO: _ClassVar[Relationship.RelationshipType]
+        RETURNS: _ClassVar[Relationship.RelationshipType]
+        ACCEPTS: _ClassVar[Relationship.RelationshipType]
+        ANNOTATES: _ClassVar[Relationship.RelationshipType]
+        MENTIONS: _ClassVar[Relationship.RelationshipType]
+        HAS_PARAMETER: _ClassVar[Relationship.RelationshipType]
+        OF_TYPE: _ClassVar[Relationship.RelationshipType]
+        HAS_FIELD: _ClassVar[Relationship.RelationshipType]
+        HAS_VARIANT: _ClassVar[Relationship.RelationshipType]
+        DEFINES_CONSTANT: _ClassVar[Relationship.RelationshipType]
+    RELATIONSHIP_TYPE_UNSPECIFIED: Relationship.RelationshipType
+    CONTAINS_PACKAGE: Relationship.RelationshipType
+    CONTAINS_FOLDER: Relationship.RelationshipType
+    CONTAINS_FILE: Relationship.RelationshipType
+    CONTAINS_MODULE: Relationship.RelationshipType
+    DEFINES: Relationship.RelationshipType
+    DEFINES_METHOD: Relationship.RelationshipType
+    IMPORTS: Relationship.RelationshipType
+    INHERITS: Relationship.RelationshipType
+    OVERRIDES: Relationship.RelationshipType
+    CALLS: Relationship.RelationshipType
+    DEPENDS_ON_EXTERNAL: Relationship.RelationshipType
+    IMPLEMENTS_MODULE: Relationship.RelationshipType
+    IMPLEMENTS: Relationship.RelationshipType
+    EXPORTS: Relationship.RelationshipType
+    EXPORTS_MODULE: Relationship.RelationshipType
+    READS_FROM: Relationship.RelationshipType
+    WRITES_TO: Relationship.RelationshipType
+    CONTAINS_SECTION: Relationship.RelationshipType
+    EXPOSES: Relationship.RelationshipType
+    FLOWS_TO: Relationship.RelationshipType
+    HAS_SMELL: Relationship.RelationshipType
+    HAS_VULNERABILITY: Relationship.RelationshipType
+    IMPLEMENTS_PATTERN: Relationship.RelationshipType
+    INSTANTIATES: Relationship.RelationshipType
+    LINKS_TO: Relationship.RelationshipType
+    REFERENCES: Relationship.RelationshipType
+    RESOLVES_TO: Relationship.RelationshipType
+    RETURNS: Relationship.RelationshipType
+    ACCEPTS: Relationship.RelationshipType
+    ANNOTATES: Relationship.RelationshipType
+    MENTIONS: Relationship.RelationshipType
+    HAS_PARAMETER: Relationship.RelationshipType
+    OF_TYPE: Relationship.RelationshipType
+    HAS_FIELD: Relationship.RelationshipType
+    HAS_VARIANT: Relationship.RelationshipType
+    DEFINES_CONSTANT: Relationship.RelationshipType
+    TYPE_FIELD_NUMBER: _ClassVar[int]
+    SOURCE_ID_FIELD_NUMBER: _ClassVar[int]
+    TARGET_ID_FIELD_NUMBER: _ClassVar[int]
+    PROPERTIES_FIELD_NUMBER: _ClassVar[int]
+    SOURCE_LABEL_FIELD_NUMBER: _ClassVar[int]
+    TARGET_LABEL_FIELD_NUMBER: _ClassVar[int]
+    type: Relationship.RelationshipType
+    source_id: str
+    target_id: str
+    properties: _struct_pb2.Struct
+    source_label: str
+    target_label: str
+    def __init__(self, type: _Optional[_Union[Relationship.RelationshipType, str]] = ..., source_id: _Optional[str] = ..., target_id: _Optional[str] = ..., properties: _Optional[_Union[_struct_pb2.Struct, _Mapping]] = ..., source_label: _Optional[str] = ..., target_label: _Optional[str] = ...) -> None: ...
+
+class Project(_message.Message):
+    __slots__ = ("name",)
+    NAME_FIELD_NUMBER: _ClassVar[int]
+    name: str
+    def __init__(self, name: _Optional[str] = ...) -> None: ...
+
+class Package(_message.Message):
+    __slots__ = ("qualified_name", "name", "path")
+    QUALIFIED_NAME_FIELD_NUMBER: _ClassVar[int]
+    NAME_FIELD_NUMBER: _ClassVar[int]
+    PATH_FIELD_NUMBER: _ClassVar[int]
+    qualified_name: str
+    name: str
+    path: str
+    def __init__(self, qualified_name: _Optional[str] = ..., name: _Optional[str] = ..., path: _Optional[str] = ...) -> None: ...
+
+class Folder(_message.Message):
+    __slots__ = ("path", "name")
+    PATH_FIELD_NUMBER: _ClassVar[int]
+    NAME_FIELD_NUMBER: _ClassVar[int]
+    path: str
+    name: str
+    def __init__(self, path: _Optional[str] = ..., name: _Optional[str] = ...) -> None: ...
+
+class File(_message.Message):
+    __slots__ = ("path", "name", "extension")
+    PATH_FIELD_NUMBER: _ClassVar[int]
+    NAME_FIELD_NUMBER: _ClassVar[int]
+    EXTENSION_FIELD_NUMBER: _ClassVar[int]
+    path: str
+    name: str
+    extension: str
+    def __init__(self, path: _Optional[str] = ..., name: _Optional[str] = ..., extension: _Optional[str] = ...) -> None: ...
+
+class Module(_message.Message):
+    __slots__ = ("qualified_name", "name", "path", "decorators", "rust_cfg_test_mods", "rust_ungated_mods", "flow_covered", "generated", "generator", "front_matter", "docstring", "start_line", "end_line", "unresolved_specifiers", "unresolved_references")
+    QUALIFIED_NAME_FIELD_NUMBER: _ClassVar[int]
+    NAME_FIELD_NUMBER: _ClassVar[int]
+    PATH_FIELD_NUMBER: _ClassVar[int]
+    DECORATORS_FIELD_NUMBER: _ClassVar[int]
+    RUST_CFG_TEST_MODS_FIELD_NUMBER: _ClassVar[int]
+    RUST_UNGATED_MODS_FIELD_NUMBER: _ClassVar[int]
+    FLOW_COVERED_FIELD_NUMBER: _ClassVar[int]
+    GENERATED_FIELD_NUMBER: _ClassVar[int]
+    GENERATOR_FIELD_NUMBER: _ClassVar[int]
+    FRONT_MATTER_FIELD_NUMBER: _ClassVar[int]
+    DOCSTRING_FIELD_NUMBER: _ClassVar[int]
+    START_LINE_FIELD_NUMBER: _ClassVar[int]
+    END_LINE_FIELD_NUMBER: _ClassVar[int]
+    UNRESOLVED_SPECIFIERS_FIELD_NUMBER: _ClassVar[int]
+    UNRESOLVED_REFERENCES_FIELD_NUMBER: _ClassVar[int]
+    qualified_name: str
+    name: str
+    path: str
+    decorators: _containers.RepeatedScalarFieldContainer[str]
+    rust_cfg_test_mods: _containers.RepeatedScalarFieldContainer[str]
+    rust_ungated_mods: _containers.RepeatedScalarFieldContainer[str]
+    flow_covered: bool
+    generated: bool
+    generator: str
+    front_matter: _containers.RepeatedScalarFieldContainer[str]
+    docstring: str
+    start_line: int
+    end_line: int
+    unresolved_specifiers: _containers.RepeatedScalarFieldContainer[str]
+    unresolved_references: _containers.RepeatedScalarFieldContainer[str]
+    def __init__(self, qualified_name: _Optional[str] = ..., name: _Optional[str] = ..., path: _Optional[str] = ..., decorators: _Optional[_Iterable[str]] = ..., rust_cfg_test_mods: _Optional[_Iterable[str]] = ..., rust_ungated_mods: _Optional[_Iterable[str]] = ..., flow_covered: bool = ..., generated: bool = ..., generator: _Optional[str] = ..., front_matter: _Optional[_Iterable[str]] = ..., docstring: _Optional[str] = ..., start_line: _Optional[int] = ..., end_line: _Optional[int] = ..., unresolved_specifiers: _Optional[_Iterable[str]] = ..., unresolved_references: _Optional[_Iterable[str]] = ...) -> None: ...
+
+class ExternalModule(_message.Message):
+    __slots__ = ("qualified_name", "name", "path")
+    QUALIFIED_NAME_FIELD_NUMBER: _ClassVar[int]
+    NAME_FIELD_NUMBER: _ClassVar[int]
+    PATH_FIELD_NUMBER: _ClassVar[int]
+    qualified_name: str
+    name: str
+    path: str
+    def __init__(self, qualified_name: _Optional[str] = ..., name: _Optional[str] = ..., path: _Optional[str] = ...) -> None: ...
+
+class ModuleImplementation(_message.Message):
+    __slots__ = ("qualified_name", "name", "path", "implements_module", "module_type")
+    QUALIFIED_NAME_FIELD_NUMBER: _ClassVar[int]
+    NAME_FIELD_NUMBER: _ClassVar[int]
+    PATH_FIELD_NUMBER: _ClassVar[int]
+    IMPLEMENTS_MODULE_FIELD_NUMBER: _ClassVar[int]
+    MODULE_TYPE_FIELD_NUMBER: _ClassVar[int]
+    qualified_name: str
+    name: str
+    path: str
+    implements_module: str
+    module_type: str
+    def __init__(self, qualified_name: _Optional[str] = ..., name: _Optional[str] = ..., path: _Optional[str] = ..., implements_module: _Optional[str] = ..., module_type: _Optional[str] = ...) -> None: ...
+
+class ModuleInterface(_message.Message):
+    __slots__ = ("qualified_name", "name", "path", "module_type")
+    QUALIFIED_NAME_FIELD_NUMBER: _ClassVar[int]
+    NAME_FIELD_NUMBER: _ClassVar[int]
+    PATH_FIELD_NUMBER: _ClassVar[int]
+    MODULE_TYPE_FIELD_NUMBER: _ClassVar[int]
+    qualified_name: str
+    name: str
+    path: str
+    module_type: str
+    def __init__(self, qualified_name: _Optional[str] = ..., name: _Optional[str] = ..., path: _Optional[str] = ..., module_type: _Optional[str] = ...) -> None: ...
+
+class ExternalPackage(_message.Message):
+    __slots__ = ("name",)
+    NAME_FIELD_NUMBER: _ClassVar[int]
+    name: str
+    def __init__(self, name: _Optional[str] = ...) -> None: ...
+
+class Pattern(_message.Message):
+    __slots__ = ("qualified_name", "name", "message", "start_line", "end_line", "path", "snippet")
+    QUALIFIED_NAME_FIELD_NUMBER: _ClassVar[int]
+    NAME_FIELD_NUMBER: _ClassVar[int]
+    MESSAGE_FIELD_NUMBER: _ClassVar[int]
+    START_LINE_FIELD_NUMBER: _ClassVar[int]
+    END_LINE_FIELD_NUMBER: _ClassVar[int]
+    PATH_FIELD_NUMBER: _ClassVar[int]
+    SNIPPET_FIELD_NUMBER: _ClassVar[int]
+    qualified_name: str
+    name: str
+    message: str
+    start_line: int
+    end_line: int
+    path: str
+    snippet: str
+    def __init__(self, qualified_name: _Optional[str] = ..., name: _Optional[str] = ..., message: _Optional[str] = ..., start_line: _Optional[int] = ..., end_line: _Optional[int] = ..., path: _Optional[str] = ..., snippet: _Optional[str] = ...) -> None: ...
+
+class CodeSmell(_message.Message):
+    __slots__ = ("qualified_name", "name", "message", "start_line", "end_line", "path", "snippet")
+    QUALIFIED_NAME_FIELD_NUMBER: _ClassVar[int]
+    NAME_FIELD_NUMBER: _ClassVar[int]
+    MESSAGE_FIELD_NUMBER: _ClassVar[int]
+    START_LINE_FIELD_NUMBER: _ClassVar[int]
+    END_LINE_FIELD_NUMBER: _ClassVar[int]
+    PATH_FIELD_NUMBER: _ClassVar[int]
+    SNIPPET_FIELD_NUMBER: _ClassVar[int]
+    qualified_name: str
+    name: str
+    message: str
+    start_line: int
+    end_line: int
+    path: str
+    snippet: str
+    def __init__(self, qualified_name: _Optional[str] = ..., name: _Optional[str] = ..., message: _Optional[str] = ..., start_line: _Optional[int] = ..., end_line: _Optional[int] = ..., path: _Optional[str] = ..., snippet: _Optional[str] = ...) -> None: ...
+
+class SecurityIssue(_message.Message):
+    __slots__ = ("qualified_name", "name", "message", "start_line", "end_line", "path", "snippet")
+    QUALIFIED_NAME_FIELD_NUMBER: _ClassVar[int]
+    NAME_FIELD_NUMBER: _ClassVar[int]
+    MESSAGE_FIELD_NUMBER: _ClassVar[int]
+    START_LINE_FIELD_NUMBER: _ClassVar[int]
+    END_LINE_FIELD_NUMBER: _ClassVar[int]
+    PATH_FIELD_NUMBER: _ClassVar[int]
+    SNIPPET_FIELD_NUMBER: _ClassVar[int]
+    qualified_name: str
+    name: str
+    message: str
+    start_line: int
+    end_line: int
+    path: str
+    snippet: str
+    def __init__(self, qualified_name: _Optional[str] = ..., name: _Optional[str] = ..., message: _Optional[str] = ..., start_line: _Optional[int] = ..., end_line: _Optional[int] = ..., path: _Optional[str] = ..., snippet: _Optional[str] = ...) -> None: ...
+
+class Gloss(_message.Message):
+    __slots__ = ("qualified_name", "kind", "status", "body", "created_by", "created_at", "commit_sha", "target_qn", "target_hash", "anchor_quote", "anchor_prefix", "anchor_suffix", "anchor_state", "moved_from", "project")
+    QUALIFIED_NAME_FIELD_NUMBER: _ClassVar[int]
+    KIND_FIELD_NUMBER: _ClassVar[int]
+    STATUS_FIELD_NUMBER: _ClassVar[int]
+    BODY_FIELD_NUMBER: _ClassVar[int]
+    CREATED_BY_FIELD_NUMBER: _ClassVar[int]
+    CREATED_AT_FIELD_NUMBER: _ClassVar[int]
+    COMMIT_SHA_FIELD_NUMBER: _ClassVar[int]
+    TARGET_QN_FIELD_NUMBER: _ClassVar[int]
+    TARGET_HASH_FIELD_NUMBER: _ClassVar[int]
+    ANCHOR_QUOTE_FIELD_NUMBER: _ClassVar[int]
+    ANCHOR_PREFIX_FIELD_NUMBER: _ClassVar[int]
+    ANCHOR_SUFFIX_FIELD_NUMBER: _ClassVar[int]
+    ANCHOR_STATE_FIELD_NUMBER: _ClassVar[int]
+    MOVED_FROM_FIELD_NUMBER: _ClassVar[int]
+    PROJECT_FIELD_NUMBER: _ClassVar[int]
+    qualified_name: str
+    kind: str
+    status: str
+    body: str
+    created_by: str
+    created_at: str
+    commit_sha: str
+    target_qn: str
+    target_hash: str
+    anchor_quote: str
+    anchor_prefix: str
+    anchor_suffix: str
+    anchor_state: str
+    moved_from: str
+    project: str
+    def __init__(self, qualified_name: _Optional[str] = ..., kind: _Optional[str] = ..., status: _Optional[str] = ..., body: _Optional[str] = ..., created_by: _Optional[str] = ..., created_at: _Optional[str] = ..., commit_sha: _Optional[str] = ..., target_qn: _Optional[str] = ..., target_hash: _Optional[str] = ..., anchor_quote: _Optional[str] = ..., anchor_prefix: _Optional[str] = ..., anchor_suffix: _Optional[str] = ..., anchor_state: _Optional[str] = ..., moved_from: _Optional[str] = ..., project: _Optional[str] = ...) -> None: ...
+
+class Parameter(_message.Message):
+    __slots__ = ("qualified_name", "name", "index", "path", "absolute_path", "start_line", "start_col", "type_name", "is_variadic", "has_default")
+    QUALIFIED_NAME_FIELD_NUMBER: _ClassVar[int]
+    NAME_FIELD_NUMBER: _ClassVar[int]
+    INDEX_FIELD_NUMBER: _ClassVar[int]
+    PATH_FIELD_NUMBER: _ClassVar[int]
+    ABSOLUTE_PATH_FIELD_NUMBER: _ClassVar[int]
+    START_LINE_FIELD_NUMBER: _ClassVar[int]
+    START_COL_FIELD_NUMBER: _ClassVar[int]
+    TYPE_NAME_FIELD_NUMBER: _ClassVar[int]
+    IS_VARIADIC_FIELD_NUMBER: _ClassVar[int]
+    HAS_DEFAULT_FIELD_NUMBER: _ClassVar[int]
+    qualified_name: str
+    name: str
+    index: int
+    path: str
+    absolute_path: str
+    start_line: int
+    start_col: int
+    type_name: str
+    is_variadic: bool
+    has_default: bool
+    def __init__(self, qualified_name: _Optional[str] = ..., name: _Optional[str] = ..., index: _Optional[int] = ..., path: _Optional[str] = ..., absolute_path: _Optional[str] = ..., start_line: _Optional[int] = ..., start_col: _Optional[int] = ..., type_name: _Optional[str] = ..., is_variadic: bool = ..., has_default: bool = ...) -> None: ...
+
+class Field(_message.Message):
+    __slots__ = ("qualified_name", "name", "path", "start_line", "start_col", "type_name", "modifiers", "is_static", "docstring")
+    QUALIFIED_NAME_FIELD_NUMBER: _ClassVar[int]
+    NAME_FIELD_NUMBER: _ClassVar[int]
+    PATH_FIELD_NUMBER: _ClassVar[int]
+    START_LINE_FIELD_NUMBER: _ClassVar[int]
+    START_COL_FIELD_NUMBER: _ClassVar[int]
+    TYPE_NAME_FIELD_NUMBER: _ClassVar[int]
+    MODIFIERS_FIELD_NUMBER: _ClassVar[int]
+    IS_STATIC_FIELD_NUMBER: _ClassVar[int]
+    DOCSTRING_FIELD_NUMBER: _ClassVar[int]
+    qualified_name: str
+    name: str
+    path: str
+    start_line: int
+    start_col: int
+    type_name: str
+    modifiers: _containers.RepeatedScalarFieldContainer[str]
+    is_static: bool
+    docstring: str
+    def __init__(self, qualified_name: _Optional[str] = ..., name: _Optional[str] = ..., path: _Optional[str] = ..., start_line: _Optional[int] = ..., start_col: _Optional[int] = ..., type_name: _Optional[str] = ..., modifiers: _Optional[_Iterable[str]] = ..., is_static: bool = ..., docstring: _Optional[str] = ...) -> None: ...
+
+class Constant(_message.Message):
+    __slots__ = ("qualified_name", "name", "path", "start_line", "start_col", "type_name", "value")
+    QUALIFIED_NAME_FIELD_NUMBER: _ClassVar[int]
+    NAME_FIELD_NUMBER: _ClassVar[int]
+    PATH_FIELD_NUMBER: _ClassVar[int]
+    START_LINE_FIELD_NUMBER: _ClassVar[int]
+    START_COL_FIELD_NUMBER: _ClassVar[int]
+    TYPE_NAME_FIELD_NUMBER: _ClassVar[int]
+    VALUE_FIELD_NUMBER: _ClassVar[int]
+    qualified_name: str
+    name: str
+    path: str
+    start_line: int
+    start_col: int
+    type_name: str
+    value: str
+    def __init__(self, qualified_name: _Optional[str] = ..., name: _Optional[str] = ..., path: _Optional[str] = ..., start_line: _Optional[int] = ..., start_col: _Optional[int] = ..., type_name: _Optional[str] = ..., value: _Optional[str] = ...) -> None: ...
+
+class EnumVariant(_message.Message):
+    __slots__ = ("qualified_name", "name", "path", "start_line", "start_col", "index", "value", "docstring")
+    QUALIFIED_NAME_FIELD_NUMBER: _ClassVar[int]
+    NAME_FIELD_NUMBER: _ClassVar[int]
+    PATH_FIELD_NUMBER: _ClassVar[int]
+    START_LINE_FIELD_NUMBER: _ClassVar[int]
+    START_COL_FIELD_NUMBER: _ClassVar[int]
+    INDEX_FIELD_NUMBER: _ClassVar[int]
+    VALUE_FIELD_NUMBER: _ClassVar[int]
+    DOCSTRING_FIELD_NUMBER: _ClassVar[int]
+    qualified_name: str
+    name: str
+    path: str
+    start_line: int
+    start_col: int
+    index: int
+    value: str
+    docstring: str
+    def __init__(self, qualified_name: _Optional[str] = ..., name: _Optional[str] = ..., path: _Optional[str] = ..., start_line: _Optional[int] = ..., start_col: _Optional[int] = ..., index: _Optional[int] = ..., value: _Optional[str] = ..., docstring: _Optional[str] = ...) -> None: ...
+
+class Resource(_message.Message):
+    __slots__ = ("qualified_name", "name", "kind", "project")
+    QUALIFIED_NAME_FIELD_NUMBER: _ClassVar[int]
+    NAME_FIELD_NUMBER: _ClassVar[int]
+    KIND_FIELD_NUMBER: _ClassVar[int]
+    PROJECT_FIELD_NUMBER: _ClassVar[int]
+    qualified_name: str
+    name: str
+    kind: str
+    project: str
+    def __init__(self, qualified_name: _Optional[str] = ..., name: _Optional[str] = ..., kind: _Optional[str] = ..., project: _Optional[str] = ...) -> None: ...
+
+class Section(_message.Message):
+    __slots__ = ("qualified_name", "name", "heading_level", "start_line", "end_line", "path", "absolute_path")
+    QUALIFIED_NAME_FIELD_NUMBER: _ClassVar[int]
+    NAME_FIELD_NUMBER: _ClassVar[int]
+    HEADING_LEVEL_FIELD_NUMBER: _ClassVar[int]
+    START_LINE_FIELD_NUMBER: _ClassVar[int]
+    END_LINE_FIELD_NUMBER: _ClassVar[int]
+    PATH_FIELD_NUMBER: _ClassVar[int]
+    ABSOLUTE_PATH_FIELD_NUMBER: _ClassVar[int]
+    qualified_name: str
+    name: str
+    heading_level: int
+    start_line: int
+    end_line: int
+    path: str
+    absolute_path: str
+    def __init__(self, qualified_name: _Optional[str] = ..., name: _Optional[str] = ..., heading_level: _Optional[int] = ..., start_line: _Optional[int] = ..., end_line: _Optional[int] = ..., path: _Optional[str] = ..., absolute_path: _Optional[str] = ...) -> None: ...
+
+class Function(_message.Message):
+    __slots__ = ("qualified_name", "name", "docstring", "start_line", "end_line", "decorators", "is_exported", "ast_fingerprint", "ast_fingerprint_nodes", "ast_branch_fingerprints", "return_type", "param_types", "is_object_member", "is_program_main", "rust_visibility", "path", "modifiers", "start_col", "name_start_line", "name_start_col", "anchor_hash", "positional_params", "is_body_scoped_name", "is_macro")
+    QUALIFIED_NAME_FIELD_NUMBER: _ClassVar[int]
+    NAME_FIELD_NUMBER: _ClassVar[int]
+    DOCSTRING_FIELD_NUMBER: _ClassVar[int]
+    START_LINE_FIELD_NUMBER: _ClassVar[int]
+    END_LINE_FIELD_NUMBER: _ClassVar[int]
+    DECORATORS_FIELD_NUMBER: _ClassVar[int]
+    IS_EXPORTED_FIELD_NUMBER: _ClassVar[int]
+    AST_FINGERPRINT_FIELD_NUMBER: _ClassVar[int]
+    AST_FINGERPRINT_NODES_FIELD_NUMBER: _ClassVar[int]
+    AST_BRANCH_FINGERPRINTS_FIELD_NUMBER: _ClassVar[int]
+    RETURN_TYPE_FIELD_NUMBER: _ClassVar[int]
+    PARAM_TYPES_FIELD_NUMBER: _ClassVar[int]
+    IS_OBJECT_MEMBER_FIELD_NUMBER: _ClassVar[int]
+    IS_PROGRAM_MAIN_FIELD_NUMBER: _ClassVar[int]
+    RUST_VISIBILITY_FIELD_NUMBER: _ClassVar[int]
+    PATH_FIELD_NUMBER: _ClassVar[int]
+    MODIFIERS_FIELD_NUMBER: _ClassVar[int]
+    START_COL_FIELD_NUMBER: _ClassVar[int]
+    NAME_START_LINE_FIELD_NUMBER: _ClassVar[int]
+    NAME_START_COL_FIELD_NUMBER: _ClassVar[int]
+    ANCHOR_HASH_FIELD_NUMBER: _ClassVar[int]
+    POSITIONAL_PARAMS_FIELD_NUMBER: _ClassVar[int]
+    IS_BODY_SCOPED_NAME_FIELD_NUMBER: _ClassVar[int]
+    IS_MACRO_FIELD_NUMBER: _ClassVar[int]
+    qualified_name: str
+    name: str
+    docstring: str
+    start_line: int
+    end_line: int
+    decorators: _containers.RepeatedScalarFieldContainer[str]
+    is_exported: bool
+    ast_fingerprint: str
+    ast_fingerprint_nodes: int
+    ast_branch_fingerprints: _containers.RepeatedScalarFieldContainer[str]
+    return_type: str
+    param_types: _containers.RepeatedScalarFieldContainer[str]
+    is_object_member: bool
+    is_program_main: bool
+    rust_visibility: str
+    path: str
+    modifiers: _containers.RepeatedScalarFieldContainer[str]
+    start_col: int
+    name_start_line: int
+    name_start_col: int
+    anchor_hash: str
+    positional_params: _containers.RepeatedScalarFieldContainer[str]
+    is_body_scoped_name: bool
+    is_macro: bool
+    def __init__(self, qualified_name: _Optional[str] = ..., name: _Optional[str] = ..., docstring: _Optional[str] = ..., start_line: _Optional[int] = ..., end_line: _Optional[int] = ..., decorators: _Optional[_Iterable[str]] = ..., is_exported: bool = ..., ast_fingerprint: _Optional[str] = ..., ast_fingerprint_nodes: _Optional[int] = ..., ast_branch_fingerprints: _Optional[_Iterable[str]] = ..., return_type: _Optional[str] = ..., param_types: _Optional[_Iterable[str]] = ..., is_object_member: bool = ..., is_program_main: bool = ..., rust_visibility: _Optional[str] = ..., path: _Optional[str] = ..., modifiers: _Optional[_Iterable[str]] = ..., start_col: _Optional[int] = ..., name_start_line: _Optional[int] = ..., name_start_col: _Optional[int] = ..., anchor_hash: _Optional[str] = ..., positional_params: _Optional[_Iterable[str]] = ..., is_body_scoped_name: bool = ..., is_macro: bool = ...) -> None: ...
+
+class Method(_message.Message):
+    __slots__ = ("qualified_name", "name", "docstring", "start_line", "end_line", "decorators", "ast_fingerprint", "ast_fingerprint_nodes", "ast_branch_fingerprints", "return_type", "param_types", "signature", "declared_in_class", "is_exported", "is_program_main", "path", "modifiers", "start_col", "name_start_line", "name_start_col", "anchor_hash", "positional_params", "is_property", "overrides_external")
+    QUALIFIED_NAME_FIELD_NUMBER: _ClassVar[int]
+    NAME_FIELD_NUMBER: _ClassVar[int]
+    DOCSTRING_FIELD_NUMBER: _ClassVar[int]
+    START_LINE_FIELD_NUMBER: _ClassVar[int]
+    END_LINE_FIELD_NUMBER: _ClassVar[int]
+    DECORATORS_FIELD_NUMBER: _ClassVar[int]
+    AST_FINGERPRINT_FIELD_NUMBER: _ClassVar[int]
+    AST_FINGERPRINT_NODES_FIELD_NUMBER: _ClassVar[int]
+    AST_BRANCH_FINGERPRINTS_FIELD_NUMBER: _ClassVar[int]
+    RETURN_TYPE_FIELD_NUMBER: _ClassVar[int]
+    PARAM_TYPES_FIELD_NUMBER: _ClassVar[int]
+    SIGNATURE_FIELD_NUMBER: _ClassVar[int]
+    DECLARED_IN_CLASS_FIELD_NUMBER: _ClassVar[int]
+    IS_EXPORTED_FIELD_NUMBER: _ClassVar[int]
+    IS_PROGRAM_MAIN_FIELD_NUMBER: _ClassVar[int]
+    PATH_FIELD_NUMBER: _ClassVar[int]
+    MODIFIERS_FIELD_NUMBER: _ClassVar[int]
+    START_COL_FIELD_NUMBER: _ClassVar[int]
+    NAME_START_LINE_FIELD_NUMBER: _ClassVar[int]
+    NAME_START_COL_FIELD_NUMBER: _ClassVar[int]
+    ANCHOR_HASH_FIELD_NUMBER: _ClassVar[int]
+    POSITIONAL_PARAMS_FIELD_NUMBER: _ClassVar[int]
+    IS_PROPERTY_FIELD_NUMBER: _ClassVar[int]
+    OVERRIDES_EXTERNAL_FIELD_NUMBER: _ClassVar[int]
+    qualified_name: str
+    name: str
+    docstring: str
+    start_line: int
+    end_line: int
+    decorators: _containers.RepeatedScalarFieldContainer[str]
+    ast_fingerprint: str
+    ast_fingerprint_nodes: int
+    ast_branch_fingerprints: _containers.RepeatedScalarFieldContainer[str]
+    return_type: str
+    param_types: _containers.RepeatedScalarFieldContainer[str]
+    signature: str
+    declared_in_class: bool
+    is_exported: bool
+    is_program_main: bool
+    path: str
+    modifiers: _containers.RepeatedScalarFieldContainer[str]
+    start_col: int
+    name_start_line: int
+    name_start_col: int
+    anchor_hash: str
+    positional_params: _containers.RepeatedScalarFieldContainer[str]
+    is_property: bool
+    overrides_external: bool
+    def __init__(self, qualified_name: _Optional[str] = ..., name: _Optional[str] = ..., docstring: _Optional[str] = ..., start_line: _Optional[int] = ..., end_line: _Optional[int] = ..., decorators: _Optional[_Iterable[str]] = ..., ast_fingerprint: _Optional[str] = ..., ast_fingerprint_nodes: _Optional[int] = ..., ast_branch_fingerprints: _Optional[_Iterable[str]] = ..., return_type: _Optional[str] = ..., param_types: _Optional[_Iterable[str]] = ..., signature: _Optional[str] = ..., declared_in_class: bool = ..., is_exported: bool = ..., is_program_main: bool = ..., path: _Optional[str] = ..., modifiers: _Optional[_Iterable[str]] = ..., start_col: _Optional[int] = ..., name_start_line: _Optional[int] = ..., name_start_col: _Optional[int] = ..., anchor_hash: _Optional[str] = ..., positional_params: _Optional[_Iterable[str]] = ..., is_property: bool = ..., overrides_external: bool = ...) -> None: ...
+
+class Class(_message.Message):
+    __slots__ = ("qualified_name", "name", "docstring", "start_line", "end_line", "decorators", "is_exported", "namespace", "generic_arity", "field_types", "path", "modifiers", "start_col", "anchor_hash")
+    QUALIFIED_NAME_FIELD_NUMBER: _ClassVar[int]
+    NAME_FIELD_NUMBER: _ClassVar[int]
+    DOCSTRING_FIELD_NUMBER: _ClassVar[int]
+    START_LINE_FIELD_NUMBER: _ClassVar[int]
+    END_LINE_FIELD_NUMBER: _ClassVar[int]
+    DECORATORS_FIELD_NUMBER: _ClassVar[int]
+    IS_EXPORTED_FIELD_NUMBER: _ClassVar[int]
+    NAMESPACE_FIELD_NUMBER: _ClassVar[int]
+    GENERIC_ARITY_FIELD_NUMBER: _ClassVar[int]
+    FIELD_TYPES_FIELD_NUMBER: _ClassVar[int]
+    PATH_FIELD_NUMBER: _ClassVar[int]
+    MODIFIERS_FIELD_NUMBER: _ClassVar[int]
+    START_COL_FIELD_NUMBER: _ClassVar[int]
+    ANCHOR_HASH_FIELD_NUMBER: _ClassVar[int]
+    qualified_name: str
+    name: str
+    docstring: str
+    start_line: int
+    end_line: int
+    decorators: _containers.RepeatedScalarFieldContainer[str]
+    is_exported: bool
+    namespace: str
+    generic_arity: int
+    field_types: _containers.RepeatedScalarFieldContainer[str]
+    path: str
+    modifiers: _containers.RepeatedScalarFieldContainer[str]
+    start_col: int
+    anchor_hash: str
+    def __init__(self, qualified_name: _Optional[str] = ..., name: _Optional[str] = ..., docstring: _Optional[str] = ..., start_line: _Optional[int] = ..., end_line: _Optional[int] = ..., decorators: _Optional[_Iterable[str]] = ..., is_exported: bool = ..., namespace: _Optional[str] = ..., generic_arity: _Optional[int] = ..., field_types: _Optional[_Iterable[str]] = ..., path: _Optional[str] = ..., modifiers: _Optional[_Iterable[str]] = ..., start_col: _Optional[int] = ..., anchor_hash: _Optional[str] = ...) -> None: ...
+
+class Interface(_message.Message):
+    __slots__ = ("qualified_name", "name", "path", "absolute_path", "namespace", "generic_arity", "implementers_unknown", "field_types", "docstring", "start_line", "end_line", "decorators", "is_exported", "modifiers", "start_col", "anchor_hash")
+    QUALIFIED_NAME_FIELD_NUMBER: _ClassVar[int]
+    NAME_FIELD_NUMBER: _ClassVar[int]
+    PATH_FIELD_NUMBER: _ClassVar[int]
+    ABSOLUTE_PATH_FIELD_NUMBER: _ClassVar[int]
+    NAMESPACE_FIELD_NUMBER: _ClassVar[int]
+    GENERIC_ARITY_FIELD_NUMBER: _ClassVar[int]
+    IMPLEMENTERS_UNKNOWN_FIELD_NUMBER: _ClassVar[int]
+    FIELD_TYPES_FIELD_NUMBER: _ClassVar[int]
+    DOCSTRING_FIELD_NUMBER: _ClassVar[int]
+    START_LINE_FIELD_NUMBER: _ClassVar[int]
+    END_LINE_FIELD_NUMBER: _ClassVar[int]
+    DECORATORS_FIELD_NUMBER: _ClassVar[int]
+    IS_EXPORTED_FIELD_NUMBER: _ClassVar[int]
+    MODIFIERS_FIELD_NUMBER: _ClassVar[int]
+    START_COL_FIELD_NUMBER: _ClassVar[int]
+    ANCHOR_HASH_FIELD_NUMBER: _ClassVar[int]
+    qualified_name: str
+    name: str
+    path: str
+    absolute_path: str
+    namespace: str
+    generic_arity: int
+    implementers_unknown: str
+    field_types: _containers.RepeatedScalarFieldContainer[str]
+    docstring: str
+    start_line: int
+    end_line: int
+    decorators: _containers.RepeatedScalarFieldContainer[str]
+    is_exported: bool
+    modifiers: _containers.RepeatedScalarFieldContainer[str]
+    start_col: int
+    anchor_hash: str
+    def __init__(self, qualified_name: _Optional[str] = ..., name: _Optional[str] = ..., path: _Optional[str] = ..., absolute_path: _Optional[str] = ..., namespace: _Optional[str] = ..., generic_arity: _Optional[int] = ..., implementers_unknown: _Optional[str] = ..., field_types: _Optional[_Iterable[str]] = ..., docstring: _Optional[str] = ..., start_line: _Optional[int] = ..., end_line: _Optional[int] = ..., decorators: _Optional[_Iterable[str]] = ..., is_exported: bool = ..., modifiers: _Optional[_Iterable[str]] = ..., start_col: _Optional[int] = ..., anchor_hash: _Optional[str] = ...) -> None: ...
+
+class Enum(_message.Message):
+    __slots__ = ("qualified_name", "name", "path", "absolute_path", "namespace", "docstring", "start_line", "end_line", "decorators", "is_exported", "modifiers", "start_col", "anchor_hash")
+    QUALIFIED_NAME_FIELD_NUMBER: _ClassVar[int]
+    NAME_FIELD_NUMBER: _ClassVar[int]
+    PATH_FIELD_NUMBER: _ClassVar[int]
+    ABSOLUTE_PATH_FIELD_NUMBER: _ClassVar[int]
+    NAMESPACE_FIELD_NUMBER: _ClassVar[int]
+    DOCSTRING_FIELD_NUMBER: _ClassVar[int]
+    START_LINE_FIELD_NUMBER: _ClassVar[int]
+    END_LINE_FIELD_NUMBER: _ClassVar[int]
+    DECORATORS_FIELD_NUMBER: _ClassVar[int]
+    IS_EXPORTED_FIELD_NUMBER: _ClassVar[int]
+    MODIFIERS_FIELD_NUMBER: _ClassVar[int]
+    START_COL_FIELD_NUMBER: _ClassVar[int]
+    ANCHOR_HASH_FIELD_NUMBER: _ClassVar[int]
+    qualified_name: str
+    name: str
+    path: str
+    absolute_path: str
+    namespace: str
+    docstring: str
+    start_line: int
+    end_line: int
+    decorators: _containers.RepeatedScalarFieldContainer[str]
+    is_exported: bool
+    modifiers: _containers.RepeatedScalarFieldContainer[str]
+    start_col: int
+    anchor_hash: str
+    def __init__(self, qualified_name: _Optional[str] = ..., name: _Optional[str] = ..., path: _Optional[str] = ..., absolute_path: _Optional[str] = ..., namespace: _Optional[str] = ..., docstring: _Optional[str] = ..., start_line: _Optional[int] = ..., end_line: _Optional[int] = ..., decorators: _Optional[_Iterable[str]] = ..., is_exported: bool = ..., modifiers: _Optional[_Iterable[str]] = ..., start_col: _Optional[int] = ..., anchor_hash: _Optional[str] = ...) -> None: ...
+
+class Type(_message.Message):
+    __slots__ = ("qualified_name", "name", "docstring", "start_line", "end_line", "decorators", "is_exported", "modifiers", "start_col", "anchor_hash", "path")
+    QUALIFIED_NAME_FIELD_NUMBER: _ClassVar[int]
+    NAME_FIELD_NUMBER: _ClassVar[int]
+    DOCSTRING_FIELD_NUMBER: _ClassVar[int]
+    START_LINE_FIELD_NUMBER: _ClassVar[int]
+    END_LINE_FIELD_NUMBER: _ClassVar[int]
+    DECORATORS_FIELD_NUMBER: _ClassVar[int]
+    IS_EXPORTED_FIELD_NUMBER: _ClassVar[int]
+    MODIFIERS_FIELD_NUMBER: _ClassVar[int]
+    START_COL_FIELD_NUMBER: _ClassVar[int]
+    ANCHOR_HASH_FIELD_NUMBER: _ClassVar[int]
+    PATH_FIELD_NUMBER: _ClassVar[int]
+    qualified_name: str
+    name: str
+    docstring: str
+    start_line: int
+    end_line: int
+    decorators: _containers.RepeatedScalarFieldContainer[str]
+    is_exported: bool
+    modifiers: _containers.RepeatedScalarFieldContainer[str]
+    start_col: int
+    anchor_hash: str
+    path: str
+    def __init__(self, qualified_name: _Optional[str] = ..., name: _Optional[str] = ..., docstring: _Optional[str] = ..., start_line: _Optional[int] = ..., end_line: _Optional[int] = ..., decorators: _Optional[_Iterable[str]] = ..., is_exported: bool = ..., modifiers: _Optional[_Iterable[str]] = ..., start_col: _Optional[int] = ..., anchor_hash: _Optional[str] = ..., path: _Optional[str] = ...) -> None: ...
+
+class Union(_message.Message):
+    __slots__ = ("qualified_name", "name", "field_types", "docstring", "start_line", "end_line", "decorators", "is_exported", "modifiers", "start_col", "anchor_hash", "path")
+    QUALIFIED_NAME_FIELD_NUMBER: _ClassVar[int]
+    NAME_FIELD_NUMBER: _ClassVar[int]
+    FIELD_TYPES_FIELD_NUMBER: _ClassVar[int]
+    DOCSTRING_FIELD_NUMBER: _ClassVar[int]
+    START_LINE_FIELD_NUMBER: _ClassVar[int]
+    END_LINE_FIELD_NUMBER: _ClassVar[int]
+    DECORATORS_FIELD_NUMBER: _ClassVar[int]
+    IS_EXPORTED_FIELD_NUMBER: _ClassVar[int]
+    MODIFIERS_FIELD_NUMBER: _ClassVar[int]
+    START_COL_FIELD_NUMBER: _ClassVar[int]
+    ANCHOR_HASH_FIELD_NUMBER: _ClassVar[int]
+    PATH_FIELD_NUMBER: _ClassVar[int]
+    qualified_name: str
+    name: str
+    field_types: _containers.RepeatedScalarFieldContainer[str]
+    docstring: str
+    start_line: int
+    end_line: int
+    decorators: _containers.RepeatedScalarFieldContainer[str]
+    is_exported: bool
+    modifiers: _containers.RepeatedScalarFieldContainer[str]
+    start_col: int
+    anchor_hash: str
+    path: str
+    def __init__(self, qualified_name: _Optional[str] = ..., name: _Optional[str] = ..., field_types: _Optional[_Iterable[str]] = ..., docstring: _Optional[str] = ..., start_line: _Optional[int] = ..., end_line: _Optional[int] = ..., decorators: _Optional[_Iterable[str]] = ..., is_exported: bool = ..., modifiers: _Optional[_Iterable[str]] = ..., start_col: _Optional[int] = ..., anchor_hash: _Optional[str] = ..., path: _Optional[str] = ...) -> None: ...

@@ -1,0 +1,284 @@
+---
+description: "Find functions and methods that are unreachable from any entry point using the code knowledge graph."
+---
+
+# Dead Code Detection
+
+`cgr dead-code` reports functions and methods that are **unreachable** from any
+entry point in the knowledge graph. It walks the `CALLS` and `REFERENCES` edges
+outward from a set of roots (exported and public symbols, tests, decorated
+handlers such as routes/tasks/CLI commands, dunder/lifecycle methods, and
+JavaScript/TypeScript well-known symbol properties) and lists everything the
+walk never reaches.
+
+The results are **candidates for review, not a guaranteed delete list**. Code
+reached only through dynamic dispatch, reflection, string-keyed lookups, or an
+external framework that the static graph cannot see may still be reported. Read
+each candidate before removing it.
+
+## Language Coverage
+
+Detection needs a call graph, so it covers only the
+[fully supported languages](../architecture/language-support.md). Languages
+served by the structural (ast-grep) tier, such as Ruby, produce no `CALLS`
+edges, so their symbols are always treated as reachable and never reported.
+
+That exemption is deliberate: without call edges every symbol would look
+unreachable. But it means a clean report says nothing about those languages, so
+the command prints how many symbols were skipped:
+
+```text
+No unreachable functions or methods found.
+(public symbols treated as roots; use --no-public-roots for application code)
+12 symbol(s) in structural-tier languages were not analyzed (no call graph for these languages).
+```
+
+PHP has no module privacy, so every function declared at file level and every
+non-`private` member of a named class, interface, trait or enum is a public
+root; closures and anonymous-class members are not. A PHP test is recognised
+wherever it lives: a `*Test.php` file, a `Tests/` directory, or a class
+extending PHPUnit's `TestCase` (directly, through a project base class, or
+through a framework base such as Symfony's `KernelTestCase`), together with
+everything declared in it.
+
+## Prerequisites
+
+Index the repository first, so the graph exists in Memgraph:
+
+```bash
+cgr daemon up
+cgr start --repo-path /path/to/your/repo --update-graph --clean
+```
+
+## Basic Usage
+
+```bash
+cgr dead-code
+```
+
+![cgr dead-code listing the one unreachable method in the requests repository](../assets/demos/dead-code.gif)
+
+*Recorded on psf/requests.*
+
+Run from inside an indexed checkout, it reads that checkout's project (the
+one `--repo-path`, default the current directory, was indexed as). Outside
+any indexed checkout it uses the graph's only project; when there are
+several, name one (see [Choosing the Project](cli-reference.md#choosing-the-project)):
+
+```bash
+cgr dead-code --project my-project
+```
+
+## Declaring Entry Points
+
+A function invoked only by a framework or an external caller has no visible
+call site, so it looks unreachable. Mark such roots so the code they reach is
+not reported:
+
+```bash
+# Treat any symbol whose qualified name ends with these as reachable roots
+cgr dead-code -e main -e cli.run -e handlers.webhook
+
+# Treat symbols carrying a decorator as roots (extends the built-in set:
+# route, task, fixture, command, ...). A dotted value matches the decorator's
+# trailing segments: `plugins.register` roots `@plugins.register(...)` and
+# `@app.plugins.register`, not `@other.register`; a bare `register` roots any
+# `@x.register`.
+cgr dead-code --decorator-root plugins.register --decorator-root signal_handler
+```
+
+![cgr dead-code run before and after -e main -e cli.run -e handlers.webhook on a small C plugin, the second run no longer reporting run, webhook and their callees](../assets/demos/dead-code-entry-points.gif)
+
+*Recorded on a small C plugin whose host resolves `run` and `webhook` with `dlsym()`, so no call site reaches them.*
+
+## Libraries and Applications
+
+By default every exported or public symbol is a root, because a library's
+public API is called from outside the repository. An application or service
+is different: nearly every function in it is public by naming convention, yet
+only a few entry points run it. There the default hides almost all dead code,
+since only private (`_helper`) symbols can ever be reported. Pass
+`--no-public-roots` to drop the rule:
+
+```bash
+cgr dead-code --no-public-roots
+```
+
+Without public roots, the roots are:
+
+- **Program entry points.** A module-level `main` in Python (a console
+  script's target), a top-level one in Dart (not a local function named
+  `main`), and the Java `main` the JVM launcher would start. That is a
+  non-private `void main(String[] args)` (also written `String args[]` or
+  `String... args`), or, when the class declares none, a non-private
+  `void main()`. An instance `main` also needs a concrete class with a
+  non-private zero-argument constructor. The rules every mode applies count
+  too: `main` in C, C++, Go and Rust, and a `static Main` in C#. Module-level
+  code also counts, such as an `if __name__ == "__main__":` block, so
+  whatever it calls is reachable.
+- **Tests**, unless `--no-include-tests`.
+- **Decorated handlers**: routes, tasks, CLI commands and any `--decorator-root`.
+- **Runtime hooks**: dunder and lifecycle methods, the overrides a runtime
+  calls through an external base (an external Rust trait's impl, a Dart
+  `@override`, a Python standard-library base class), and the `visit_*` and
+  `generic_visit` handlers of a Python `ast.NodeVisitor` or
+  `ast.NodeTransformer` subclass, which `visit` looks up by name. A
+  `pytest_*` function or method is a pytest hook, which pytest calls by name
+  in a plugin module (a `pytest11` entry point) as in a `conftest.py`.
+- **Type-checker declarations**: a Python `typing.Protocol` and a class
+  declared under `if TYPE_CHECKING:`, with their members. Their stubs type a
+  receiver, such as `self` in a mixin, whose calls resolve to the
+  implementation, so nothing ever calls the stub itself, and the class is
+  named only in annotations.
+- **Every `--entry-point`.**
+
+Symbols in structural-tier languages stay roots in both modes, since they have
+no call graph that could reach them.
+
+A clean report names the rule that produced it, so an empty report on an
+application is not mistaken for a clean one:
+
+```text
+No unreachable functions or methods found.
+(public symbols treated as roots; use --no-public-roots for application code)
+```
+
+With `--no-public-roots` the second line reads
+`(public symbols not treated as roots)`.
+
+Without public roots, a public symbol that only an external framework calls
+has no root. Examples are a Java method that implements a library interface,
+or a page component that a router loads by file name. Name such symbols with
+`--entry-point`, or their decorator or annotation with `--decorator-root`
+(`--decorator-root Override` roots Java `@Override` methods).
+
+## Excluding Generated Code
+
+Generated or vendored code (API clients, protobuf stubs) is full of callbacks a
+library invokes and reports noisily. Exclude it by file-path glob:
+
+```bash
+cgr dead-code --exclude '*client/core*' --exclude '*.gen.*'
+```
+
+![cgr dead-code with --exclude '*client/core*' --exclude '*.gen.*' dropping the generated client and protobuf files from the report](../assets/demos/dead-code-exclude.gif)
+
+Two rules keep a pattern from silently excluding nothing:
+
+- **Quote the glob.** Unquoted, the shell expands `--exclude src/gen/*` into
+  a file listing before `cgr` runs — the first file becomes the pattern and
+  the rest are rejected as extra arguments (or, if the glob matches nothing,
+  some shells pass it through and others error out). Quotes make the shell
+  hand the pattern over untouched.
+- **Cover the whole path.** Patterns are matched against the full
+  repo-relative file path (`src/client/core/api.py`), and a glob only counts
+  when it matches that entire string. A bare directory name like `tests`
+  matches nothing; spell the path out from the repo root (`'tests/*'`,
+  `'src/tests/*'`) and add `'*/tests/*'` when test directories nest deeper.
+  `*` spans `/`, so keep patterns path-scoped: a substring glob like
+  `'*tests*'` also excludes production paths such as `contests/entry.py`.
+
+## Options
+
+| Option | Description |
+|--------|-------------|
+| `--project-name`, `-n` | Project to scan. Defaults to the sole indexed project. |
+| `--entry-point`, `-e` | Treat symbols whose qualified name ends with this value as reachable roots. Repeatable. |
+| `--decorator-root` | Treat symbols carrying this decorator as roots: a bare name matches the decorator's last segment, a dotted one (`plugins.register`) its trailing whole segments. Extends the built-in set. Repeatable. |
+| `--exclude` | Glob matched against a symbol's whole repo-relative file path to exclude it from the report; quote it. Repeatable. |
+| `--include-tests` / `--no-include-tests` | Treat test code as reachable roots so the production code it exercises is not reported. On by default. |
+| `--classes` / `--no-classes` | Also report unreachable classes. Off by default. |
+| `--public-roots` / `--no-public-roots` | Treat every public or exported symbol as a root, as suits a library. On by default; turn it off for an application (see [Libraries and Applications](#libraries-and-applications)). |
+| `--format` | Output format: `table` (default) or `json`. |
+| `--output`, `-o` | Write the report to this file instead of stdout. |
+| `--fail-on-found` | Exit with code 1 when any candidate is found (useful in CI). |
+
+## Use in CI
+
+Fail a build when new unreachable code appears, writing a JSON report for the
+job artifacts:
+
+```bash
+cgr dead-code --format json --output dead-code.json --fail-on-found \
+  --exclude '*_generated*'
+```
+
+![cgr dead-code writing a JSON report with --fail-on-found, exiting 1, and jq listing each candidate's path and start line](../assets/demos/dead-code-ci.gif)
+
+Each JSON row carries `label`, `name`, `qualified_name`, `path`, `start_line`
+and `end_line`. `path` is the repo-relative file (the same path `--exclude`
+matches), so an annotation can point at `path:start_line` without guessing
+the file from the qualified name. The table shows it in its `Path` column.
+A table written with `--output` or to a pipe is as wide as its longest row,
+so no name or path is cut to fit 80 columns.
+
+## How It Works
+
+1. **Roots**: exported/public symbols (unless `--no-public-roots`), tests (unless `--no-include-tests`),
+   decorated handlers, dunder/lifecycle methods, program entry points (`main`
+   in C, C++, Go and Rust; a `static Main` in C#, whatever its accessibility),
+   plus any `--entry-point` and `--decorator-root` you add. Each language's
+   own visibility rule decides what is public:
+   - **C:** a function without `static`, outside another function's body,
+     and not made `static` by an earlier declaration.
+   - **C++:** besides a C++20 module `export`:
+     - a function with external linkage that is no class member: at
+       namespace scope, or a friend defined inside a class (a hidden friend
+       such as `operator==`, which no access label governs). It is not
+       `static`, no earlier declaration of it is `static`, and its namespace
+       is not inside an anonymous namespace at any depth. A definition
+       written `void N::f() {}` belongs to the namespace `N` names, followed
+       through namespace aliases and `using namespace`;
+     - a member defined inside a class under `public:` or `protected:` (a
+       `struct` starts public, a `class` private), unless the class is local
+       to a function, inside an anonymous namespace, or private in a class
+       around it.
+
+     Access labels inside `#if` / `#ifdef` blocks count. A member counts
+     when one build both compiles it and makes it public in every class
+     around it. An out-of-line member definition (`int Box::f() {}`) or
+     class (`struct Outer::Inner {}`) takes its access from a class
+     declaration in another file, so it is not counted. A class template
+     specialization at namespace scope
+     (`template <> struct std::hash<Foo> {...}`, or a partial one) is
+     counted: the library it specializes calls its members. A specialization
+     of a member template of a class in the same file
+     (`template <> struct Outer::Hidden<int> {...}`) is an out-of-line nested
+     class, so it is not counted.
+   - **Scala:** a member or top-level `def`, extension methods included,
+     that is not `private` or `private[pkg]`, in no `private` object or
+     class.
+2. **Reachability**: a breadth-first walk over `CALLS` and `REFERENCES` edges
+   from every root. With `--classes` the walk also follows `INSTANTIATES` and
+   `INHERITS`, so a class counts as reachable when a reachable class
+   instantiates or subclasses it.
+3. **Report**: functions and methods (and, with `--classes`, classes) the walk
+   never reaches, minus anything matching an `--exclude` glob.
+
+### What counts as test code
+
+`--include-tests`, `--no-include-tests`, `cgr graph tests-reaching` and
+`cgr check` all classify a symbol as test code the same way. Its file path is
+read as whole words of its directories and file name, never as a substring,
+so `shortest_paths/` and `latest_prices.py` stay production code:
+
+- a snake or kebab-case word, in any case: `test`, `tests`, `unittest`,
+  `unittests` or `conftest` (`tests/`, `Tests/`, `__tests__/`, `test_app.py`,
+  `server_test.go`, `snappy_unittest.cc`, `e2e-tests/`);
+- a CamelCase name ending in `Test` or `Tests`, or starting with `test`
+  followed by a capital (`ParserTests.cs`, `AppTests/`, `src/androidTest/`,
+  `src/integrationTest/`, `src/testFixtures/`);
+- a dotted qualifier `test`, `tests`, `spec` or `specs` (`app.test.ts`,
+  `app.spec.tsx`, `src/Acme.Tests/`, `src/Acme.Specs/`);
+- a `testing/` or `_testing/` directory, and a `spec/` or `specs/` directory
+  at the repository root (RSpec, Jasmine). A nested `spec/` is left alone,
+  since it is often a package such as `java/security/spec/`.
+
+Rust `#[test]` functions and `#[cfg(test)]` modules count as test code too,
+wherever they are.
+
+First-class functions matter for accuracy: a callback stored in an object, an
+inline arrow handed to `useMutation`/`.forEach`/`new Promise`, a function
+passed as an argument, or a Java method reference (`Acc::add`, `this::m`,
+`Acc::new`) is recorded as a `REFERENCES` edge so it stays reachable rather
+than being reported as dead.

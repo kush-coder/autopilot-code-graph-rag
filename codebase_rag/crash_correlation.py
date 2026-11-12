@@ -1,0 +1,1005 @@
+# Traceback-to-graph correlation (issue #227). A traceback is the ground-truth
+# call path of the crashing thread; the graph knows who else can reach the
+# failing frame (CALLS) and where the failing value could have come from
+# (FLOWS_TO). Frame resolution reuses the dynamic-trace resolver, and
+# reachability runs CLIENT-side over linear scans, the same discipline as
+# flow_verdict.py and dead_code.py.
+
+from __future__ import annotations
+
+import re
+from collections import deque
+from pathlib import Path
+from typing import TYPE_CHECKING, NamedTuple
+
+from . import constants as cs
+from .flow_verdict import CYPHER_FLOW_COVERAGE_GAPS, CYPHER_FLOW_EDGES, QueryFn
+from .language_spec import get_language_for_extension
+from .trace.records import FramePoint
+from .trace.resolution import (
+    CallableNode,
+    FrameResolver,
+    PathRebase,
+    ResolutionStats,
+    is_absolute_on_any_os,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+
+# All CALLS pairs of one project, static and runtime-discovered alike: an edge
+# a previous trace ingestion created is a real observed call path, exactly the
+# evidence a root-cause walk wants (unlike ingest, which excludes them so a
+# re-ingest cannot reclassify its own edges).
+CYPHER_CRASH_CALLS = f"""MATCH (a)-[:{cs.RelationshipType.CALLS.value}]->(b)
+WHERE a.qualified_name STARTS WITH $prefix
+  AND b.qualified_name STARTS WITH $prefix
+RETURN a.qualified_name AS from_qn, b.qualified_name AS to_qn
+"""
+
+# Declared positional parameters, for the arity check. A node without the
+# property yields NULL and the diagnosis declines rather than comparing
+# against a phantom empty signature. The path comes along because other
+# languages store their own lists (issue #2517), and a Python TypeError is
+# never raised by one of their functions.
+CYPHER_CRASH_POSITIONAL_PARAMS = f"""MATCH (n)
+WHERE n.qualified_name STARTS WITH $prefix
+  AND n.{cs.KEY_POSITIONAL_PARAMS} IS NOT NULL
+RETURN n.qualified_name AS qn, n.{cs.KEY_POSITIONAL_PARAMS} AS positional_params,
+       n.{cs.KEY_PATH} AS path
+"""
+
+_TYPE_ERROR = "TypeError"
+
+# ``  File "/app/service.py", line 14, in handle_request``
+_TB_FRAME = re.compile(
+    r'^\s*File "(?P<path>[^"]+)", line (?P<line>\d+), in (?P<name>.+)$'
+)
+_TB_HEADER = "Traceback (most recent call last):"
+_TB_GROUP_HEADER = "Exception Group Traceback (most recent call last):"
+# The lines that join one section of a chained traceback to the next.
+_TB_CHAIN_LINKS = (
+    "The above exception was the direct cause of the following exception:",
+    "During handling of the above exception, another exception occurred:",
+)
+# ``ValueError: boom`` or a bare ``KeyboardInterrupt``; the leading class of
+# characters admits Unicode identifiers, which Python allows in class names.
+_TB_EXCEPTION = re.compile(r"^(?P<type>[^\W\d][\w.]*)(?::\s?(?P<message>.*))?$")
+# ExceptionGroup rendering draws a box: ``  + Exception Group Traceback ...``
+# opens the group, ``  | `` prefixes each of its lines, and ``  +-+---- 1 ----``
+# and ``    +---- 2 ----`` open its members one margin deeper. Each nesting
+# level sits two columns further right (issue #3235).
+_TB_BOX_MEMBER = re.compile(r"^(?P<indent> *)(?P<first>\+-)?\+-+ (?P<title>\S+) -+$")
+_TB_BOX_LINE = re.compile(r"^(?P<indent> *)[+|](?: (?P<text>.*))?$")
+# ``    +------------------------------------`` closes a group's members.
+_TB_BOX_RULE = re.compile(r"^ *\+-+$")
+_TB_BOX_STEP = 2
+# CPython lists at most `max_group_width` members and nests at most
+# `max_group_depth` groups, and says what it left out.
+_TB_ELIDED_TITLE = "..."
+_TB_MORE_MEMBERS = re.compile(r"^and (?P<count>\d+) more exceptions?$")
+_TB_DEPTH_ELIDED = re.compile(r"^\.\.\. \(max_group_depth is \d+\)$")
+
+_REASON_ON_STACK = "on the crashing stack, {depth} frame(s) above the failure"
+_REASON_CALLER = "can reach the failing frame through CALLS, depth {depth}"
+_REASON_FLOW = "FLOWS_TO source into the failing frame"
+
+_SCORE_FLOW = 0.6
+_SCORE_ON_STACK = 0.3
+_SCORE_CALLER_BASE = 0.4
+_RANK_LIMIT = 10
+_CALLER_DEPTH_LIMIT = 3
+
+
+class ParsedTraceback(NamedTuple):
+    """The last (propagated) traceback section, outermost frame first."""
+
+    frames: tuple[FramePoint, ...]
+    exception_type: str
+    exception_message: str
+    # An ExceptionGroup's sub-exceptions in printed order, each parsed the
+    # same way, nested groups included; empty for any other exception. The
+    # group's own `frames` are the stack that raised it (issue #3235).
+    members: tuple[ParsedTraceback, ...] = ()
+    # Sub-exceptions the rendering itself left out, past its width or depth
+    # limit.
+    omitted_members: int = 0
+
+
+class _TracebackLine(NamedTuple):
+    """One line of traceback text with its group box taken off.
+
+    `level` is how many groups' member boxes enclose it; a member separator
+    has no text, its title, and the level of the member it opens.
+    """
+
+    level: int
+    text: str
+    member_title: str | None = None
+
+
+class FrameContext(NamedTuple):
+    """One traceback frame with its graph neighbourhood."""
+
+    path: str
+    line: int
+    name: str
+    qualified_name: str | None
+    label: str | None
+    unresolved_reason: str | None
+    callers: tuple[str, ...]
+    callees: tuple[str, ...]
+    flow_sources: tuple[str, ...]
+
+
+class FrameResolutionRate(NamedTuple):
+    """How much of a traceback the graph could actually anchor (issue #227).
+
+    Named for the frames it counts rather than "resolution stats", because
+    `trace.resolution.ResolutionStats` is already imported here and counts
+    something else entirely -- the resolver's internal attempts for ONE frame.
+    Shadowing it silently broke `_resolve_stack`.
+
+    Per-frame ``unresolved_reason`` says WHICH frames failed to resolve; this
+    says HOW MANY, which is what decides whether a report is worth acting on.
+    A stack where one frame in three resolved and one where all three did are
+    different artefacts, and without the aggregate they read alike.
+    """
+
+    total: int
+    resolved: int
+
+    @property
+    def rate(self) -> float:
+        """Resolved frames over ALL frames, 0.0 when there are none.
+
+        The denominator is every frame in the traceback, including those
+        outside the repository. Dividing by the resolved count instead would
+        report 1.0 for every report ever produced, and skipping unresolved
+        frames would hide exactly the gap this measures. An empty stack
+        resolves nothing, so it scores 0.0 rather than a vacuous 1.0 -- the
+        same trap as an average over no cases.
+        """
+        return self.resolved / self.total if self.total else 0.0
+
+
+class TracebackReport(NamedTuple):
+    exception_type: str
+    exception_message: str
+    frames: tuple[FrameContext, ...]
+    flow_gaps: tuple[str, ...]
+    resolution: FrameResolutionRate
+    # None when the crash is not an arity TypeError, which is most crashes.
+    arity: ArityFinding | None = None
+    # The other checkout's root the frames were matched under, when it was
+    # inferred from their paths rather than given or local (issue #2587).
+    inferred_root: str | None = None
+    # Why nothing resolved, when nothing did, and what an ExceptionGroup's
+    # report holds.
+    note: str | None = None
+    # An ExceptionGroup's sub-exceptions, each explained on its own; the
+    # group's `frames` are the stack that raised it (issue #3235).
+    members: tuple[TracebackReport, ...] = ()
+    omitted_members: int = 0
+
+
+class ArityError(NamedTuple):
+    """An arity `TypeError` decomposed into the parts the graph can check.
+
+    Unlike most of this module, an arity error needs no ranking: the message
+    names the callee and the counts, and the graph knows the declared
+    parameters, so the mismatch is mechanically decidable (issue #227,
+    Phase 1).
+
+    `expected`/`actual` are set by the "takes N but M were given" form and
+    `missing` by the "missing N required positional argument" form. Exactly
+    one form matches any given message, so the unused fields stay empty
+    rather than carrying a sentinel that reads as a real count.
+    """
+
+    callee: str
+    expected: int | None = None
+    actual: int | None = None
+    missing: tuple[str, ...] = ()
+
+
+# Sentinel for "the caller cannot tell positional parameters from keyword-only
+# ones". Distinct from `()`, which asserts a function genuinely declares NO
+# parameters -- a claim, where this is the absence of one.
+#
+# Python ingestion writes `positional_params`, so a Python callee yields real
+# names. Every other frontend leaves the property absent, and those callees
+# land here: the kinds were never extracted, so nothing is known about them.
+# Absent is deliberately not stored as `[]` -- that would assert "declares no
+# positional parameters" and produce a false mismatch on correct code.
+_ARITY_KINDS_UNKNOWN: tuple[str, ...] = ("\x00unknown",)
+
+
+class ArityVerdict(NamedTuple):
+    """What the graph's stored signature says about a parsed arity error.
+
+    `confirmed` false is a FINDING, not a failure to diagnose: it means the
+    resolved function's signature disagrees with the message, so the function
+    the graph matched is not the one that raised -- a stale index, or a
+    same-named function elsewhere. Reporting that beats silently confirming
+    against the wrong target.
+    """
+
+    declared_count: int
+    confirmed: bool
+
+
+class ArityFinding(NamedTuple):
+    """An arity `TypeError` from a report's own traceback, graph-checked.
+
+    `callee_qualified_name` is None when the message names a callee the graph
+    cannot pin to exactly one node -- unknown to the graph, or ambiguous
+    across modules. `verdict` is then None as well: an unidentified callee has
+    no stored signature to compare against, which is a different outcome from
+    a stored signature that disagrees.
+    """
+
+    error: ArityError
+    callee_qualified_name: str | None
+    verdict: ArityVerdict | None
+
+
+# CPython emits "1 was given" for a single argument and "2 were given" for
+# several, so the verb is part of the pattern rather than a fixed literal.
+# Written from messages captured by RUNNING the failing calls, not from
+# recollection -- the singular form is exactly what a regex built from a
+# plural example silently misses.
+#
+# Both patterns are ANCHORED. Without `^` a message that merely CONTAINS the
+# arity shape would parse, and the callee captured would be whatever token
+# happened to precede it.
+# A qualifier component is a word run OR the literal `<locals>`: CPython
+# names a nested function `outer.<locals>.inner`, and `<`/`>` are not `\w`,
+# so a word-only qualifier rejects the entire message and the diagnosis is
+# silently dropped for every nested function (found on #1485). Spelled as an
+# exact alternative rather than a permissive character class -- the set of
+# qualifier shapes CPython emits is finite, and a loose one would let the
+# anchors admit callee text they exist to exclude.
+_QUALIFIER = r"(?:(?:\w+|<locals>)\.)*"
+_ARITY_TOO_MANY = re.compile(
+    rf"^{_QUALIFIER}(?P<callee>\w+)\(\) takes (?P<expected>\d+) positional "
+    r"arguments? but (?P<actual>\d+) (?:was|were) given$"
+)
+_ARITY_MISSING = re.compile(
+    rf"^{_QUALIFIER}(?P<callee>\w+)\(\) missing \d+ required positional "
+    r"arguments?: (?P<names>.+)$"
+)
+
+
+def parse_arity_error(message: str) -> ArityError | None:
+    """Decompose an arity `TypeError` message, or None if it is not one.
+
+    Most `TypeError`s are not arity errors ("unsupported operand type(s)",
+    "'NoneType' object is not subscriptable"), so returning None is the
+    common case and must stay cheap and certain.
+
+    The callee is reduced to its FINAL component: CPython writes `C.m()` for
+    a method, while the graph stores it under a qualified name that already
+    carries its own class prefix, so a `C.m` needle would fail to match
+    `project.mod.C.m`.
+    """
+    if match := _ARITY_TOO_MANY.match(message):
+        return ArityError(
+            callee=match["callee"],
+            expected=int(match["expected"]),
+            actual=int(match["actual"]),
+        )
+    if match := _ARITY_MISSING.match(message):
+        names = tuple(
+            part.strip().strip("'")
+            for part in match["names"].replace(" and ", ", ").split(",")
+            if part.strip()
+        )
+        return ArityError(callee=match["callee"], missing=names)
+    return None
+
+
+def diagnose_arity(
+    error: ArityError, declared: tuple[str, ...], is_method: bool
+) -> ArityVerdict:
+    """Check a parsed arity error against a function's declared parameters.
+
+    `self` is the subtlety this exists to get right. CPython counts the bound
+    receiver, so `C.m(self, a)` reports "takes 2" for one caller-supplied
+    parameter. Comparing the message's 2 against a stored `("a",)` would
+    report a mismatch on CORRECT code -- turning a diagnostic aid into a
+    source of false accusations, which is worse than no diagnosis.
+
+    `declared` must contain POSITIONAL parameters only. Names are not enough
+    to tell kinds apart: `def only_kw(*, a)` reports "takes 0 positional
+    arguments" while its declared names are `("a",)`, so counting every name
+    as positional produces `confirmed=False` on correct code -- the same false
+    accusation the `self` handling exists to prevent (reported on #1485).
+
+    A caller that cannot separate the kinds must pass
+    `declared=_ARITY_KINDS_UNKNOWN` rather than guessing. The verdict is then
+    `confirmed=False` with `declared_count=-1`, which reads as "the graph
+    cannot corroborate this" instead of "the graph disagrees". Those are
+    different claims and only one of them is true.
+    """
+    if declared == _ARITY_KINDS_UNKNOWN:
+        return ArityVerdict(declared_count=-1, confirmed=False)
+    declared_count = len(declared)
+    if is_method and (not declared or declared[0] not in {"self", "cls"}):
+        # A method whose stored parameters omit the receiver: add it back so
+        # the comparison is against what CPython counts.
+        declared_count += 1
+    if error.expected is None:
+        # The "missing" form names parameters rather than counts; the graph
+        # confirms it when every named parameter is actually declared.
+        return ArityVerdict(
+            declared_count=declared_count,
+            confirmed=all(name in declared for name in error.missing),
+        )
+    return ArityVerdict(
+        declared_count=declared_count,
+        confirmed=declared_count == error.expected,
+    )
+
+
+def _declares_its_arity(path: str) -> bool:
+    """Whether the node's list follows another language's rules (#2517)."""
+    return get_language_for_extension(Path(path).suffix) in cs.DECLARED_ARITY_LANGUAGES
+
+
+class RootCause(NamedTuple):
+    qualified_name: str
+    path: str | None
+    line: int | None
+    score: float
+    reasons: tuple[str, ...]
+    call_path: tuple[str, ...]
+
+
+class RootCauseReport(NamedTuple):
+    """Ranked writers/callers that can explain the failure.
+
+    ``failing`` is the innermost frame the graph resolves -- the deepest
+    point the analysis can anchor on. When the crash site itself is deeper
+    (a library frame, or an in-repo frame the graph cannot match),
+    ``anchor_is_crash_site`` is false so the ranking reads as "relative to
+    the deepest resolvable frame", never as a claim about the crash line.
+    ``flow_used`` distinguishes "no FLOWS_TO evidence considered" from "flow
+    considered and empty": when the project has no flow edges at all the
+    ranking degrades to a CALLS-only walk. ``flow_gaps`` always names the
+    files outside flow-analysis coverage so an absent flow signal is not
+    read as evidence.
+    """
+
+    exception_type: str
+    exception_message: str
+    failing: str | None
+    anchor_is_crash_site: bool
+    candidates: tuple[RootCause, ...]
+    flow_used: bool
+    flow_gaps: tuple[str, ...]
+    # The same measurements `TracebackReport` carries: without them an empty
+    # ranking cannot say whether the graph lacked the code or the paths
+    # simply did not line up (issue #2587).
+    resolution: FrameResolutionRate = FrameResolutionRate(total=0, resolved=0)
+    inferred_root: str | None = None
+    note: str | None = None
+    # An ExceptionGroup's sub-exceptions, each ranked against its own
+    # failing frame; the group's own ranking anchors where it was raised.
+    members: tuple[RootCauseReport, ...] = ()
+    omitted_members: int = 0
+
+
+def parse_python_traceback(text: str) -> ParsedTraceback:
+    """Parse CPython traceback text into frames and the exception line.
+
+    Chained tracebacks (``During handling ...``/``direct cause``) contain
+    several sections; the last one is the failure that propagated, so its
+    frames and its trailing exception line are the ones returned. When that
+    failure is an ``ExceptionGroup``, its frames are the stack that raised
+    the group, and each sub-exception printed inside the group's box is
+    parsed the same way into `members`.
+    """
+    return _parse_section(_traceback_lines(text), 0)
+
+
+def _traceback_lines(text: str) -> list[_TracebackLine]:
+    """The non-blank lines of `text`, each with its group margin removed.
+
+    A margin is read only where the text draws a group's box, by a member
+    separator or a boxed traceback header: elsewhere a quoted source line
+    such as ``| flag`` is code, not a margin.
+    """
+    lines = [line for line in text.splitlines() if line.strip()]
+    separators = _separators(lines)
+    # The margin column of each box the text opens: a separator's group sits
+    # one step left of its members, and a boxed header at its own margin.
+    margins = [
+        _member_column(match) - _TB_BOX_STEP for match in separators.values()
+    ] + [
+        len(match["indent"])
+        for line in lines
+        if (match := _TB_BOX_LINE.match(line))
+        and (match["text"] or "").strip() in (_TB_HEADER, _TB_GROUP_HEADER)
+    ]
+    if not margins:
+        return [_TracebackLine(0, line) for line in lines]
+    base = min(margins)
+
+    def level(column: int) -> int:
+        return (column - base) // _TB_BOX_STEP
+
+    parsed: list[_TracebackLine] = []
+    for index, line in enumerate(lines):
+        if match := separators.get(index):
+            parsed.append(
+                _TracebackLine(level(_member_column(match)), "", match["title"])
+            )
+        elif match := _TB_BOX_LINE.match(line):
+            parsed.append(
+                _TracebackLine(level(len(match["indent"])), match["text"] or "")
+            )
+        else:
+            parsed.append(_TracebackLine(0, line))
+    return parsed
+
+
+def _separators(lines: list[str]) -> dict[int, re.Match[str]]:
+    """The member separators of `lines`, by index.
+
+    A separator follows a line of the box it is drawn in: a boxed line, or
+    the rule closing a nested group's members. Unboxed text of its shape,
+    such as a plain error's note, opens no member; a fragment may start at
+    one.
+    """
+    return {
+        index: match
+        for index, line in enumerate(lines)
+        if (match := _TB_BOX_MEMBER.match(line))
+        and (
+            index == 0
+            or _TB_BOX_LINE.match(lines[index - 1])
+            or _TB_BOX_RULE.match(lines[index - 1])
+        )
+    }
+
+
+def _member_column(separator: re.Match[str]) -> int:
+    """The margin column of the members a separator opens: ``+-+----``
+    starts at the group's margin, ``+----`` at the members'."""
+    indent = len(separator["indent"])
+    return indent + _TB_BOX_STEP if separator["first"] else indent
+
+
+def _parse_section(lines: list[_TracebackLine], level: int) -> ParsedTraceback:
+    """The propagated exception of `lines`, whose own text sits at `level`."""
+    # The last section of a chain propagated. One printed without being
+    # raised has no header, and the last header is then its cause's.
+    links = [
+        index
+        for index, line in enumerate(lines)
+        if line.level == level and line.text.strip() in _TB_CHAIN_LINKS
+    ]
+    if links:
+        lines = lines[links[-1] + 1 :]
+    headers = [
+        index
+        for index, line in enumerate(lines)
+        if line.level == level and line.text.strip() in (_TB_HEADER, _TB_GROUP_HEADER)
+    ]
+    tail = lines[headers[-1] + 1 :] if headers else lines
+    frames: list[FramePoint] = []
+    exception_type = ""
+    exception_message = ""
+    for line in (line.text for line in tail if line.level == level):
+        if match := _TB_FRAME.match(line):
+            frames.append(
+                FramePoint(
+                    path=match.group("path"),
+                    qualname=match.group("name").strip(),
+                    line=int(match.group("line")),
+                )
+            )
+        # Source snippets and caret markers are indented; the exception line
+        # is the first flush-left line after the frames.
+        elif not line[:1].isspace() and (match := _TB_EXCEPTION.match(line)):
+            exception_type = match.group("type")
+            exception_message = match.group("message") or ""
+            break
+    members, omitted = _parse_members(tail, level + 1)
+    return ParsedTraceback(
+        tuple(frames), exception_type, exception_message, members, omitted
+    )
+
+
+def _parse_members(
+    lines: list[_TracebackLine], level: int
+) -> tuple[tuple[ParsedTraceback, ...], int]:
+    """The group members printed in `lines` at `level`, and how many the
+    rendering left out."""
+    # A member runs to the next separator at its level; what follows the
+    # group's box sits at a lower level, which a member's own text excludes.
+    blocks: list[tuple[str, list[_TracebackLine]]] = []
+    for line in lines:
+        if line.level == level and line.member_title is not None:
+            blocks.append((line.member_title, []))
+        elif blocks:
+            blocks[-1][1].append(line)
+    members: list[ParsedTraceback] = []
+    omitted = 0
+    for title, block in blocks:
+        own = [line.text for line in block if line.level == level]
+        if title == _TB_ELIDED_TITLE:
+            omitted += sum(
+                int(match["count"])
+                for text in own
+                if (match := _TB_MORE_MEMBERS.match(text))
+            )
+        elif len(own) == 1 and _TB_DEPTH_ELIDED.match(own[0]):
+            omitted += 1
+        else:
+            members.append(_parse_section(block, level))
+    return tuple(members), omitted
+
+
+def _anchored(frame: FramePoint, repo_root: Path) -> FramePoint:
+    """A frame whose relative path is joined to the repository root.
+
+    Tracebacks from a process started inside the repository carry paths
+    relative to it; absolute paths and synthetic files (``<stdin>``) pass
+    through and resolve (or fail containment) as they are. Absolute means
+    absolute on ANY OS: a Windows traceback read on Linux is not relative to
+    this checkout, and joining it on buried its real root mid-path.
+    """
+    if is_absolute_on_any_os(frame.path) or frame.path.startswith("<"):
+        return frame
+    return FramePoint(
+        path=(repo_root / frame.path).as_posix(),
+        qualname=frame.qualname,
+        line=frame.line,
+    )
+
+
+class _CrashGraph:
+    """The project slice a correlation needs, fetched once."""
+
+    def __init__(self, fetch_all: QueryFn, project_name: str) -> None:
+        prefix = f"{project_name}{cs.SEPARATOR_DOT}"
+        params = {
+            cs.KEY_PROJECT_PREFIX: prefix,
+            cs.KEY_PROJECT_NAME: project_name,
+        }
+        # Deferred: trace.ingest imports the parser stack, which the CLI would
+        # otherwise load at start-up through editing -> structural_delta
+        # (issue #2253).
+        from .trace.ingest import load_callables
+
+        self.nodes: list[CallableNode] = load_callables(fetch_all, prefix)
+        self.by_qn: dict[str, CallableNode] = {
+            node.qualified_name: node for node in self.nodes
+        }
+        self.callers: dict[str, list[str]] = {}
+        self.callees: dict[str, list[str]] = {}
+        for row in fetch_all(CYPHER_CRASH_CALLS, {cs.KEY_PREFIX: prefix}):
+            from_qn, to_qn = row.get("from_qn"), row.get("to_qn")
+            if isinstance(from_qn, str) and isinstance(to_qn, str):
+                self.callers.setdefault(to_qn, []).append(from_qn)
+                self.callees.setdefault(from_qn, []).append(to_qn)
+        self.positional_params: dict[str, tuple[str, ...]] = {}
+        for row in fetch_all(CYPHER_CRASH_POSITIONAL_PARAMS, {cs.KEY_PREFIX: prefix}):
+            qn, declared = row.get("qn"), row.get("positional_params")
+            path = row.get(cs.KEY_PATH)
+            if (
+                isinstance(qn, str)
+                and isinstance(declared, list)
+                and not (isinstance(path, str) and _declares_its_arity(path))
+            ):
+                self.positional_params[qn] = tuple(
+                    name for name in declared if isinstance(name, str)
+                )
+        self.flow_sources: dict[str, list[str]] = {}
+        for row in fetch_all(CYPHER_FLOW_EDGES, params):
+            source, target = row.get("source"), row.get("target")
+            if isinstance(source, str) and isinstance(target, str):
+                self.flow_sources.setdefault(target, []).append(source)
+        # Gaps are fetched unconditionally: a flow edge elsewhere in the
+        # project must not hide that the failing file sits outside coverage.
+        gap_rows = fetch_all(CYPHER_FLOW_COVERAGE_GAPS, params)
+        self.flow_gaps: tuple[str, ...] = tuple(
+            sorted(
+                path
+                for row in gap_rows
+                if isinstance(path := row.get(cs.KEY_PATH), str)
+            )
+        )
+
+
+class _ResolvedStack(NamedTuple):
+    # Each frame with (resolved qn, label, unresolved reason).
+    frames: list[tuple[FramePoint, str | None, str | None, str | None]]
+    inferred_root: str | None
+    # The members of an ExceptionGroup, in the parsed order.
+    members: tuple[_ResolvedStack, ...] = ()
+
+
+def _rebase_for(
+    frames: list[FramePoint],
+    resolver: FrameResolver,
+    repo_root: Path,
+    path_prefix_map: Mapping[str, str] | None,
+) -> tuple[PathRebase, str | None]:
+    """How frames from another checkout reach this one, and the inferred root.
+
+    A root the caller names beats one guessed from the paths, so inference
+    runs only when no given prefix anchors any frame.
+    """
+    given = PathRebase.from_prefix_map(
+        repo_root, path_prefix_map or {}, resolver.path_spellings
+    )
+    if any(given.matches(frame) for frame in frames):
+        return given, None
+    inferred = resolver.infer_recorded_root(frames)
+    if inferred is None:
+        return given, None
+    return PathRebase.from_prefix_map(
+        repo_root, {inferred: cs.PATH_CURRENT_DIR}, resolver.path_spellings
+    ), inferred
+
+
+def _every_frame(parsed: ParsedTraceback) -> list[FramePoint]:
+    # Depth-first, as printed: a section's own frames, then its members'.
+    frames: list[FramePoint] = []
+    pending = [parsed]
+    while pending:
+        section = pending.pop()
+        frames.extend(section.frames)
+        pending.extend(reversed(section.members))
+    return frames
+
+
+def _resolve_stack(
+    parsed: ParsedTraceback,
+    graph: _CrashGraph,
+    repo_root: Path,
+    path_prefix_map: Mapping[str, str] | None = None,
+) -> _ResolvedStack:
+    """Each frame's graph node, for the stack and every group member's.
+
+    One checkout root serves the whole traceback, inferred from every frame
+    it prints: a member's stack is often too short to infer one alone.
+    """
+    resolver = FrameResolver(repo_root, graph.nodes)
+    anchored = [_anchored(frame, repo_root) for frame in _every_frame(parsed)]
+    rebase, inferred_root = _rebase_for(anchored, resolver, repo_root, path_prefix_map)
+
+    def resolve(section: ParsedTraceback) -> _ResolvedStack:
+        resolved: list[tuple[FramePoint, str | None, str | None, str | None]] = []
+        for frame in section.frames:
+            stats = ResolutionStats()
+            match = resolver.resolve(rebase.apply(_anchored(frame, repo_root)), stats)
+            if match is not None:
+                resolved.append((frame, match.qualified_name, match.label, None))
+            else:
+                reason = next(iter(stats.unresolved), None)
+                resolved.append((frame, None, None, reason))
+        return _ResolvedStack(
+            frames=resolved,
+            inferred_root=inferred_root,
+            members=tuple(resolve(member) for member in section.members),
+        )
+
+    return resolve(parsed)
+
+
+def _resolution_rate(stack: _ResolvedStack) -> FrameResolutionRate:
+    # Keyed on the qualified name, NOT on `reason is None`: see the predicate
+    # comment in `explain_traceback`.
+    return FrameResolutionRate(
+        total=len(stack.frames),
+        resolved=sum(1 for _frame, qn, _label, _reason in stack.frames if qn),
+    )
+
+
+def _nothing_resolved_note(stack: _ResolvedStack, repo_root: Path) -> str | None:
+    """The explanation an all-unresolved stack owes its reader, or None.
+
+    Only when some frame lies outside the checkout: a stack whose frames are
+    all under it but unknown to the graph has a different cause (a stale or
+    partial index), and a note about paths would point the wrong way.
+    """
+    if any(qn for _frame, qn, _label, _reason in stack.frames):
+        return None
+    outside = sum(
+        1
+        for _frame, _qn, _label, reason in stack.frames
+        if reason == cs.TraceUnresolvedReason.OUTSIDE_REPO
+    )
+    if not outside:
+        return None
+    return cs.TRACEBACK_NOTE_NOTHING_RESOLVED.format(
+        total=len(stack.frames),
+        outside=outside,
+        root=repo_root.resolve().as_posix(),
+        param=cs.MCPParamName.PATH_PREFIX_MAP,
+    )
+
+
+def _group_note(parsed: ParsedTraceback) -> str | None:
+    """What an ExceptionGroup's report holds, or None for any other one."""
+    if not parsed.members and not parsed.omitted_members:
+        return None
+    listed = len(parsed.members)
+    note = cs.TRACEBACK_NOTE_EXCEPTION_GROUP.format(
+        type=parsed.exception_type,
+        listed=listed,
+        plural="" if listed == 1 else "s",
+    )
+    if parsed.omitted_members:
+        note += cs.TRACEBACK_NOTE_MEMBERS_OMITTED.format(omitted=parsed.omitted_members)
+    return note
+
+
+def _section_note(
+    parsed: ParsedTraceback, stack: _ResolvedStack, repo_root: Path
+) -> str | None:
+    notes = (_nothing_resolved_note(stack, repo_root), _group_note(parsed))
+    return " ".join(note for note in notes if note) or None
+
+
+def _resolve_callee(
+    callee: str, graph: _CrashGraph, resolved_qns: tuple[str, ...]
+) -> str | None:
+    """The one graph node the arity message's callee names, or None.
+
+    An arity `TypeError` is raised at the CALL SITE -- the callee never runs,
+    so it is absent from the traceback and cannot be read off the stack. The
+    message gives a bare name, which may occur in many modules, so candidates
+    are narrowed by the graph: a callee of a frame actually on the stack wins
+    over an unrelated same-named function elsewhere.
+
+    Ambiguity returns None rather than picking one. Confirming an arity
+    mismatch against the wrong function of the same name is precisely the
+    false accusation this module declines to make.
+    """
+    suffix = f"{cs.SEPARATOR_DOT}{callee}"
+    candidates = [qn for qn in graph.by_qn if qn.endswith(suffix) or qn == callee]
+    if len(candidates) == 1:
+        return candidates[0]
+    if not candidates:
+        return None
+    reachable = {
+        callee_qn
+        for frame_qn in resolved_qns
+        for callee_qn in graph.callees.get(frame_qn, ())
+    }
+    narrowed = [qn for qn in candidates if qn in reachable]
+    return narrowed[0] if len(narrowed) == 1 else None
+
+
+def _arity_finding(
+    parsed: ParsedTraceback, graph: _CrashGraph, resolved_qns: tuple[str, ...]
+) -> ArityFinding | None:
+    if parsed.exception_type != _TYPE_ERROR:
+        return None
+    error = parse_arity_error(parsed.exception_message)
+    if error is None:
+        return None
+    callee_qn = _resolve_callee(error.callee, graph, resolved_qns)
+    if callee_qn is None:
+        return ArityFinding(error=error, callee_qualified_name=None, verdict=None)
+    declared = graph.positional_params.get(callee_qn, _ARITY_KINDS_UNKNOWN)
+    # `is_method=False` even for methods, deliberately. That flag adds the
+    # receiver back for callers whose stored parameters omit it; this store
+    # keeps the receiver, so adding it again would over-count by one. It would
+    # also mis-handle a staticmethod, which is a Method node that CPython
+    # counts with no receiver at all.
+    return ArityFinding(
+        error=error,
+        callee_qualified_name=callee_qn,
+        verdict=diagnose_arity(error, declared, is_method=False),
+    )
+
+
+def explain_traceback(
+    fetch_all: QueryFn,
+    project_name: str,
+    repo_root: Path,
+    traceback_text: str,
+    path_prefix_map: Mapping[str, str] | None = None,
+) -> TracebackReport:
+    """Resolve each traceback frame and attach its graph neighbourhood.
+
+    ``path_prefix_map`` maps the checkout root the traceback was recorded
+    under (``/app``) to a directory of this repository (``.``); without it a
+    root shared by the frames is inferred when they are not under this one.
+    """
+    parsed = parse_python_traceback(traceback_text)
+    graph = _CrashGraph(fetch_all, project_name)
+    stack = _resolve_stack(parsed, graph, repo_root, path_prefix_map)
+    return _explain_section(parsed, stack, graph, repo_root)
+
+
+def _explain_section(
+    parsed: ParsedTraceback,
+    stack: _ResolvedStack,
+    graph: _CrashGraph,
+    repo_root: Path,
+) -> TracebackReport:
+    contexts = [
+        FrameContext(
+            path=frame.path,
+            line=frame.line,
+            name=frame.qualname,
+            qualified_name=qn,
+            label=label,
+            unresolved_reason=reason,
+            callers=tuple(sorted(graph.callers.get(qn, ()))) if qn else (),
+            callees=tuple(sorted(graph.callees.get(qn, ()))) if qn else (),
+            flow_sources=tuple(sorted(graph.flow_sources.get(qn, ()))) if qn else (),
+        )
+        for frame, qn, label, reason in stack.frames
+    ]
+    return TracebackReport(
+        exception_type=parsed.exception_type,
+        exception_message=parsed.exception_message,
+        frames=tuple(contexts),
+        flow_gaps=graph.flow_gaps,
+        resolution=FrameResolutionRate(
+            total=len(contexts),
+            # Keyed on `qualified_name`, NOT on `unresolved_reason is None`.
+            # Today the two agree, because every failure path in
+            # `FrameResolver.resolve` records a reason before returning None.
+            # But `_resolve_stack` derives the reason with
+            # `next(iter(stats.unresolved), None)`, so a future failure path
+            # that forgets to record one would yield reason=None with no
+            # qualified name -- and the other predicate would then count an
+            # unresolvable frame as resolved. The qualified name is what the
+            # rate is ABOUT; the reason is diagnostic text alongside it.
+            resolved=sum(1 for frame in contexts if frame.qualified_name is not None),
+        ),
+        arity=_arity_finding(
+            parsed,
+            graph,
+            tuple(
+                frame.qualified_name
+                for frame in contexts
+                if frame.qualified_name is not None
+            ),
+        ),
+        inferred_root=stack.inferred_root,
+        note=_section_note(parsed, stack, repo_root),
+        members=tuple(
+            _explain_section(member, member_stack, graph, repo_root)
+            for member, member_stack in zip(parsed.members, stack.members, strict=True)
+        ),
+        omitted_members=parsed.omitted_members,
+    )
+
+
+def _reverse_reachable(
+    graph: _CrashGraph, failing: str
+) -> dict[str, tuple[int, tuple[str, ...]]]:
+    """Callers that reach the failing node within the depth limit.
+
+    Maps each caller to its depth and the forward call path it takes to the
+    failure (``candidate -> ... -> failing``), from a breadth-first walk over
+    reversed CALLS edges, so the recorded path is a shortest one.
+    """
+    reached: dict[str, tuple[int, tuple[str, ...]]] = {}
+    queue: deque[tuple[str, int]] = deque([(failing, 0)])
+    seen = {failing}
+    while queue:
+        current, depth = queue.popleft()
+        if depth == _CALLER_DEPTH_LIMIT:
+            continue
+        # Sorted expansion keeps the recorded shortest path deterministic
+        # when several exist; the graph returns edges in no fixed order.
+        for caller in sorted(graph.callers.get(current, ())):
+            if caller in seen:
+                continue
+            seen.add(caller)
+            _, tail = reached.get(current, (0, (failing,)))
+            reached[caller] = (depth + 1, (caller, *tail))
+            queue.append((caller, depth + 1))
+    return reached
+
+
+def rank_root_causes(
+    fetch_all: QueryFn,
+    project_name: str,
+    repo_root: Path,
+    traceback_text: str,
+    path_prefix_map: Mapping[str, str] | None = None,
+) -> RootCauseReport:
+    """Rank the sites that can explain the failure, best first.
+
+    The score is additive over three signals: being a FLOWS_TO source into
+    the failing frame (the failing value's possible producers), sitting on
+    the crashing stack itself (the ground-truth path), and reaching the
+    failing frame through CALLS (closer callers score higher). The failing
+    frame itself is reported separately, not ranked.
+    """
+    parsed = parse_python_traceback(traceback_text)
+    graph = _CrashGraph(fetch_all, project_name)
+    resolved_stack = _resolve_stack(parsed, graph, repo_root, path_prefix_map)
+    return _rank_section(parsed, resolved_stack, graph, repo_root)
+
+
+def _rank_section(
+    parsed: ParsedTraceback,
+    resolved_stack: _ResolvedStack,
+    graph: _CrashGraph,
+    repo_root: Path,
+) -> RootCauseReport:
+    members = tuple(
+        _rank_section(member, member_stack, graph, repo_root)
+        for member, member_stack in zip(
+            parsed.members, resolved_stack.members, strict=True
+        )
+    )
+    note = _section_note(parsed, resolved_stack, repo_root)
+    stack = resolved_stack.frames
+    stack_qns = [qn for _frame, qn, _label, _reason in stack if qn]
+    failing = stack_qns[-1] if stack_qns else None
+    anchor_is_crash_site = bool(stack) and stack[-1][1] is not None
+    resolution = _resolution_rate(resolved_stack)
+    if failing is None:
+        return RootCauseReport(
+            exception_type=parsed.exception_type,
+            exception_message=parsed.exception_message,
+            failing=None,
+            anchor_is_crash_site=False,
+            candidates=(),
+            flow_used=bool(graph.flow_sources),
+            flow_gaps=graph.flow_gaps,
+            resolution=resolution,
+            inferred_root=resolved_stack.inferred_root,
+            note=note,
+            members=members,
+            omitted_members=parsed.omitted_members,
+        )
+
+    reached = _reverse_reachable(graph, failing)
+    flow_into_failing = set(graph.flow_sources.get(failing, ()))
+    scores: dict[str, float] = {}
+    reasons: dict[str, list[str]] = {}
+    paths: dict[str, tuple[str, ...]] = {}
+
+    for qn, (depth, call_path) in reached.items():
+        scores[qn] = scores.get(qn, 0.0) + _SCORE_CALLER_BASE / depth
+        reasons.setdefault(qn, []).append(_REASON_CALLER.format(depth=depth))
+        paths[qn] = call_path
+    for distance, qn in enumerate(reversed(stack_qns[:-1]), start=1):
+        scores[qn] = scores.get(qn, 0.0) + _SCORE_ON_STACK
+        reasons.setdefault(qn, []).append(_REASON_ON_STACK.format(depth=distance))
+    for qn in flow_into_failing:
+        scores[qn] = scores.get(qn, 0.0) + _SCORE_FLOW
+        reasons.setdefault(qn, []).append(_REASON_FLOW)
+
+    ranked = sorted(scores.items(), key=lambda item: (-item[1], item[0]))
+    candidates = tuple(
+        RootCause(
+            qualified_name=qn,
+            path=node.path if node else None,
+            line=node.start_line if node else None,
+            score=round(score, 3),
+            reasons=tuple(reasons[qn]),
+            call_path=paths.get(qn, ()),
+        )
+        for qn, score in ranked[:_RANK_LIMIT]
+        for node in (graph.by_qn.get(qn),)
+    )
+    return RootCauseReport(
+        exception_type=parsed.exception_type,
+        exception_message=parsed.exception_message,
+        failing=failing,
+        anchor_is_crash_site=anchor_is_crash_site,
+        candidates=candidates,
+        flow_used=bool(graph.flow_sources),
+        flow_gaps=graph.flow_gaps,
+        resolution=resolution,
+        inferred_root=resolved_stack.inferred_root,
+        note=note,
+        members=members,
+        omitted_members=parsed.omitted_members,
+    )

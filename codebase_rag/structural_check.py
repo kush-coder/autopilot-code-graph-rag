@@ -1,0 +1,485 @@
+"""`cgr check`: the structural delta of the working tree against a git ref.
+
+The graph is assumed to reflect `--base` (index at the base, then edit);
+the files that differ between the base and the working tree are re-ingested
+and the delta reported the same way the MCP write tools report it after
+each write (issue #1525). Exit status 1 with `--fail-on-found` makes it a
+CI or pre-commit gate.
+
+The check measures the graph against the working tree, and the re-ingest
+brings the graph up to the tree, so a second run on an unchanged tree
+reports nothing: the delta was already applied. Rebuild the graph at the
+base (or index at the base before editing) to measure the same edit again,
+or run the check isolated (`--isolated`, issue #1718): the subgraph the
+re-ingest replaces is captured inside its prologue and put back once the
+delta is computed, the hash cache with it, so the graph reads as it did
+before and the same edit measures the same way every time. The CLI holds
+no lock against a concurrently running MCP server; like every other
+command that writes the graph, run it when no other writer is active.
+"""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import uuid
+from collections.abc import Callable, Mapping
+from pathlib import Path
+from typing import cast
+
+from tree_sitter import Parser
+
+from . import constants as cs
+from . import cypher_queries as cq
+from .capture import CaptureSelection, default_capture
+from .check_isolation import GraphStore, IsolationGuard
+from .checkout_state import state_file
+from .config import load_ignore_patterns
+from .graph_updater import GraphUpdater, _load_exclusion_state, _load_project_stamps
+from .services import QueryingIngestorProtocol
+from .structural_delta import StructuralDelta, normalise_paths, observe
+from .sync_guard import run_owner
+from .types_defs import LanguageQueries, PropertyDict, ReingestReport
+from .utils.path_utils import derive_project_name, should_skip_path
+
+_GIT_DELETED = "D"
+
+
+class CheckError(ValueError):
+    """The working tree cannot be compared against the requested base."""
+
+
+def changed_since(repo_root: Path, base: str) -> tuple[list[str], list[str]]:
+    """Files that differ from `base`: (changed or added, deleted).
+
+    Untracked files count as added; a rename shows as one deletion and one
+    addition so the delta reports the old symbols as removed or renamed.
+    """
+    if base.startswith("-"):
+        # Placed before git's own `--`, a dash-prefixed value would be read
+        # as a diff option (`--cached` compares the index) rather than a
+        # revision, and the check would measure the wrong files.
+        raise CheckError(cs.CHECK_BAD_BASE.format(base=base))
+    # A range (`HEAD~1..HEAD`, `main...HEAD`) makes `git diff` compare its
+    # endpoints instead of a commit with the working tree, silently leaving
+    # the current edits out; only a value naming one commit is a base.
+    verified = subprocess.run(
+        [cs.SHELL_CMD_GIT, "rev-parse", "--verify", "--quiet", f"{base}^{{commit}}"],
+        cwd=repo_root,
+        capture_output=True,
+        encoding=cs.ENCODING_UTF8,
+        check=False,
+    )
+    if verified.returncode != 0:
+        raise CheckError(cs.CHECK_BASE_NOT_A_COMMIT.format(base=base))
+    try:
+        status = subprocess.run(
+            # `--relative`: paths relative to `repo_root`, which may sit below
+            # the git toplevel; `ls-files --others` is already cwd-relative.
+            # `-z`: NUL-delimited, unquoted paths, so a name holding a tab or
+            # a newline is not C-quoted into something that does not exist.
+            [
+                cs.SHELL_CMD_GIT,
+                "diff",
+                "--name-status",
+                "--no-renames",
+                "--relative",
+                "-z",
+                base,
+                "--",
+            ],
+            cwd=repo_root,
+            capture_output=True,
+            encoding=cs.ENCODING_UTF8,
+            check=True,
+        ).stdout
+        untracked = subprocess.run(
+            [cs.SHELL_CMD_GIT, "ls-files", "--others", "--exclude-standard", "-z"],
+            cwd=repo_root,
+            capture_output=True,
+            encoding=cs.ENCODING_UTF8,
+            check=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError) as error:
+        detail = getattr(error, "stderr", "") or str(error)
+        raise CheckError(
+            cs.CHECK_GIT_FAILED.format(base=base, error=detail.strip())
+        ) from error
+    changed: set[str] = set()
+    deleted: set[str] = set()
+    # `-z` output alternates status and path fields, each NUL-terminated.
+    fields = [f for f in status.split("\0") if f]
+    for code, path in zip(fields[0::2], fields[1::2], strict=False):
+        if not _is_cgr_state(path):
+            (deleted if code.startswith(_GIT_DELETED) else changed).add(path)
+    changed.update(
+        entry for entry in untracked.split("\0") if entry and not _is_cgr_state(entry)
+    )
+    return sorted(changed), sorted(deleted)
+
+
+def _is_cgr_state(path: str) -> bool:
+    """cgr's own state files (hash cache, directory mtimes, ...) are not
+    source: never re-ingested or reported as reparsed. That holds for a copy
+    a user committed with `git add -A` before cgr kept them out of the tree,
+    which every later sync rewrote, or the next one moves out (issue #2427),
+    and for the temp sibling an older cgr wrote one through.
+
+    By exact name, as the indexing walk skips them: a source file merely
+    named `.cgr-...` (a tracked `.cgr-custom.py`) is indexed, so its edits
+    and deletions are structural changes the check must report.
+    """
+    name = Path(path).name
+    if name in cs.CGR_STATE_FILENAMES:
+        return True
+    if not name.endswith(cs.TMP_EXTENSION):
+        return False
+    return any(name.startswith(f"{state}.") for state in cs.CGR_STATE_FILENAMES)
+
+
+def _stamp_is_named(stored: dict[str, list[str] | str]) -> bool:
+    """Whether the run that wrote this stamp was given an explicit --project.
+
+    Stamps written before the field existed have no `named` key; they read
+    as unnamed, which is what the overwhelming majority of them were.
+    """
+    return bool(stored.get("named"))
+
+
+def _stamp_belongs_to(
+    stored: dict[str, list[str] | str],
+    repo_root: Path,
+    project_name: str,
+    explicit: bool,
+) -> bool:
+    owner = stored.get("project")
+    if _stamp_is_named(stored):
+        return owner == project_name
+    derived = derive_project_name(repo_root)
+    # `cgr start` without --project-name indexes under the derived name, which
+    # hashes this checkout's path: asking for it by name can only mean the
+    # graph that unnamed run wrote, so an explicit request is no reason to
+    # refuse (issue #2854). The bare directory name stays ambiguous below.
+    if owner == project_name == derived:
+        return True
+    # The updater's default is the directory name, or the derived name for a
+    # directory holding `.` (#2412); a stamp written before that still
+    # carries the dotted name verbatim.
+    default_names = {derived, repo_root.resolve().name}
+    return not explicit and owner in default_names and project_name in default_names
+
+
+def _own_project_stamp(
+    stamps: dict[str, dict[str, list[str] | str]],
+    repo_root: Path,
+    project_name: str,
+    explicit: bool,
+) -> dict[str, list[str] | str] | None:
+    """This project's own entry from the per-project map, if it has one."""
+    exact = stamps.get(project_name)
+    if exact is not None and _stamp_belongs_to(
+        exact, repo_root, project_name, explicit
+    ):
+        return exact
+    return next(
+        (
+            stamp
+            for stamp in stamps.values()
+            if _stamp_belongs_to(stamp, repo_root, project_name, explicit)
+        ),
+        None,
+    )
+
+
+def indexed_scope(
+    repo_root: Path, project_name: str, *, explicit: bool = False
+) -> tuple[frozenset[str] | None, frozenset[str] | None]:
+    """The exclusion scope `project_name`'s graph was last indexed under.
+
+    The last completed run stamps its effective `--exclude` and unignore
+    sets (CLI flags included, not only `.cgrignore`) in the exclusion state
+    file; the check must re-ingest under that same scope or a file the
+    index deliberately left out would enter the graph. The stamp is per
+    repository, so one written by ANOTHER project indexed from this tree
+    refuses the check rather than lending that project's scope. Without a
+    stamp the `.cgrignore` file is the only scope there is.
+
+    Ownership comes from the stamp, which records whether the run that
+    wrote it was given a `--project`. The stamp is per repository and the
+    last run of ANY project overwrites it, so the check must establish that
+    it belongs to the project asked for and refuse otherwise: a scope from
+    the wrong project silently re-ingests files the index left out, or drops
+    files it deliberately kept.
+    """
+    state_path = state_file(repo_root, cs.EXCLUSION_STATE_FILENAME)
+    stored = _load_exclusion_state(state_path)
+    # Every project indexed from this tree keeps its own entry, so one that
+    # a later project's run overwrote at the top level still has its scope
+    # (issue #1987). Its ownership is judged by the same rule as the
+    # top-level stamp below; with no entry that is this project's, the
+    # top-level stamp decides as it did before the map existed.
+    own = _own_project_stamp(
+        _load_project_stamps(state_path), repo_root, project_name, explicit
+    )
+    if own is not None:
+        stored = own
+    if stored is not None:
+        owner = stored.get("project")
+        # `cgr index` without --project stamps the bare directory name
+        # where `cgr check` derives the digest-suffixed one, so an UNNAMED
+        # run's stamp answers to either spelling of this tree's identity.
+        # A NAMED run's answers only to the name it was given.
+        #
+        # The two cannot be told apart by the string alone -- a project
+        # deliberately called `myrepo` in a directory called `myrepo` writes
+        # the same owner an unnamed run does -- which is why the writer
+        # records `named` and this reads it rather than guessing (#1525).
+        #
+        # `explicit` is what the CALLER asked for. Both sides must agree:
+        # an unnamed stamp does not serve `--project myrepo`, because the
+        # last unnamed run of this tree overwrote whatever the named project
+        # had stamped, and its scope is simply gone rather than inferable.
+        mine = _stamp_belongs_to(stored, repo_root, project_name, explicit)
+        if isinstance(owner, str) and not mine:
+            # The same string on both sides is an unnamed run's stamp asked
+            # for by name: "belongs to X, not X" told the user nothing.
+            message = (
+                cs.CHECK_SCOPE_OF_UNNAMED_RUN.format(project=project_name)
+                if owner == project_name
+                else cs.CHECK_SCOPE_OF_OTHER_PROJECT.format(
+                    project=project_name, other=owner
+                )
+            )
+            raise CheckError(message)
+        exclude = stored.get("exclude") or []
+        unignore = stored.get("unignore") or []
+        return (
+            frozenset(exclude) or None,
+            frozenset(unignore) or None,
+        )
+    cgrignore = load_ignore_patterns(repo_root)
+    return cgrignore.exclude or None, cgrignore.unignore or None
+
+
+class _FileSnapshot:
+    """A file's bytes and timestamps, to be put back after the check.
+
+    The re-ingest records the files it re-parsed in the hash cache, which
+    would make a later full run skip them and keep the base graph for files
+    the working tree changed. The cache's mtime is also a judgement about
+    every file NOT in it (`_reingest_update_hashes`), so it goes back too.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._content: bytes | None = None
+        self._times: tuple[int, int] | None = None
+        # Absent and unreadable are different states and must not share one
+        # representation: treating a permission error as absence made the
+        # restore DELETE a cache it could not read (Greptile, #1718). Only a
+        # confirmed absence licenses the unlink.
+        self._absent = False
+        self._readable = False
+        try:
+            self._content = path.read_bytes()
+            stat = path.stat()
+            self._times = (stat.st_atime_ns, stat.st_mtime_ns)
+            self._readable = True
+        except FileNotFoundError:
+            self._absent = True
+        except OSError:
+            # Unreadable: leave whatever is there alone.
+            pass
+
+    @property
+    def unrestorable(self) -> bool:
+        """Present but unreadable: the re-ingest may still WRITE it (mode
+        0o200 allows that), and `put_back` could not undo the write (bot
+        review, #1718)."""
+        return not self._absent and not self._readable
+
+    def put_back(self) -> None:
+        if self._absent:
+            self._path.unlink(missing_ok=True)
+            return
+        if not self._readable or self._content is None or self._times is None:
+            return
+        self._path.write_bytes(self._content)
+        os.utime(self._path, ns=self._times)
+
+
+_UNRESTORABLE_RELS = (
+    cs.RelationshipType.RESOLVES_TO,
+    cs.RelationshipType.FLOWS_TO,
+)
+
+
+def _refuse_unrestorable_capture(capture: CaptureSelection) -> None:
+    """Refuse an isolated run whose capture holds links it cannot restore.
+
+    The guard restores by walking out from the re-parsed modules, and a
+    `Resource` is not on that walk: it is only ever the far end of an edge.
+    The endpoint pass then deletes every network `RESOLVES_TO` edge in the
+    graph and rebuilds them from the edited tree, and a Resource-to-Resource
+    `FLOWS_TO` chain touches no scoped node at all, so neither can be put
+    back from the capture. Losing them silently is worse than not offering
+    the mode, so this refuses instead (greptile-local, #1718).
+    """
+    enabled = [rel for rel in _UNRESTORABLE_RELS if capture.rel_enabled(rel)]
+    if enabled:
+        raise CheckError(
+            cs.CHECK_ISOLATED_WITH_IO.format(
+                groups=", ".join(rel.value for rel in enabled)
+            )
+        )
+
+
+def _refuse_project_holding_io_links(ingestor: object, project_name: str) -> None:
+    """Refuse an isolated run over IO links the checked project anchors.
+
+    The capture check above covers what THIS run would write. A graph built
+    earlier with IO enabled can hold resource chains of its own; deleting a
+    changed file's subtree can leave one unanchored, and the re-ingest's
+    repo-wide resource prune then deletes it, chain edges included, which
+    the capture cannot put back (bot review, #1718). Only a resource the
+    project's own nodes touch can be unanchored by the run, so another
+    project's links do not refuse it (issue #3188).
+    """
+    rows = cast(GraphStore, ingestor).fetch_all(
+        cq.CYPHER_CHECK_PROJECT_IO_LINKS,
+        {
+            cs.KEY_PROJECT_PREFIX: project_name + cs.SEPARATOR_DOT,
+            cs.KEY_PROJECT_NAME: project_name,
+        },
+    )
+    if rows:
+        raise CheckError(
+            cs.CHECK_ISOLATED_GRAPH_HAS_IO.format(
+                project=project_name, groups=rows[0].get(cs.KEY_REL)
+            )
+        )
+
+
+def _measure_then_restore(
+    updater: GraphUpdater,
+    ingestor: object,
+    project_name: str,
+    repo_root: Path,
+    apply: Callable[[Callable[[], None]], ReingestReport],
+    measure: Callable[[Callable[[], ReingestReport]], StructuralDelta],
+) -> StructuralDelta:
+    """Measure through `apply`, then put the graph and the hash cache back.
+
+    The guard captures inside the re-ingest's write hook, so a run that
+    aborts in its prologue captured nothing and restores nothing; one that
+    fails after its first write is rolled back from the capture before the
+    error propagates.
+    """
+    store = cast(GraphStore, ingestor)
+    guard = IsolationGuard(store, project_name, repo_root)
+    # The cache the re-ingest rewrites, in the checkout's state directory
+    # rather than the tree since #2427.
+    cache_path = state_file(repo_root, cs.HASH_CACHE_FILENAME)
+    cache = _FileSnapshot(cache_path)
+    if cache.unrestorable:
+        raise CheckError(cs.CHECK_ISOLATED_CACHE_UNREADABLE.format(path=cache_path))
+    # The restore deletes before it re-creates, and the store offers no
+    # transaction around the two, so a failure between them leaves the graph
+    # partial. The persistent incomplete-run marker every mutating path sets
+    # (#1679) records that: set before the first write, cleared only once the
+    # graph and the hash cache are both back, so a failed restore leaves
+    # readers refusing and the next full update repairing (bot review, #1718).
+    marker: PropertyDict = {
+        cs.KEY_PROJECT_NAME: project_name,
+        cs.KEY_RUN_ID: uuid.uuid4().hex,
+    }
+    store.execute_write(
+        cq.CYPHER_MARK_RUN_INCOMPLETE,
+        {**marker, **run_owner(), cs.KEY_WRITING: True},
+    )
+    try:
+        return measure(lambda: apply(lambda: guard.capture(updater.reingest_scope)))
+    finally:
+        try:
+            guard.restore()
+        finally:
+            cache.put_back()
+        # Only once BOTH are back: a cache left holding the re-parse's hashes
+        # would make the next update skip the edited files, so a failed cache
+        # restore must keep the marker too (CodeRabbit, #1718).
+        store.execute_write(cq.CYPHER_CLEAR_PROJECT_INCOMPLETE, marker)
+
+
+def run_check(
+    repo_root: Path,
+    base: str,
+    project_name: str,
+    ingestor: QueryingIngestorProtocol,
+    parsers: Mapping[cs.SupportedLanguage, Parser],
+    queries: Mapping[cs.SupportedLanguage, LanguageQueries],
+    exclude_paths: frozenset[str] | None = None,
+    unignore_paths: frozenset[str] | None = None,
+    project_named: bool | None = None,
+    isolated: bool = False,
+    capture: CaptureSelection | None = None,
+) -> StructuralDelta:
+    """Re-ingest what changed since `base` and return the structural delta.
+
+    `exclude_paths` and `unignore_paths` are the project's indexing scope
+    (the `.cgrignore` file plus any CLI excludes): a changed file outside
+    that scope must not enter the graph through the check. With `isolated`
+    the re-ingest is measured and then undone (see `check_isolation`).
+    """
+    changed, deleted = changed_since(repo_root, base)
+
+    def indexed(rel: str) -> bool:
+        # git lists every untracked file `.gitignore` leaves in, and a new
+        # repo's `.venv` or `node_modules` is all of them: the files a sync
+        # would skip are not the edit (issue #3264). Skipped before anything
+        # resolves them, so an interpreter symlink leaving the repository
+        # cannot abort the check, and before the snapshots, whose path
+        # filters scale with the list.
+        return not should_skip_path(
+            repo_root / rel,
+            repo_root,
+            exclude_paths=exclude_paths,
+            unignore_paths=unignore_paths,
+            is_file=True,
+        )
+
+    changed = [p for p in normalise_paths(changed, repo_root) if indexed(p)]
+    deleted = [p for p in normalise_paths(deleted, repo_root) if indexed(p)]
+    updater = GraphUpdater(
+        ingestor=ingestor,
+        repo_path=repo_root,
+        parsers=parsers,
+        queries=queries,
+        project_name=project_name,
+        project_named=project_named,
+        exclude_paths=exclude_paths,
+        unignore_paths=unignore_paths,
+        # The selection isolated mode validated must be the one the run
+        # uses; without it the updater falls back to the configured default,
+        # which can enable the IO links `_refuse_unrestorable_capture` just
+        # refused (Greptile, #1718).
+        capture=capture,
+    )
+    fetch_all = ingestor.fetch_all
+
+    def measure(apply: Callable[[], ReingestReport]) -> StructuralDelta:
+        return observe(
+            fetch_all, project_name, [*changed, *deleted], apply, repo_root=repo_root
+        )
+
+    if not isolated:
+        return measure(lambda: updater.reingest(changed, deleted=deleted))
+    _refuse_unrestorable_capture(capture or default_capture())
+    _refuse_project_holding_io_links(ingestor, project_name)
+    return _measure_then_restore(
+        updater,
+        ingestor,
+        project_name,
+        repo_root,
+        lambda hook: updater.reingest(changed, deleted=deleted, before_write=hook),
+        measure,
+    )

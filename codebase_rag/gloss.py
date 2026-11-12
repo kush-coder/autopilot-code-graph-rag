@@ -1,0 +1,523 @@
+"""Writing and reading `Gloss` nodes: agent-authored notes about code.
+
+Stage two of issue #1808. Stage one (#1830) registered the node, its
+`ANNOTATES` / `MENTIONS` edges and the wire format; nothing wrote or read one.
+This module is the write and the read, over the same fixed-query surface the
+deterministic graph tools use, so a note is a pure function of what the agent
+said and what the graph holds.
+
+Three decisions from the issue are load-bearing here:
+
+* A note is never written into a source file. Its only copy is the graph.
+* Its subject is a definition `graph_query.resolve()` can return, named the
+  way every other tool names one. A NAME that resolves to several definitions
+  is refused with the candidates rather than bound to the first: a note on
+  the wrong function is a false invariant, which is worse than no note.
+  A `path:line` LOCATION takes the innermost definition spanning the line,
+  which is what "the line is in" means and is how `resolve` orders them.
+* The node, its `ANNOTATES` edge and every `MENTIONS` edge are one statement,
+  and the write is confirmed by reading the node back. A subject or mention
+  that left the graph between resolving and writing therefore reports "not
+  written", not success, and never a note with half its edges.
+
+A gloss is EXACT at the moment it is written and records the subject's
+`anchor_hash` (see `parsers/anchor_hash.py`); after every sync the graph
+updater compares the two and grades the note EXACT or STALE, so a reader
+knows whether the code under a note has changed since it was made. A note
+whose subject's name is gone is repaired by content hash (`gloss_repair`):
+MOVED when one definition carries it, AMBIGUOUS or LOST otherwise, and the
+unattached ones stay readable through `glosses_for` on the old name. The
+text-quote anchor is the next stage.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import uuid
+from collections.abc import Callable
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, NamedTuple, NotRequired, TypedDict
+
+from . import constants as cs
+from . import cypher_queries as cq
+from . import graph_query
+from .gloss_anchor import SourceReader, TextAnchor, text_anchor
+from .graph_query import QueryFn, SymbolRow
+from .types_defs import PropertyDict, ResultRow
+
+if TYPE_CHECKING:
+    # Annotation-only: TypeIs reaches `typing` in 3.13, and the checker reads
+    # typing_extensions from its bundled stubs, so nothing imports it at runtime.
+    from typing_extensions import TypeIs
+
+WriteFn = Callable[[str, PropertyDict | None], None]
+
+_ID_SEPARATOR = "\x00"
+
+
+class GlossRow(TypedDict):
+    qualified_name: str
+    kind: str
+    status: str
+    body: str
+    created_by: str
+    created_at: str
+    commit_sha: str | None
+    target_qn: str
+    target_hash: str | None
+    anchor_state: str
+    moved_from: str | None
+    candidate_qns: list[str]
+    mentions: list[str]
+    # Mentions whose definition the repair could not place after a rename,
+    # move or delete: still named, with no MENTIONS edge (issue #3230). A
+    # name `mentions` also lists is a lost mention whose name another one
+    # has since taken.
+    mentions_lost: list[str]
+
+
+class GlossRefusal(TypedDict, total=False):
+    error: str
+    candidates: list[SymbolRow]
+    # Notes written against a name that no longer resolves: a LOST or
+    # AMBIGUOUS note is unattached, and this is where it is still visible.
+    orphaned: list[GlossRow]
+
+
+class GlossesResult(TypedDict):
+    target: SymbolRow
+    annotating: list[GlossRow]
+    mentioning: list[GlossRow]
+    # A descriptor target (`x#setter`) that resolves to a member which moved
+    # (`x@16` -> `x@20`): the notes left unattached on the property's
+    # variants are listed here rather than lost behind the stable name.
+    orphaned: NotRequired[list[GlossRow]]
+
+
+def _prefix(project_name: str) -> str:
+    return f"{project_name}{cs.SEPARATOR_DOT}"
+
+
+def gloss_id(target_qn: str, kind: str, body: str) -> str:
+    """The node key: deterministic in (subject, kind, body).
+
+    Writing the same note twice therefore MERGEs onto one node instead of
+    filing a duplicate; a note that differs in a word is a different gloss,
+    and near-duplicate folding is deliberately not attempted here.
+    """
+    digest = hashlib.sha256(
+        _ID_SEPARATOR.join((target_qn, kind, body)).encode(cs.ENCODING_UTF8)
+    ).hexdigest()
+    return f"{cs.GLOSS_ID_PREFIX}{digest[: cs.GLOSS_ID_HEX_LENGTH]}"
+
+
+def resolve_one(
+    fetch_all: QueryFn, project_name: str, target: str
+) -> SymbolRow | GlossRefusal:
+    """The single definition `target` names, or why there is not one.
+
+    An exact qualified-name match wins outright, then a unique dotted-suffix
+    match (`Store.get`), then a unique match of any kind. A location is an
+    exception by design:
+    `resolve` orders its rows innermost first, and the innermost is the one
+    the line "is in".
+    """
+    base, descriptor = _split_descriptor(target)
+    if descriptor is not None:
+        if descriptor not in cs.GLOSS_DESCRIPTORS:
+            return GlossRefusal(
+                error=cs.MCP_GLOSS_DESCRIPTOR_UNKNOWN.format(
+                    descriptor=descriptor,
+                    known=cs.SEPARATOR_COMMA_SPACE.join(sorted(cs.GLOSS_DESCRIPTORS)),
+                )
+            )
+        # The base is resolved once, here; its refusal (not found, ambiguous)
+        # is the descriptor target's refusal too.
+        natural = resolve_one(fetch_all, project_name, base)
+        if _is_refusal(natural):
+            return natural
+        natural_row: SymbolRow = natural
+        return _resolve_descriptor(
+            fetch_all, project_name, target, natural_row, descriptor
+        )
+    found = graph_query.resolve_or_refuse(fetch_all, project_name, target)
+    if not isinstance(found, list):
+        # A location the project cannot answer for (a file it does not hold,
+        # or two held files it could name): saying which says more than "no
+        # definition matches" (issue #2611).
+        return GlossRefusal(error=found["error"])
+    rows = found
+    if not rows:
+        return GlossRefusal(
+            error=cs.MCP_GLOSS_TARGET_NOT_FOUND.format(
+                target=target, project=project_name
+            )
+        )
+    if graph_query.parse_location(target) is not None:
+        return rows[0]
+    exact = [row for row in rows if row["qualified_name"] == target]
+    if len(exact) == 1:
+        return exact[0]
+    # `Store.get` is a dotted suffix of exactly one definition even when
+    # other `get`s exist; `resolve` returns those too (matched by bare name),
+    # so the suffix tier is what makes the documented target form usable.
+    dotted = f"{cs.SEPARATOR_DOT}{target}"
+    suffix = [row for row in rows if row["qualified_name"].endswith(dotted)]
+    if not exact and len(suffix) == 1:
+        return suffix[0]
+    if not exact and not suffix and len(rows) == 1:
+        return rows[0]
+    return GlossRefusal(
+        error=cs.MCP_GLOSS_TARGET_AMBIGUOUS.format(target=target, count=len(rows)),
+        candidates=rows,
+    )
+
+
+def _split_descriptor(target: str) -> tuple[str, str | None]:
+    """`pkg.C.x#setter` -> (`pkg.C.x`, `setter`); a target without `#` is
+    its own base. A `#` that opens a name is part of it, not a descriptor:
+    a JS/TS private member keeps its `#` in the qualified name
+    (`Bank.#validatePin`), so a `#` right after a dot, or at the start,
+    leaves the target whole (bot review)."""
+    if cs.GLOSS_DESCRIPTOR_SEPARATOR not in target:
+        return target, None
+    base, descriptor = target.rsplit(cs.GLOSS_DESCRIPTOR_SEPARATOR, 1)
+    if not base or base.endswith(cs.SEPARATOR_DOT) or cs.SEPARATOR_DOT in descriptor:
+        return target, None
+    return base, descriptor.strip().lower()
+
+
+def _variant_prefix(qualified_name: str) -> str:
+    """The prefix every `name@<line>` variant of a definition shares."""
+    return f"{qualified_name.split(cs.DUP_QN_MARKER, 1)[0]}{cs.DUP_QN_MARKER}"
+
+
+def _resolve_descriptor(
+    fetch_all: QueryFn,
+    project_name: str,
+    target: str,
+    natural_row: SymbolRow,
+    descriptor: str,
+) -> SymbolRow | GlossRefusal:
+    """The variant of the resolved base definition `natural_row` that
+    carries the descriptor's decorator: a property's getter (`@property`),
+    setter (`@x.setter`) or deleter (`@x.deleter`). The registry names the
+    later members `x@<line>`, which shifts with the file; the descriptor is
+    the stable address (issue #1808)."""
+    qn = natural_row["qualified_name"].split(cs.DUP_QN_MARKER, 1)[0]
+    marker = cs.GLOSS_DESCRIPTORS[descriptor]
+    for row in fetch_all(
+        cq.CYPHER_GLOSS_VARIANTS,
+        {
+            cs.KEY_QN: qn,
+            cs.KEY_VARIANT_PREFIX: _variant_prefix(qn),
+            cs.KEY_PROJECT_PREFIX: _prefix(project_name),
+        },
+    ):
+        decorators = row.get(cs.KEY_DECORATORS)
+        if not isinstance(decorators, list):
+            continue
+        if any(
+            str(d) == marker if marker.startswith("@") else str(d).endswith(marker)
+            for d in decorators
+        ):
+            return graph_query._symbol_row(row)
+    return GlossRefusal(
+        error=cs.MCP_GLOSS_DESCRIPTOR_NOT_FOUND.format(
+            target=target, qn=qn, descriptor=marker
+        )
+    )
+
+
+def _orphaned_on(fetch_all: QueryFn, project_name: str, target: str) -> list[GlossRow]:
+    """The unattached notes written against `target`. A note on a
+    descriptor target (`Store.x#setter`) was filed on the member's
+    `x@<line>` name, so when the base still resolves the search covers
+    every variant of it rather than the literal target (bot review)."""
+    base, descriptor = _split_descriptor(target)
+    natural = resolve_one(fetch_all, project_name, base) if descriptor else None
+    if natural is not None and not _is_refusal(natural):
+        return _orphaned_under(fetch_all, project_name, natural["qualified_name"])
+    params: PropertyDict = {
+        cs.KEY_PROJECT_NAME: project_name,
+        cs.KEY_PROJECT_PREFIX: _prefix(project_name),
+        cs.KEY_QN: target,
+        cs.KEY_SUFFIX: f"{cs.SEPARATOR_DOT}{target}",
+    }
+    return _sort_gloss_rows(fetch_all(cq.CYPHER_GLOSSES_ORPHANED_ON, params))
+
+
+def _orphaned_under(
+    fetch_all: QueryFn, project_name: str, qualified_name: str
+) -> list[GlossRow]:
+    """The unattached notes on the definition `qualified_name` names or on
+    any of its `name@<line>` variants."""
+    qn = qualified_name.split(cs.DUP_QN_MARKER, 1)[0]
+    params: PropertyDict = {
+        cs.KEY_PROJECT_NAME: project_name,
+        cs.KEY_PROJECT_PREFIX: _prefix(project_name),
+        cs.KEY_QN: qn,
+        cs.KEY_VARIANT_PREFIX: _variant_prefix(qn),
+    }
+    return _sort_gloss_rows(fetch_all(cq.CYPHER_GLOSSES_ORPHANED_UNDER, params))
+
+
+def _is_refusal(value: SymbolRow | GlossRefusal) -> TypeIs[GlossRefusal]:
+    return isinstance(value, dict) and cs.DICT_KEY_ERROR in value
+
+
+def _split_mentions(mentions: str | None) -> list[str]:
+    if not mentions:
+        return []
+    return [part.strip() for part in mentions.split(cs.CHAR_COMMA) if part.strip()]
+
+
+class _TargetFacts(NamedTuple):
+    """What the subject's own node says at write time."""
+
+    target_hash: str | None
+    anchor: TextAnchor | None
+
+
+def _mention_anchor_props(
+    fetch_all: QueryFn,
+    project_name: str,
+    mention_qns: list[str],
+    read_source: SourceReader | None,
+) -> PropertyDict:
+    # Each mention records the anchors the subject does, in `mention_qns`
+    # order, so the repair can follow a renamed or moved mention instead of
+    # dropping it or handing it to a newcomer with the old name (#3230).
+    facts = [
+        _target_facts(fetch_all, project_name, qn, read_source) for qn in mention_qns
+    ]
+    return {
+        cs.KEY_MENTION_QNS: mention_qns,
+        cs.KEY_MENTION_HASHES: [f.target_hash or "" for f in facts],
+        cs.KEY_MENTION_QUOTES: [f.anchor.quote if f.anchor else "" for f in facts],
+    }
+
+
+def _target_facts(
+    fetch_all: QueryFn,
+    project_name: str,
+    target_qn: str,
+    read_source: SourceReader | None,
+) -> _TargetFacts:
+    rows = fetch_all(
+        cq.CYPHER_GLOSS_TARGET,
+        {cs.KEY_QN: target_qn, cs.KEY_PROJECT_PREFIX: _prefix(project_name)},
+    )
+    if not rows:
+        return _TargetFacts(None, None)
+    row = rows[0]
+    value = row.get(cs.KEY_TARGET_HASH)
+    return _TargetFacts(
+        value if isinstance(value, str) else None,
+        _anchor_of(row, project_name, read_source),
+    )
+
+
+def _anchor_of(
+    row: ResultRow, project_name: str, read_source: SourceReader | None
+) -> TextAnchor | None:
+    # The quote needs the subject's text, which only a caller rooted at the
+    # project's own checkout can supply; without one the note carries no
+    # quote and the repair chain stops at the hash tier for it.
+    path = row.get(cs.KEY_PATH)
+    start = row.get(cs.KEY_START_LINE)
+    end = row.get(cs.KEY_END_LINE)
+    name = row.get(cs.KEY_NAME)
+    if (
+        read_source is None
+        or not isinstance(path, str)
+        or not isinstance(start, int)
+        or not isinstance(end, int)
+    ):
+        return None
+    source = read_source(project_name, path)
+    if source is None:
+        return None
+    return text_anchor(source, name if isinstance(name, str) else None, start, end)
+
+
+def _gloss_row(row: ResultRow) -> GlossRow:
+    raw_mentions = row.get(cs.KEY_MENTIONS)
+    mentions = (
+        sorted(str(m) for m in raw_mentions if m is not None)
+        if isinstance(raw_mentions, list)
+        else []
+    )
+    return GlossRow(
+        qualified_name=str(row.get(cs.KEY_QUALIFIED_NAME, "")),
+        kind=str(row.get(cs.KEY_KIND, "")),
+        status=str(row.get(cs.KEY_STATUS, "")),
+        body=str(row.get(cs.KEY_BODY, "")),
+        created_by=str(row.get(cs.KEY_CREATED_BY, "")),
+        created_at=str(row.get(cs.KEY_CREATED_AT, "")),
+        commit_sha=_opt_str(row.get(cs.KEY_COMMIT_SHA)),
+        target_qn=str(row.get(cs.KEY_TARGET_QN, "")),
+        target_hash=_opt_str(row.get(cs.KEY_TARGET_HASH)),
+        anchor_state=str(row.get(cs.KEY_ANCHOR_STATE, "")),
+        moved_from=_opt_str(row.get(cs.KEY_MOVED_FROM)),
+        candidate_qns=_str_list(row.get(cs.KEY_CANDIDATE_QNS)),
+        mentions=mentions,
+        mentions_lost=_str_list(row.get(cs.KEY_MENTIONS_LOST)),
+    )
+
+
+def _str_list(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return sorted(str(item) for item in value if item is not None)
+
+
+def _opt_str(value: object) -> str | None:
+    return value if isinstance(value, str) else None
+
+
+def _sort_gloss_rows(rows: list[ResultRow]) -> list[GlossRow]:
+    # Oldest first, then by key: the store's return order is not a contract.
+    return sorted(
+        (_gloss_row(row) for row in rows),
+        key=lambda g: (g["created_at"], g["qualified_name"]),
+    )
+
+
+def write_gloss(
+    fetch_all: QueryFn,
+    execute_write: WriteFn,
+    project_name: str,
+    target: str,
+    body: str,
+    kind: str,
+    mentions: str | None = None,
+    author: str | None = None,
+    commit_sha: str | None = None,
+    read_source: SourceReader | None = None,
+) -> GlossRow | GlossRefusal:
+    """Attach a note to the definition `target` names and return it as stored.
+
+    Every input is resolved and validated BEFORE anything is written, and the
+    write itself is one all-or-nothing statement, so an error or a refusal
+    always means the graph is unchanged. A repeat write of the same note
+    (same subject, kind and body) updates it in place, keeps its original
+    author and creation time, and replaces its mentions. `mentions` is a
+    comma-separated list of further definitions the note talks about; each
+    becomes a `MENTIONS` edge and each is held to the same resolution rule as
+    the subject. `read_source` supplies the subject's file text so the note
+    can record its text-quote anchor (`gloss_anchor`); without it, or when
+    the file cannot be read, the note simply carries no quote.
+    """
+    text = body.strip()
+    if not text:
+        return GlossRefusal(error=cs.MCP_GLOSS_BODY_EMPTY)
+    kinds = [k.value for k in cs.GlossKind]
+    if kind not in kinds:
+        return GlossRefusal(
+            error=cs.MCP_GLOSS_KIND_UNKNOWN.format(
+                kind=kind, kinds=cs.SEPARATOR_COMMA_SPACE.join(kinds)
+            )
+        )
+    subject = resolve_one(fetch_all, project_name, target)
+    if _is_refusal(subject):
+        return subject
+    subject_row: SymbolRow = subject
+    mentioned: list[SymbolRow] = []
+    for name in _split_mentions(mentions):
+        found = resolve_one(fetch_all, project_name, name)
+        if _is_refusal(found):
+            refusal: GlossRefusal = found
+            refusal[cs.DICT_KEY_ERROR] = cs.MCP_GLOSS_MENTION_REFUSED.format(
+                name=name, error=refusal[cs.DICT_KEY_ERROR]
+            )
+            return refusal
+        mentioned.append(found)
+
+    target_qn = subject_row["qualified_name"]
+    key = gloss_id(target_qn, kind, text)
+    facts = _target_facts(fetch_all, project_name, target_qn, read_source)
+    # A None here unsets the property (Cypher SET with null), so a gloss on a
+    # target without a fingerprint, or written outside a checkout, simply
+    # lacks that property rather than carrying a placeholder.
+    params: PropertyDict = {
+        cs.KEY_QN: key,
+        cs.KEY_PROJECT_PREFIX: _prefix(project_name),
+        cs.KEY_TARGET_QN: target_qn,
+        **_mention_anchor_props(
+            fetch_all,
+            project_name,
+            sorted({m["qualified_name"] for m in mentioned}),
+            read_source,
+        ),
+        cs.KEY_KIND: kind,
+        cs.KEY_STATUS: cs.GLOSS_STATUS_ACCEPTED,
+        cs.KEY_BODY: text,
+        cs.KEY_CREATED_BY: (author or "").strip() or cs.GLOSS_DEFAULT_AUTHOR,
+        cs.KEY_CREATED_AT: datetime.now(UTC).isoformat(timespec="seconds"),
+        cs.KEY_COMMIT_SHA: commit_sha or None,
+        cs.KEY_TARGET_HASH: facts.target_hash,
+        cs.KEY_ANCHOR_QUOTE: facts.anchor.quote if facts.anchor else None,
+        cs.KEY_ANCHOR_PREFIX: facts.anchor.prefix if facts.anchor else None,
+        cs.KEY_ANCHOR_SUFFIX: facts.anchor.suffix if facts.anchor else None,
+        # Recorded, not derived: a project name may contain dots, so the
+        # repair pass cannot read it back off `target_qn` (local review).
+        cs.KEY_PROJECT_NAME: project_name,
+        cs.KEY_ANCHOR_STATE: cs.GlossAnchorState.EXACT.value,
+        cs.KEY_WRITE_ID: uuid.uuid4().hex,
+    }
+    # One statement writes the node and every edge, or nothing (see the
+    # query). The statement is silent either way, and on a repeat write the
+    # node's presence proves nothing (the earlier note satisfies it), so the
+    # only evidence THIS write landed is the per-call nonce read back from
+    # the node: the subject or a mentioned definition may have left the
+    # graph between resolving and writing, and that must read as "not
+    # written", not as success over the old state.
+    execute_write(cq.CYPHER_GLOSS_WRITE, params)
+    stored = fetch_all(cq.CYPHER_GLOSS_READ, {cs.KEY_QN: key})
+    if not stored or stored[0].get(cs.KEY_WRITE_ID) != params[cs.KEY_WRITE_ID]:
+        return GlossRefusal(error=cs.MCP_GLOSS_NOT_WRITTEN.format(target=target))
+    return _gloss_row(stored[0])
+
+
+def glosses_for(
+    fetch_all: QueryFn, project_name: str, target: str
+) -> GlossesResult | GlossRefusal:
+    """Every gloss about the definition `target` names.
+
+    `annotating` are the notes filed ON it; `mentioning` are notes filed on
+    something else that refer to it. Keeping them apart is the point of the
+    node over a text field. Per-symbol by construction, so retrieval is
+    relevance-gated rather than a dump.
+    """
+    subject = resolve_one(fetch_all, project_name, target)
+    if _is_refusal(subject):
+        refusal: GlossRefusal = subject
+        # A name that matches nothing may still be one notes were written
+        # against: the definition is gone and the notes are LOST or
+        # AMBIGUOUS. They are returned with the refusal so the orphaning is
+        # visible, never re-bound to a lookalike. An ambiguous name is not
+        # gone, so it gets no such list.
+        if cs.KEY_CANDIDATES not in refusal:
+            orphaned = _orphaned_on(fetch_all, project_name, target)
+            if orphaned:
+                refusal[cs.KEY_ORPHANED] = orphaned
+        return refusal
+    subject_row: SymbolRow = subject
+    params: PropertyDict = {cs.KEY_QN: subject_row["qualified_name"]}
+    result = GlossesResult(
+        target=subject_row,
+        annotating=_sort_gloss_rows(fetch_all(cq.CYPHER_GLOSSES_ANNOTATING, params)),
+        mentioning=_sort_gloss_rows(fetch_all(cq.CYPHER_GLOSSES_MENTIONING, params)),
+    )
+    # A descriptor names a member whose `x@<line>` name shifts: a note filed
+    # on the member's old name that the repair could not re-bind (LOST or
+    # AMBIGUOUS) is reachable only through the stable descriptor, so it is
+    # listed with the member the descriptor now resolves to.
+    if _split_descriptor(target)[1] is not None:
+        orphaned = _orphaned_under(
+            fetch_all, project_name, subject_row["qualified_name"]
+        )
+        if orphaned:
+            result[cs.KEY_ORPHANED] = orphaned
+    return result

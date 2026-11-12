@@ -1,0 +1,677 @@
+syntax = "proto3";
+
+// Regenerating the bindings after editing this file:
+//
+//   uv run --with "grpcio-tools==1.76.0" python -m grpc_tools.protoc \
+//     -I. --python_out=. --pyi_out=. codec/schema.proto
+//
+// The grpcio-tools version is not incidental. Generated code carries a gencode
+// version stamp that `ValidateProtobufRuntimeVersion` checks at import, and a
+// runtime OLDER than the gencode raises rather than degrading — so generating
+// with a newer protoc than the pinned `protobuf` runtime makes `codec`
+// unimportable for everyone. 1.76.0 bundles a protoc matching the runtime
+// floor in pyproject.toml. Bump both together, runtime first.
+
+package graphcode.v1;
+
+import "google/protobuf/struct.proto";
+
+
+/*
+
+We are parsing the entire codebase into ASTs & putting that into a codegraph.
+This makes the Project node the top level root, and everything then will span from it.
+
+Roughly, we're going to be looking at something like this:
+
+Project
+    Folder
+        File
+        Module
+            Function
+            Class
+                Method
+    Package
+        Module
+            Function
+            Class
+                Method
+    ExternalPackage
+
+We can't build a literal nested tree like so because we would have duplicated results.
+I think the correct way to go about this would be to have IDs for each nested structure.
+Then the parents/nodes that have an outgoing connection to the child node will have a
+list of IDs of the children with which they're connected with. Flattened, this would bring
+us to something like this:
+
+Project
+    - List of Package IDs for CONTAINS_PACKAGE rels
+    - List of ExternalPackage IDs for DEPENDS_ON_EXTERNAL rels (or whatever it is; need to double check)
+    - List of Folder IDs for CONTAINS_FOLDER rels
+Folder
+    - List of File IDs for CONTAINS_FILE rels
+    - List of Module IDs for CONTAINS_MODULE rels
+File
+Module
+    - List of Function IDs for DEFINES rels
+    - List of Class IDs for DEFINES rels
+ModuleImplementation
+    - TODO: think about this
+ModuleInterface
+    - TODO: think about this
+Function
+    - List of Function IDs for CALLS rels
+    - List of Method IDs for CALLS rels
+Class
+    - List of Method IDs for DEFINES_METHOD rels
+    - List of Class IDs for INHERITS rels
+Method
+    - List of Method IDs for CALLS rels
+    - List of Method IDs for OVERRIDES rels
+    - List of Function IDs for CALLS rels
+Package
+    - List of Module IDs for CONTAINS_MODULE rels
+ExternalPackage
+
+
+And then the rest of the params are just direct translations from what's in the
+memgraph schema, nothing special. Not worth listing in the tree. Can just check the shema.
+
+So that's the structure of the schema. I guess the next thing is how do we parse it into
+that structure?
+
+Well, we want to do everything the same up to the GraphUpdate part in the system architecture.
+Beyond that, we need a new Ingestor class in the Data Layer, next to the Memgraph Ingestor.
+This new Ingestor won't be communicating to Memgraph Database but instead be outputting
+a protobuf file.
+*/
+
+// =======================================================
+// Top-Level Container Message
+// =======================================================
+
+message GraphCodeIndex {
+    repeated Node nodes = 1;
+    repeated Relationship relationships = 2;
+  }
+
+  // =======================================================
+  // Generic Node and Relationship Messages
+  // =======================================================
+
+  // A generic container for any node in the graph.
+  // The 'oneof' field holds the specific, strongly-typed payload.
+  message Node {
+    oneof payload {
+      Project project = 1;
+      Package package = 2;
+      Folder folder = 3;
+      Module module = 4;
+      Class class_node = 5;
+      Function function = 6;
+      Method method = 7;
+      File file = 8;
+      ExternalPackage external_package = 9;
+      ModuleImplementation module_implementation = 10;
+      ModuleInterface module_interface = 11;
+      Interface interface_node = 12;
+      Enum enum_node = 13;
+      Type type_node = 14;
+      Union union_node = 15;
+      ExternalModule external_module = 16;
+      Resource resource = 17;
+      Section section = 18;
+      // ast-grep findings (issue #413). Field numbering is append-only for
+      // the same reason as RelationshipType: a number is wire format.
+      Pattern pattern = 19;
+      CodeSmell code_smell = 20;
+      SecurityIssue security_issue = 21;
+      Gloss gloss = 22;
+      Parameter parameter = 23;
+      Field field = 24;
+      EnumVariant enum_variant = 25;
+      Constant constant = 26;
+    }
+  }
+
+  // Represents a single, directed relationship between two nodes.
+  // The source and target IDs are the primary keys of the respective nodes.
+  message Relationship {
+    enum RelationshipType {
+      RELATIONSHIP_TYPE_UNSPECIFIED = 0;
+      CONTAINS_PACKAGE = 1;
+      CONTAINS_FOLDER = 2;
+      CONTAINS_FILE = 3;
+      CONTAINS_MODULE = 4;
+      DEFINES = 5;
+      DEFINES_METHOD = 6;
+      IMPORTS = 7;
+      INHERITS = 8;
+      OVERRIDES = 9;
+      CALLS = 10;
+      DEPENDS_ON_EXTERNAL = 11;
+      IMPLEMENTS_MODULE = 12;
+      IMPLEMENTS = 13;
+      EXPORTS = 14;
+      EXPORTS_MODULE = 15;
+      READS_FROM = 16;
+      WRITES_TO = 17;
+      CONTAINS_SECTION = 18;
+      // Numbering is append-only: a field number is part of the wire format,
+      // so reusing or reordering one silently reinterprets existing indexes.
+      EXPOSES = 19;
+      FLOWS_TO = 20;
+      HAS_SMELL = 21;
+      HAS_VULNERABILITY = 22;
+      IMPLEMENTS_PATTERN = 23;
+      INSTANTIATES = 24;
+      LINKS_TO = 25;
+      REFERENCES = 26;
+      RESOLVES_TO = 27;
+      // Function/Method -> the project type its annotation names (#1527).
+      RETURNS = 28;
+      ACCEPTS = 29;
+
+      // Agent-written glosses (issue #1808).
+      ANNOTATES = 30;
+      MENTIONS = 31;
+      // Declared parameters (issue #1804).
+      HAS_PARAMETER = 32;
+      OF_TYPE = 33;
+      // Declared fields (issue #1805). OF_TYPE is shared with Parameter.
+      HAS_FIELD = 34;
+      // Enum variants (issue #1807).
+      HAS_VARIANT = 35;
+      // Module-level constants (issue #1806). OF_TYPE is shared with
+      // Parameter and Field.
+      DEFINES_CONSTANT = 36;
+    }
+
+    RelationshipType type = 1;
+    string source_id = 2; // The Primary Key of the source node
+    string target_id = 3; // The Primary Key of the target node
+    google.protobuf.Struct properties = 4;
+    string source_label = 5; // The label of the source node
+    string target_label = 6; // The label of the target node
+  }
+
+
+  // =======================================================
+  // Specific Node Payload Messages
+  // =======================================================
+
+  message Project {
+    // Primary Key
+    string name = 1;
+  }
+
+  message Package {
+    // Primary Key
+    string qualified_name = 1;
+
+    string name = 2;
+    string path = 3;
+  }
+
+  message Folder {
+    // Primary Key
+    string path = 1;
+
+    string name = 2;
+  }
+
+  message File {
+    // Primary Key
+    string path = 1;
+
+    string name = 2;
+    string extension = 3;
+  }
+
+  message Module {
+    // Primary Key
+    string qualified_name = 1;
+
+    string name = 2;
+    string path = 3;
+    // Rust: the module's own attributes (a bodied inline mod's
+    // `#[cfg(test)]` marks its subtree as test code, issue #1010).
+    repeated string decorators = 4;
+    // Rust: target-qn candidates of `#[cfg(test)] mod NAME;` declarations
+    // made IN this module, and the ungated counterparts that let a
+    // production target's declaration of the same file module win.
+    repeated string rust_cfg_test_mods = 5;
+    repeated string rust_ungated_mods = 6;
+    // Whether flow analysis covered this module: its language is in the
+    // source/sink registry and the FLOWS_TO capture group was enabled at
+    // indexing (issue #1050).
+    bool flow_covered = 7;
+    // Annotation-processor provenance (issue #1140): true for modules parsed
+    // from generated output, with the path-derived processor hint.
+    bool generated = 8;
+    string generator = 9;
+    // Declared Markdown front matter as "key=value" pairs (issue #164).
+    // Always emitted, empty list included, so a re-index clears metadata
+    // the document no longer declares -- SET n += row.props merges, so
+    // omitting the property could not express removal.
+    repeated string front_matter = 10;
+    // The file's own documentation (issue #1789): a Python module docstring,
+    // a Rust `//!` block, a Go package comment, Javadoc/JSDoc, and so on.
+    string docstring = 11;
+    // Graph properties the index used to drop (#3206). Numbered from 20 so
+    // fields other changes add below do not collide.
+    int32 start_line = 20;
+    int32 end_line = 21;
+    repeated string unresolved_specifiers = 22;
+    repeated string unresolved_references = 23;
+  }
+
+  message ExternalModule {
+    // Primary Key
+    string qualified_name = 1;
+
+    string name = 2;
+    string path = 3;
+  }
+
+  // C++20 only
+  message ModuleImplementation {
+    // Primary Key
+    string qualified_name = 1;
+
+    string name = 2;
+    string path = 3;
+    string implements_module = 4;
+    // Graph properties the index used to drop (#3206). Numbered from 20 so
+    // fields other changes add below do not collide.
+    string module_type = 20;
+  }
+
+  // C++20 only
+  message ModuleInterface {
+    // Primary Key
+    string qualified_name = 1;
+
+    string name = 2;
+    string path = 3;
+    // Graph properties the index used to drop (#3206). Numbered from 20 so
+    // fields other changes add below do not collide.
+    string module_type = 20;
+  }
+
+  message ExternalPackage {
+    // Primary Key
+    string name = 1;
+  }
+
+  // ast-grep findings (issue #413), attached to a Module and opt-in via
+  // CaptureGroup.FINDINGS. The three share a shape: Pattern is a matched
+  // structural pattern, CodeSmell a quality signal, SecurityIssue a security
+  // one. They are separate labels rather than one with a `kind`, so the graph
+  // can be queried per severity without a property filter.
+  message Pattern {
+    // Primary Key
+    string qualified_name = 1;
+
+    string name = 2;
+    string message = 3;
+    int32 start_line = 4;
+    int32 end_line = 5;
+    string path = 6;
+    string snippet = 7;
+  }
+
+  message CodeSmell {
+    // Primary Key
+    string qualified_name = 1;
+
+    string name = 2;
+    string message = 3;
+    int32 start_line = 4;
+    int32 end_line = 5;
+    string path = 6;
+    string snippet = 7;
+  }
+
+  message SecurityIssue {
+    // Primary Key
+    string qualified_name = 1;
+
+    string name = 2;
+    string message = 3;
+    int32 start_line = 4;
+    int32 end_line = 5;
+    string path = 6;
+    string snippet = 7;
+  }
+
+  // An agent-written note about a symbol (issue #1808). Unlike every other
+  // payload here it is not derived from source: it is written into the graph
+  // and read back later, so it must survive re-indexing rather than being
+  // rebuilt by it.
+  message Gloss {
+    // Primary Key
+    string qualified_name = 1;
+
+    string kind = 2;
+    string status = 3;
+    string body = 4;
+    string created_by = 5;
+    string created_at = 6;
+    string commit_sha = 7;
+
+    // The symbol this gloss is about, and the evidence for still being
+    // attached to it. `anchor_state` is EXACT|MOVED|STALE|AMBIGUOUS|LOST; a
+    // gloss that cannot be re-anchored goes LOST rather than being re-bound
+    // to a wrong symbol on a confident guess.
+    string target_qn = 8;
+    string target_hash = 9;
+    string anchor_quote = 10;
+    string anchor_prefix = 11;
+    string anchor_suffix = 12;
+    string anchor_state = 13;
+    // The name a MOVED gloss was written against (stage four of #1808);
+    // unset unless the note has followed its definition to a new name.
+    string moved_from = 14;
+    // The project the gloss was written in. `target_qn` starts with it, but a
+    // project name may itself contain dots, so it is recorded rather than
+    // split back out. Unset on a gloss written before this field existed.
+    string project = 15;
+  }
+
+  // A declared formal parameter of a Function or Method (issue #1804).
+  // Position is the DECLARATION index with self/cls excluded, not the
+  // call-site slot: keyword-only parameters count, variadics count once.
+  message Parameter {
+    // Primary Key: <callable qn>.<index>
+    string qualified_name = 1;
+
+    string name = 2;
+    int32 index = 3;
+    string path = 4;
+    string absolute_path = 5;
+    int32 start_line = 6;
+    int32 start_col = 7;
+    // The annotation as written, "" when there is none.
+    string type_name = 8;
+    bool is_variadic = 9;
+    bool has_default = 10;
+  }
+
+  // A field, attribute, property or member variable a Class, Interface, Enum,
+  // Type or Union declares (issue #1805).
+  message Field {
+    // Primary Key: <owner qn>.<name>
+    string qualified_name = 1;
+
+    string name = 2;
+    string path = 3;
+    // 4 was absolute_path. Deliberately not on the wire, like every other
+    // definition label: the canonical export must not differ per checkout.
+    reserved 4;
+    int32 start_line = 5;
+    int32 start_col = 6;
+    // The declared type as written, "" when there is none.
+    string type_name = 7;
+    // Keyword modifiers in source order (visibility, static, final, ...).
+    repeated string modifiers = 8;
+    bool is_static = 9;
+    string docstring = 10;
+  }
+
+  // A named constant a Module declares (issue #1806). Python module scope
+  // only for now: a class-level member is already a Field (#1805), and the
+  // other languages' `const`/`static` forms follow in a later PR.
+  message Constant {
+    // Primary Key: <module qn>.<name>
+    string qualified_name = 1;
+
+    string name = 2;
+    string path = 3;
+    // 4 was absolute_path. Deliberately not on the wire, like Field and
+    // every other definition label: the canonical export must not differ
+    // per checkout.
+    reserved 4;
+    int32 start_line = 5;
+    int32 start_col = 6;
+    // The annotation as written, "" when there is none.
+    string type_name = 7;
+    // The right-hand side as written, "" when absent or over the cap.
+    string value = 8;
+  }
+
+  // A variant an Enum declares (issue #1807).
+  message EnumVariant {
+    // Primary Key: <enum qn>.<name>
+    string qualified_name = 1;
+
+    string name = 2;
+    string path = 3;
+    // 4 would be absolute_path; not on the wire, like Field.
+    reserved 4;
+    int32 start_line = 5;
+    int32 start_col = 6;
+    // Position among the enum's variants, 0-based.
+    int32 index = 7;
+    // The discriminant as written after `=`, "" when there is none.
+    string value = 8;
+    string docstring = 9;
+  }
+
+  // An external I/O resource a callable reads from or writes to
+  // (file, network endpoint, database, stream, env var, ...).
+  message Resource {
+    // Primary Key
+    string qualified_name = 1;
+
+    string name = 2;
+    string kind = 3;
+    // The serving project, on ENDPOINT resources only (#2536); "" elsewhere.
+    string project = 4;
+  }
+
+  // A heading in a document, and the prose beneath it. Sections nest by
+  // heading level through CONTAINS_SECTION.
+  message Section {
+    // Primary Key
+    string qualified_name = 1;
+
+    string name = 2;
+    int32 heading_level = 3;
+    int32 start_line = 4;
+    int32 end_line = 5;
+    string path = 6;
+    string absolute_path = 7;
+  }
+
+  message Function {
+    // Primary Key
+    string qualified_name = 1;
+
+    string name = 2;
+    string docstring = 3;
+    int32 start_line = 4;
+    int32 end_line = 5;
+    repeated string decorators = 6;
+    bool is_exported = 7;
+    // Structural clone-detection fingerprints (whole skeleton, its node
+    // count, and the statement-level branch digests).
+    string ast_fingerprint = 8;
+    int32 ast_fingerprint_nodes = 9;
+    repeated string ast_branch_fingerprints = 10;
+    // Annotations as written (#1527); absent return_type is the empty string.
+    string return_type = 11;
+    repeated string param_types = 12;
+    // A JS/TS object literal's function value (#2435): reached through its
+    // object, never by its key alone, so a bare call must not bind to it.
+    bool is_object_member = 13;
+    // A top-level Dart `main`, which `dart run` starts (#2527).
+    bool is_program_main = 14;
+    // The path a Rust fn's visibility is restricted to (`self`, `crate`,
+    // `super`, an `in` path); empty for a plain `pub` one, `self` for a
+    // `macro_rules!` macro (PR #3242).
+    string rust_visibility = 15;
+    // Graph properties the index used to drop (#3206). Numbered from 20 so
+    // fields other changes add below do not collide.
+    string path = 20;
+    repeated string modifiers = 21;
+    int32 start_col = 22;
+    int32 name_start_line = 23;
+    int32 name_start_col = 24;
+    string anchor_hash = 25;
+    repeated string positional_params = 26;
+    bool is_body_scoped_name = 27;
+    bool is_macro = 28;
+  }
+
+  message Method {
+    // Primary Key
+    string qualified_name = 1;
+
+    string name = 2;
+    string docstring = 3;
+    int32 start_line = 4;
+    int32 end_line = 5;
+    repeated string decorators = 6;
+    // Structural clone-detection fingerprints (see Function).
+    string ast_fingerprint = 7;
+    int32 ast_fingerprint_nodes = 8;
+    repeated string ast_branch_fingerprints = 9;
+    // Annotations as written (#1527); absent return_type is the empty string.
+    string return_type = 10;
+    repeated string param_types = 11;
+    // A C++ member's overload signature and whether its class body declares
+    // it (#2455). An incremental run reads both back to tell which overload
+    // a re-parsed out-of-class definition defines; absent signature is the
+    // empty string (not a C++ member).
+    string signature = 12;
+    bool declared_in_class = 13;
+    // The dead-code roots read both (#2527): whether the method is public
+    // API, and whether the JVM launcher starts it as `main`.
+    bool is_exported = 14;
+    bool is_program_main = 15;
+    // Graph properties the index used to drop (#3206). Numbered from 20 so
+    // fields other changes add below do not collide.
+    string path = 20;
+    repeated string modifiers = 21;
+    int32 start_col = 22;
+    int32 name_start_line = 23;
+    int32 name_start_col = 24;
+    string anchor_hash = 25;
+    repeated string positional_params = 26;
+    bool is_property = 27;
+    bool overrides_external = 28;
+  }
+
+  message Class {
+    // Primary Key
+    string qualified_name = 1;
+
+    string name = 2;
+    string docstring = 3;
+    int32 start_line = 4;
+    int32 end_line = 5;
+    repeated string decorators = 6;
+    bool is_exported = 7;
+    // The namespace a C# type is declared in (issue #1629).
+    string namespace = 8;
+    // How many type parameters a generic C# type declares; 0 when it is
+    // not generic (issue #2579).
+    int32 generic_arity = 9;
+    // `name<TAB>type` per field (plus `<TAB>inner` for a Rust guard field
+    // such as `Mutex<State>`), read back by incremental runs (issue #3004).
+    repeated string field_types = 10;
+    // Graph properties the index used to drop (#3206). Numbered from 20 so
+    // fields other changes add below do not collide.
+    string path = 20;
+    repeated string modifiers = 21;
+    int32 start_col = 22;
+    string anchor_hash = 23;
+  }
+
+  message Interface {
+    // Primary Key
+    string qualified_name = 1;
+
+    string name = 2;
+    string path = 3;
+    string absolute_path = 4;
+    string namespace = 5;
+    // How many type parameters a generic C# interface declares; 0 when it
+    // is not generic (issue #2579).
+    int32 generic_arity = 6;
+    // Why cgr cannot tell which types implement a Go interface: "builds",
+    // "embeds" or "constraint"; empty when it can (#3360). A rename of a
+    // method of its name refuses.
+    string implementers_unknown = 7;
+    // A C# interface's property types, as Class.field_types (issue #3004).
+    repeated string field_types = 8;
+    // Graph properties the index used to drop (#3206). Numbered from 20 so
+    // fields other changes add below do not collide.
+    string docstring = 20;
+    int32 start_line = 21;
+    int32 end_line = 22;
+    repeated string decorators = 23;
+    bool is_exported = 24;
+    repeated string modifiers = 25;
+    int32 start_col = 26;
+    string anchor_hash = 27;
+  }
+
+  message Enum {
+    // Primary Key
+    string qualified_name = 1;
+
+    string name = 2;
+    string path = 3;
+    string absolute_path = 4;
+    string namespace = 5;
+    // Graph properties the index used to drop (#3206). Numbered from 20 so
+    // fields other changes add below do not collide.
+    string docstring = 20;
+    int32 start_line = 21;
+    int32 end_line = 22;
+    repeated string decorators = 23;
+    bool is_exported = 24;
+    repeated string modifiers = 25;
+    int32 start_col = 26;
+    string anchor_hash = 27;
+  }
+
+  message Type {
+    // Primary Key
+    string qualified_name = 1;
+
+    string name = 2;
+    // Graph properties the index used to drop (#3206). Numbered from 20 so
+    // fields other changes add below do not collide.
+    string docstring = 20;
+    int32 start_line = 21;
+    int32 end_line = 22;
+    repeated string decorators = 23;
+    bool is_exported = 24;
+    repeated string modifiers = 25;
+    int32 start_col = 26;
+    string anchor_hash = 27;
+    string path = 28;
+  }
+
+  message Union {
+    // Primary Key
+    string qualified_name = 1;
+
+    string name = 2;
+    // The union's field types, as Class.field_types (issue #3004).
+    repeated string field_types = 3;
+    // Graph properties the index used to drop (#3206). Numbered from 20 so
+    // fields other changes add below do not collide.
+    string docstring = 20;
+    int32 start_line = 21;
+    int32 end_line = 22;
+    repeated string decorators = 23;
+    bool is_exported = 24;
+    repeated string modifiers = 25;
+    int32 start_col = 26;
+    string anchor_hash = 27;
+    string path = 28;
+  }

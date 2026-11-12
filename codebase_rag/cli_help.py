@@ -1,0 +1,795 @@
+from enum import StrEnum
+
+
+class CLICommandName(StrEnum):
+    START = "start"
+    INDEX = "index"
+    WATCH = "watch"
+    EXPORT = "export"
+    OPTIMIZE = "optimize"
+    MCP_SERVER = "mcp-server"
+    GRAPH_LOADER = "graph-loader"
+    LANGUAGE = "language"
+    DOCTOR = "doctor"
+    STATS = "stats"
+    DEAD_CODE = "dead-code"
+    DUPLICATES = "duplicates"
+    DELETE_PROJECT = "delete-project"
+    PRUNE = "prune"
+    DAEMON = "daemon"
+    WORKSPACE = "workspace"
+    TRACE = "trace"
+    EDITS = "edits"
+    GRAPH = "graph"
+    CHECK = "check"
+    RENAME = "rename"
+    CHANGE_SIGNATURE = "change-signature"
+    MOVE = "move"
+    CONTEXT = "context"
+    PORT = "port"
+    STOP = "stop"
+    STATUS = "status"
+    HELP = "help"
+    VERIFY_INDEX = "verify-index"
+    DIFF_INDEX = "diff-index"
+
+
+APP_DESCRIPTION = (
+    "Analyse source code with Tree-sitter, store its structure in a shared "
+    "knowledge graph, and query it in natural language."
+)
+APP_EPILOG = "Run 'cgr help COMMAND' for details about a command."
+
+PANEL_USE = "Query and improve code"
+PANEL_GRAPH = "Build and inspect the graph"
+PANEL_MANAGE = "Manage cgr"
+PANEL_HELP = "Help"
+
+CMD_START = "Open the code assistant for a repository or workspace"
+CMD_INDEX = "Write an offline protobuf index for a repository"
+CMD_WATCH = "Keep a repository's graph in sync while you edit it"
+CMD_EXPORT = "Export the shared graph, or chosen projects, to JSON"
+CMD_OPTIMIZE = "Run a language-focused code optimisation session"
+CMD_MCP_SERVER = "Serve cgr tools over stdio or HTTP"
+CMD_GRAPH_LOADER = "Summarise an exported graph JSON file"
+CMD_LANGUAGE = "Manage language grammars and parser metadata"
+CMD_DOCTOR = "Check dependencies, services, and configuration"
+CMD_STATS = "Show graph node and relationship counts"
+CMD_DEAD_CODE = "Report code that appears unreachable from known entry points"
+CMD_DUPLICATES = "Report structurally duplicated functions and methods"
+CMD_DELETE_PROJECT = "Delete one project without changing other indexed projects"
+CMD_HELP = "Show help for a command"
+
+CMD_LANGUAGE_GROUP = CMD_LANGUAGE
+CMD_LANGUAGE_ADD = "Add a Tree-sitter grammar to a code-graph-rag source checkout"
+CMD_LANGUAGE_LIST = "List supported languages by tier, and the optional frontends"
+CMD_LANGUAGE_REMOVE = "Remove a language from a code-graph-rag source checkout"
+CMD_LANGUAGE_CLEANUP = "Remove orphaned grammar entries under the checkout's .git"
+# add-grammar, remove-language and cleanup-orphaned-modules edit the checkout
+# the running cgr was imported from, never the cwd (issue #2422).
+HELP_LANGUAGE_CONTRIBUTOR_TOOL = (
+    "Contributor tool. It edits codebase_rag/language_spec.py and the grammars/ "
+    "submodules of the code-graph-rag source checkout this cgr runs from, "
+    "whatever the current directory. An installed cgr (pip, pipx, uv tool "
+    "install) has no checkout, so the command refuses and changes nothing."
+)
+CMD_LANGUAGE_ADD_HELP = f"{CMD_LANGUAGE_ADD}.\n\n{HELP_LANGUAGE_CONTRIBUTOR_TOOL}"
+CMD_LANGUAGE_REMOVE_HELP = f"{CMD_LANGUAGE_REMOVE}.\n\n{HELP_LANGUAGE_CONTRIBUTOR_TOOL}"
+CMD_LANGUAGE_CLEANUP_HELP = (
+    f"{CMD_LANGUAGE_CLEANUP}.\n\n{HELP_LANGUAGE_CONTRIBUTOR_TOOL}"
+)
+
+CMD_DAEMON = "Manage the shared Memgraph and Qdrant stack"
+CMD_DAEMON_GROUP = CMD_DAEMON
+CMD_DAEMON_UP = "Start the shared stack and wait until it is healthy"
+CMD_DAEMON_DOWN = "Stop the shared stack and preserve its data volumes"
+CMD_DAEMON_STATUS = "Show stack state and service reachability"
+CMD_DAEMON_LOGS = "Show Docker Compose logs for the shared stack"
+CMD_DAEMON_RESTART = "Restart the shared stack and wait for health checks"
+
+CMD_WORKSPACE = "Manage named groups of repositories"
+CMD_WORKSPACE_GROUP = CMD_WORKSPACE
+CMD_WORKSPACE_LIST = "List saved workspaces"
+CMD_WORKSPACE_CREATE = "Create an empty workspace definition"
+CMD_WORKSPACE_DELETE = "Delete a workspace definition but keep indexed graph data"
+CMD_WORKSPACE_SHOW = "Show the repositories and project names in a workspace"
+CMD_WORKSPACE_ADD_REPO = "Add a repository to a workspace"
+CMD_WORKSPACE_REMOVE_REPO = "Remove a repository from a workspace by path"
+
+CMD_TRACE = "Ingest runtime call traces as dynamic CALLS edges"
+CMD_TRACE_GROUP = CMD_TRACE
+CMD_EDITS = (
+    "Show or undo recorded edit transactions (multi-file edits applied through cgr)."
+)
+CMD_EDITS_GROUP = CMD_EDITS
+CMD_EDITS_SHOW = (
+    "List the last N recorded edit transactions, newest first, with their diffs."
+)
+CMD_EDITS_UNDO = (
+    "Reverse the last N recorded edit transactions, newest first; stops at the "
+    "first file that changed since. The restored files are re-ingested into "
+    "the graph, as the edit's own files were."
+)
+EPILOG_EDITS = "Run 'cgr help edits COMMAND' for command-specific help."
+EXAMPLES_EDITS_SHOW = (
+    "Examples:\n  cgr edits show\n  cgr edits show -n 5 --repo-path ~/proj"
+)
+EXAMPLES_EDITS_UNDO = (
+    "Examples:\n  cgr edits undo\n  cgr edits undo -n 2 --repo-path ~/proj"
+)
+HELP_EDITS_COUNT = "How many transactions to show or undo."
+HELP_EDITS_REPO_PATH = (
+    "Repository whose edit history to use (default: current directory)."
+)
+HELP_EDITS_DIFF = "Print each transaction's unified diff."
+CMD_GRAPH = "Deterministic graph queries (resolve, definition, callers, callees, implementors, overrides, importers, tests-reaching) as JSON, no LLM."
+CMD_GRAPH_GROUP = CMD_GRAPH
+CMD_GRAPH_RESOLVE = "Resolve a name, dotted suffix, or path:line to qualified names."
+CMD_GRAPH_DEFINITION = "File, span, decorators, docstring and source of one definition."
+CMD_GRAPH_CALLERS = "Call sites that invoke a qualified name, one row per site."
+CMD_GRAPH_CALLEES = "Call sites inside a qualified name, one row per site."
+CMD_GRAPH_IMPLEMENTORS = (
+    "Types that inherit from or implement a type. "
+    "Direct subtypes only, unless --depth is above 1."
+)
+CMD_GRAPH_OVERRIDES = (
+    "Methods overriding a method, and the method it overrides. "
+    "Direct overrides only, unless --depth is above 1."
+)
+CMD_GRAPH_IMPORTERS = (
+    "Modules importing a module, with each import statement's location. "
+    "Direct importers only, unless --through-reexports."
+)
+CMD_GRAPH_TESTS_REACHING = (
+    "Tests from which a qualified name is reachable, with distance."
+)
+EPILOG_GRAPH = (
+    "Run 'cgr help graph COMMAND' for command-specific help.\n\n"
+    "Exit status: 0 with the JSON answer, where [] means the name is in the "
+    "graph and nothing matches it; 3 when the project is not indexed; 4 when "
+    "a qualified name is not in the graph."
+)
+HELP_GRAPH_PROJECT = "Project name in the graph (default: derived from --repo-path)."
+HELP_GRAPH_REPO_PATH = (
+    "Repository root the project name derives from and source is read from."
+)
+HELP_GRAPH_DEPTH = "How many hops to follow (1 to 5)."
+HELP_GRAPH_THROUGH_REEXPORTS = (
+    "Also list the modules that reach it through a re-export (a package "
+    "__init__.py, a Rust pub use, an index.ts barrel), each row with the "
+    "`via` import statements it came through."
+)
+CMD_CHECK = (
+    "Report the structural delta of the working tree against a git ref: "
+    "dangling callers and importers, arity findings, new duplicates, new "
+    "import cycles, tests reaching the edited symbols."
+)
+EXAMPLES_CHECK = (
+    "Examples:\n  cgr check --base HEAD\n  cgr check --base origin/main --fail-on-found"
+    "\n  cgr check --base origin/main --isolated --fail-on-found"
+)
+HELP_CHECK_BASE = (
+    "Git ref the graph was indexed at; files differing from it are re-ingested."
+)
+HELP_CHECK_FAIL_ON_FOUND = (
+    "Exit with status 1 when the delta reports dangling callers, dangling "
+    "importers, calls with too many arguments, too few for a required "
+    "parameter or a keyword the callee does not accept, new duplicates or new "
+    "import cycles. A possibly_missing site is reported but does not fail the "
+    "check."
+)
+HELP_CHECK_ISOLATED = (
+    "Measure the edit, then put the graph and the hash cache back so the "
+    "same edit can be checked again. The graph does change while the check "
+    "runs; if the restore fails, the project stays marked incomplete until a "
+    "full update."
+)
+CMD_RENAME = (
+    "Rename a definition everywhere the graph references it (definition, call "
+    "and reference sites, imports, overrides, __all__); refuses on guessed sites, "
+    "on occurrences the graph has no site for, and on a graph a stopped sync "
+    "left partial."
+)
+EXAMPLES_RENAME = (
+    "Examples:\n  cgr rename myproj.pkg.util.helper assist --dry-run\n"
+    "  cgr rename myproj.pkg.Store.get fetch --allow-heuristic"
+)
+HELP_RENAME_QN = "Qualified name of the definition to rename."
+HELP_RENAME_NEW_NAME = "The new identifier."
+HELP_RENAME_ALLOW_HEURISTIC = (
+    "Rewrite through heuristic, overload and trace-only sites, and through "
+    "occurrences of the old name the graph has no site for, as well."
+)
+HELP_RENAME_DRY_RUN = "Print the plan and diff without writing anything."
+CMD_CHANGE_SIGNATURE = (
+    "Change a Python or JavaScript definition's parameter list and rewrite "
+    "every call site "
+    "the graph knows; sites the mapping cannot complete are listed, not touched; "
+    "refuses on a graph a stopped sync left partial."
+)
+EXAMPLES_CHANGE_SIGNATURE = (
+    "Examples:\n"
+    "  cgr change-signature myproj.pkg.util.helper a 'n: int' b --map n==1 --dry-run\n"
+    "  cgr change-signature myproj.pkg.util.helper b a\n"
+    "  cgr change-signature myproj.pkg.util.helper 'times: int' 'text: str' "
+    "--map times=0 --map text=1"
+)
+HELP_CHANGE_SIGNATURE_QN = "Qualified name of the function or method to change."
+HELP_CHANGE_SIGNATURE_PARAMS = (
+    "The new parameters in order: NAME, 'NAME: TYPE', 'NAME = DEFAULT' or "
+    "'NAME: TYPE = DEFAULT'; a bare old name carries it over unchanged."
+)
+HELP_CHANGE_SIGNATURE_MAP = (
+    "NEW=SOURCE, repeatable: SOURCE is an old parameter name, its 0-based "
+    "index, or =LITERAL to pass that text at every site (so NEW==1 inserts 1)."
+)
+HELP_CHANGE_SIGNATURE_ALLOW_HEURISTIC = (
+    "Rewrite sites the graph resolved heuristically, by overload fan-out or by "
+    "a trace as well, instead of listing them as unmapped."
+)
+HELP_CHANGE_SIGNATURE_DRY_RUN = "Print the plan and diff without writing anything."
+CMD_MOVE = (
+    "Move a module-level definition to another module: importers rewritten, "
+    "needed imports carried, refused when it would create an import cycle."
+)
+EXAMPLES_MOVE = (
+    "Examples:\n  cgr move myproj.pkg.util.helper pkg.core --dry-run\n"
+    "  cgr move myproj.pkg.util.helper pkg/core.py --keep-alias"
+)
+HELP_MOVE_QN = "Qualified name of the module-level definition to move."
+HELP_MOVE_DRY_RUN = (
+    "Print the plan (files, importers, copied imports) without writing anything."
+)
+HELP_MOVE_TARGET = "Destination module: dotted name (pkg.core) or repo-relative path."
+HELP_MOVE_KEEP_ALIAS = (
+    "Leave a re-export at the old location so the old import path still works."
+)
+CMD_CONTEXT = (
+    "Print a graph-ranked context slice for a symbol, location or task within "
+    "a token budget: source, caller lines, callee signatures, types, tests, docs."
+)
+EXAMPLES_CONTEXT = (
+    "Examples:\n  cgr context myproj.pkg.util.helper\n"
+    "  cgr context pkg/util.py:12 --budget 2000"
+)
+HELP_CONTEXT_TARGET = "Qualified name, bare name, path:line, or a free-text task."
+HELP_CONTEXT_BUDGET = "Token budget for the slice."
+CMD_PORT = "Judge a port between languages: pair the functions of two implementations and compare their calls and arity, as JSON, no LLM."
+CMD_PORT_GROUP = CMD_PORT
+CMD_PORT_CHECK = (
+    "Pair the functions and methods under OLD_SCOPE with those under "
+    "NEW_SCOPE (paths relative to the repository root) and judge each pair "
+    "MATCH, DIFFERS or UNKNOWN on the first-party calls it makes and its "
+    "positional arity; unpaired and ambiguous definitions are listed."
+)
+EPILOG_PORT = "Run 'cgr help port COMMAND' for command-specific help."
+# `\b` opens a paragraph click prints as written instead of rewrapping it,
+# which keeps one example per line.
+EPILOG_PORT_CHECK = (
+    "\b\nExamples:\n  cgr port check src/legacy src/rewrite\n"
+    "  cgr port check codebase_rag/embedded_graph rust/cgr_graph_rs/src "
+    "--fail-on-found\n"
+    "  cgr port check py rs --pair py.lexer._lex=rs.lexer.tokenize\n\n"
+    "Exit status: 0 with the JSON report; 1 with --fail-on-found when a pair "
+    "DIFFERS; 2 when the scopes overlap or a --pair is malformed or repeated; "
+    "3 when a project is not indexed; 4 when a scope holds no function or "
+    "method, or a --pair names none or several."
+)
+HELP_PORT_NEW_PROJECT = (
+    "Project holding NEW_SCOPE, when the new implementation was indexed as a "
+    "project of its own (default: the project of OLD_SCOPE)."
+)
+HELP_PORT_PAIR = (
+    "Pair two definitions explicitly, OLD=NEW, each a qualified name or a "
+    "dotted suffix naming exactly one definition of its side. Repeatable."
+)
+HELP_PORT_INCLUDE_TESTS = (
+    "Pair test functions too; by default they are left out, classified as "
+    "tests-reaching classifies them."
+)
+HELP_PORT_FAIL_ON_FOUND = (
+    "Exit with status 1 when any pair DIFFERS. UNKNOWN pairs and unpaired "
+    "definitions do not fail the check."
+)
+CMD_TRACE_INGEST = "Resolve a trace file against a project and write dynamic edges"
+CMD_TRACE_CONVERT = "Convert a V8 .cpuprofile (node --cpu-prof) to a trace file"
+
+CMD_STOP = "Stop the shared stack (alias for cgr daemon down)"
+CMD_STATUS = "Show stack state and the last sync time for each project"
+
+EXAMPLES_START = (
+    "EXAMPLES\n\n"
+    "  cgr start --repo-path ./my-repo\n\n"
+    "  cgr start --workspace backend\n\n"
+    '  cgr start --ask-agent "Where is authentication handled?"'
+)
+EXAMPLES_INDEX = "EXAMPLE\n\n  cgr index --repo-path ./my-repo -o ./index-out"
+EXAMPLES_WATCH = (
+    "EXAMPLES\n\n"
+    "  cgr watch --repo-path ./my-repo\n\n"
+    "  cgr watch --repo-path ./my-repo --debounce 2 --max-wait 10\n\n"
+    "  MEMGRAPH_PORT=7688 cgr watch --project-name my-project"
+)
+EXAMPLES_EXPORT = (
+    "EXAMPLES\n\n"
+    "  cgr export -o graph.json\n\n"
+    "  cgr export -o my-project.json --project my-project\n\n"
+    "  cgr export -o this-repo.json --repo-path .\n\n"
+    "  cgr export -o shop.json --workspace shop"
+)
+EXAMPLES_OPTIMIZE = "EXAMPLE\n\n  cgr optimize python --repo-path ./my-repo"
+EXAMPLES_MCP_SERVER = (
+    "EXAMPLES\n\n  cgr mcp-server\n\n  cgr mcp-server --transport http --port 8080"
+)
+EXAMPLES_GRAPH_LOADER = "EXAMPLE\n\n  cgr graph-loader graph.json"
+EXAMPLES_LANGUAGE_ADD = "EXAMPLE\n\n  cgr language add-grammar ruby"
+EXAMPLES_LANGUAGE_REMOVE = "EXAMPLE\n\n  cgr language remove-language ruby"
+EXAMPLES_STATS = (
+    "EXAMPLES\n\n"
+    "  cgr stats\n\n"
+    "  cgr stats --project my-project\n\n"
+    "  cgr stats --repo-path .\n\n"
+    "  cgr stats --workspace my-workspace"
+)
+EXAMPLES_DEAD_CODE = (
+    "EXAMPLES\n\n  cgr dead-code\n\n  cgr dead-code --project my-project --format json"
+)
+# `cgr dead-code --help` states which symbols are roots: with public symbols
+# among them, a clean report on an application can just mean every function
+# is public (issue #2527). The commands table keeps the one-line CMD_DEAD_CODE.
+DESC_DEAD_CODE = (
+    f"{CMD_DEAD_CODE}.\n\n"
+    "Roots are program entry points (main, Main), module-level code such as an "
+    'if __name__ == "__main__" block, tests (unless --no-include-tests), '
+    "decorated handlers (routes, tasks, CLI commands), runtime hooks such as "
+    "dunder and lifecycle methods, type-checker declarations (typing.Protocol "
+    "classes and classes under if TYPE_CHECKING:, with their members), and "
+    "every --entry-point and --decorator-root.\n\n"
+    "By default every public or exported symbol is a root as well, which "
+    "suits a library whose API is called from outside the repository. In an "
+    "application or service that rule hides unused public code; pass "
+    "--no-public-roots to report it."
+)
+EXAMPLES_DUPLICATES = (
+    "EXAMPLES\n\n"
+    "  cgr duplicates\n\n"
+    "  cgr duplicates --project my-project\n\n"
+    "  cgr duplicates --threshold 0.9 --format json --fail-on-found"
+)
+# `cgr duplicates --help` spells out what a group is: its count drives
+# --fail-on-found and trend tracking, so overlap must not be guessed at
+# (issue #2473). The commands table keeps the one-line CMD_DUPLICATES.
+DESC_DUPLICATES = (
+    f"{CMD_DUPLICATES}.\n\n"
+    "Groups are disjoint: each function is reported in at most one group. "
+    "An 'exact' group holds functions with the same structure, renamed copies "
+    "included. A 'similar' group holds near-copies, each linked to another "
+    "member by a pair whose branch overlap reaches --threshold, so two "
+    "members may be linked only through a third.\n\n"
+    "Similarity is a similar group's weakest to strongest link. 100% there "
+    "means every statement shape is shared but the bodies still differ. "
+    "Members of a similar group that are exact copies of each other share a "
+    "number in the Exact column (exact_subgroups in JSON)."
+)
+EXAMPLES_DELETE_PROJECT = (
+    "EXAMPLES\n\n"
+    "  cgr delete-project --project my-project\n\n"
+    "  cgr delete-project --repo-path ."
+)
+EXAMPLES_HELP = "EXAMPLES\n\n  cgr help start\n\n  cgr help daemon logs"
+
+EPILOG_LANGUAGE = "Run 'cgr help language COMMAND' for command-specific help."
+EPILOG_DAEMON = "Run 'cgr help daemon COMMAND' for command-specific help."
+EPILOG_WORKSPACE = "Run 'cgr help workspace COMMAND' for command-specific help."
+EPILOG_TRACE = "Run 'cgr help trace COMMAND' for command-specific help."
+
+HELP_TRACE_REPO_PATH = (
+    "Repository the trace was recorded against. Used to derive the project "
+    "name and re-anchor traced file paths, including paths recorded under the "
+    "checkout root the trace header names (a CI runner's or container's)."
+)
+HELP_TRACE_PROJECT_NAME = (
+    "Project name to ingest into. Defaults to the name derived from --repo-path."
+)
+EXAMPLES_TRACE_INGEST = (
+    "EXAMPLE\n\n  pytest --cgr-trace\n\n"
+    "  cgr trace ingest cgr-trace.jsonl --repo-path ./my-repo"
+)
+HELP_TRACE_OUTPUT = "Where to write the converted trace file."
+HELP_TRACE_WORKLOAD = "Workload label to attach to every converted record."
+HELP_TRACE_INCLUDE = (
+    "Comma-separated namespace prefixes to keep (dotnet-trace speedscope "
+    "profiles carry no file paths, so scoping is by name)."
+)
+HELP_TRACE_LANGUAGE = (
+    "Override the auto-detected source language. Rust pprof profiles share Go's "
+    "gzipped-protobuf format, so pass 'rust' to demangle them as Rust. For an "
+    "eBPF profile of a managed runtime, pass '--format ebpf --language python' "
+    "(or '--language jvm') together to resolve the in-kernel-unwound source "
+    "frames against that language's graph ('python' and 'jvm' are eBPF-only "
+    "overrides)."
+)
+HELP_TRACE_FORMAT = (
+    "Force a profile format instead of auto-detecting it. Use 'ebpf' for pprof "
+    "profiles from an eBPF continuous profiler (Parca, Pyroscope, OTel, perf)."
+)
+HELP_TRACE_PATH_MAP = (
+    "Re-anchor a production build path to the repo, as BUILD_PREFIX=REPO_PREFIX. "
+    "Repeatable; applied before the in-repo check (ebpf format)."
+)
+HELP_TRACE_BUILD_ID = (
+    "Keep only frames from the mapping with this build id or binary filename "
+    "(ebpf format); other binaries are seen through."
+)
+HELP_TRACE_SERVICE = (
+    "Keep only samples whose label matches, as KEY=VALUE (ebpf format)."
+)
+HELP_TRACE_LABEL = (
+    "Sample label whose value becomes each edge's workload (ebpf format)."
+)
+HELP_TRACE_COMMIT = (
+    "The commit the profiled binary was built from; warns if it differs from "
+    "the repository HEAD at convert time (ebpf format)."
+)
+CMD_TRACE_PULL = (
+    "Download a pprof profile from an eBPF continuous profiler over HTTP and "
+    "convert it (Parca download, Pyroscope render?format=pprof, or any URL)."
+)
+HELP_TRACE_PULL_SAVE = (
+    "Keep the downloaded pprof at this path; by default it is removed after conversion."
+)
+HELP_TRACE_PULL_HEADER = (
+    "Extra HTTP request header as NAME=VALUE (e.g. Authorization=Bearer TOKEN); "
+    "repeatable."
+)
+HELP_TRACE_PULL_TIMEOUT = (
+    "Seconds the whole download may take, headers and body (default 60)."
+)
+ERR_TRACE_PULL_BAD_URL = "Unsupported URL {url}; expected an http:// or https:// URL."
+# The header value can be a bearer token, so it is never echoed back.
+ERR_TRACE_PULL_BAD_HEADER = (
+    "Invalid --header; expected NAME=VALUE (for example Authorization=Bearer TOKEN)."
+)
+ERR_TRACE_PULL_FAILED = "Could not download {url}: {error}."
+ERR_TRACE_PULL_TIMED_OUT = "Downloading {url} did not finish within {timeout:g}s."
+ERR_TRACE_PULL_TOO_LARGE = (
+    "Profile at {url} exceeds the maximum download size (256 MB)."
+)
+ERR_TRACE_PULL_SAVE_EQUALS_OUTPUT = (
+    "--save and --output must be different paths (--output holds the converted "
+    "trace, --save the downloaded profile)."
+)
+EXAMPLES_TRACE_PULL = (
+    "EXAMPLE\n\n"
+    "  cgr trace pull https://parca.example/api/... \\\n"
+    "      --repo-path ./my-repo --build-id 8f3a \\\n"
+    "      --path-map /build/src/=./my-repo/src/ \\\n"
+    "      --header Authorization=Bearer $TOKEN\n\n"
+    "  cgr trace ingest cgr-trace.jsonl --repo-path ./my-repo"
+)
+ERR_TRACE_CONVERT_BAD_FORMAT = "Unknown --format '{format}'; supported: ebpf."
+ERR_TRACE_CONVERT_BAD_PATH_MAP = (
+    "Invalid --path-map '{value}'; expected BUILD_PREFIX=REPO_PREFIX."
+)
+ERR_TRACE_CONVERT_BAD_SERVICE = "Invalid --service '{value}'; expected KEY=VALUE."
+MSG_TRACE_COMMIT_MISMATCH = (
+    "Profiled commit {profiled} differs from repository HEAD {head}; edges may "
+    "resolve against moved or renamed code."
+)
+ERR_TRACE_CONVERT_BAD_LANGUAGE = (
+    "Unknown --language '{language}'; supported override values: {supported}."
+)
+ERR_TRACE_CONVERT_NEEDS_REPO = "V8 cpuprofiles need --repo-path to scope frames."
+ERR_TRACE_CONVERT_NEEDS_INCLUDE = (
+    "speedscope profiles need --include namespace prefixes to scope frames."
+)
+EXAMPLES_TRACE_CONVERT = (
+    "EXAMPLE\n\n  node --cpu-prof --cpu-prof-name=run.cpuprofile app.js\n\n"
+    "  cgr trace convert run.cpuprofile --repo-path ./my-repo\n\n"
+    "  cgr trace ingest cgr-trace.jsonl --repo-path ./my-repo"
+)
+
+HELP_WORKSPACE_DESCRIPTION = "Optional short description for the workspace."
+HELP_WORKSPACE_FORCE = "Overwrite an existing workspace with the same name."
+HELP_WORKSPACE_REPO_PROJECT_NAME = (
+    "Project name to use for this repo. Defaults to the derived repo name."
+)
+
+MSG_NO_WORKSPACES = "(no workspaces; create one with 'cgr workspace create <name>')"
+
+HELP_DAEMON_LOGS_FOLLOW = "Continue printing new log entries until interrupted."
+HELP_DAEMON_LOGS_SERVICE = (
+    "Show only SERVICE logs (memgraph, qdrant, or lab). By default, show all services."
+)
+HELP_NO_START_STACK = "Do not start the shared stack automatically."
+HELP_NO_SYNC = "Do not synchronise the graph before starting the assistant."
+HELP_NO_EMBEDDINGS = (
+    "Do not generate semantic embeddings during sync. Graph nodes and relationships "
+    "are still updated. Equivalent env: CGR_SKIP_EMBEDDINGS=1."
+)
+HELP_PROJECTS = (
+    "Limit queries to comma-separated project names. Overrides --project-name; "
+    "defaults to the selected repository or workspace."
+)
+HELP_WORKSPACE = "Query every project defined in workspace NAME."
+
+HELP_BATCH_SIZE = "Flush to Memgraph after this many buffered nodes or relationships."
+HELP_MEMGRAPH_HOST = "Memgraph host."
+HELP_MEMGRAPH_PORT = "Memgraph port."
+HELP_ORCHESTRATOR = (
+    "Model for the planning assistant, in provider:model form "
+    "(for example openai:gpt-5.6-terra or ollama:qwen2.5-coder)."
+)
+HELP_CYPHER_MODEL = "Model used to generate Cypher, in provider:model form."
+HELP_NO_CONFIRM = "Skip edit confirmation prompts."
+HELP_NO_INSTRUCTIONS = (
+    "Do not load ~/.cgr.md or <repo>/.cgr.md into the session prompt."
+)
+
+HELP_REPO_PATH_RETRIEVAL = "Repository to open. Defaults to the current directory."
+HELP_REPO_PATH_INDEX = "Repository to index. Defaults to the current directory."
+HELP_REPO_PATH_OPTIMIZE = "Repository to optimise. Defaults to the current directory."
+HELP_REPO_PATH_WATCH = "Repository to watch. Defaults to the current directory."
+HELP_PROJECT_NAME_WATCH = (
+    "Project name to store in the graph. Defaults to the name "
+    "`cgr start --repo-path` gives the same repository, so both update one "
+    "project; if you passed `cgr start --project-name`, pass the same name here."
+)
+HELP_VERSION = "Show the version and exit."
+HELP_QUIET = "Suppress progress, banners, and informational logs."
+
+HELP_DEBOUNCE = (
+    "Seconds to wait after a file's last change before updating the graph, so "
+    "a burst of saves becomes one update. 0 applies every change at once."
+)
+HELP_MAX_WAIT = (
+    "Longest a file that keeps changing waits before the graph is updated "
+    "anyway. Raised to --debounce when lower."
+)
+
+HELP_UPDATE_GRAPH = (
+    "Parse the repository, sync its graph, then exit without starting the "
+    "assistant (cgr start already syncs before it starts), so it cannot be "
+    "combined with --ask-agent, --output-format json or --projects. With "
+    "--workspace, sync each of the workspace's repositories instead, then "
+    "start the assistant scoped to the workspace, which takes --ask-agent, "
+    "--output-format and --projects as usual. Cannot be combined with "
+    "--no-sync in either case."
+)
+HELP_CLEAN_DB = (
+    "DESTRUCTIVE: Delete every project from the shared graph and clear the selected "
+    "repository's sync cache. With --update-graph, rebuild after deletion. Asks for "
+    "confirmation when other projects would be destroyed; use --yes to skip the prompt."
+)
+HELP_ASSUME_YES = (
+    "Answer yes to destructive confirmations, such as the one --clean asks before "
+    "deleting other projects from the shared graph."
+)
+HELP_ASSUME_YES_WATCH = (
+    "Watch even a home directory or the filesystem root, and take over a "
+    "--project-name another repository already indexes, as cgr start --yes does."
+)
+HELP_OUTPUT_GRAPH = (
+    "Write this repository's project graph to PATH as JSON. Requires "
+    "--update-graph. Use cgr export for the whole shared graph."
+)
+HELP_OUTPUT_PATH = "Write the exported graph to PATH."
+HELP_EXPORT_PROJECT = (
+    "Export only this project: what it owns, the relationships that start "
+    "there, the nodes they reach, and the links between the resources it "
+    "holds (RESOLVES_TO, FLOWS_TO). Repeatable; without it the whole shared "
+    "graph is exported."
+)
+HELP_EXPORT_WORKSPACE = "Export only the projects defined in workspace NAME."
+HELP_EXPORT_REPO_PATH = (
+    "Export the project this repository was indexed as, alongside any --project."
+)
+HELP_OUTPUT_PROTO_DIR = "Write protobuf index files under DIRECTORY."
+HELP_SPLIT_INDEX = "Write separate nodes.bin and relationships.bin files."
+HELP_LANGUAGE_ARG = "Language to optimise, such as python, java, javascript, or cpp."
+HELP_REFERENCE_DOC = "Reference document to use during optimisation."
+HELP_GRAPH_FILE = "Exported graph JSON file to load."
+HELP_EXPORTED_GRAPH_FILE = "Path to the exported_graph.json file."
+
+HELP_GRAMMAR_URL = (
+    "Tree-sitter grammar repository URL. Defaults to "
+    "https://github.com/tree-sitter/tree-sitter-<language_name>."
+)
+HELP_KEEP_SUBMODULE = (
+    "Keep the grammar git submodule when removing the language. By default, remove it."
+)
+HELP_LANGUAGE_LIST_VERBOSE = (
+    "Also list the tree-sitter node types each language maps to functions, "
+    "classes, modules and calls."
+)
+
+HELP_PROJECT_NAME = (
+    "Project name to store in the graph. Defaults to the directory name plus an "
+    "8-hex hash of its absolute path (e.g. myrepo__1a2b3c4d), so two checkouts on "
+    "one machine get different names barring a rare hash collision; machines that "
+    "sync into one graph should each pass their own name, since the same path "
+    "hashes alike on every machine. cgr status lists the names already stored. A "
+    "chosen name has no "
+    "hash: syncing a repository under a name another repository already indexes "
+    "needs --yes and replaces that project."
+)
+HELP_EXCLUDE_PATTERNS = (
+    "Exclude paths matching PATTERN from indexing. Repeat the option to add patterns."
+)
+HELP_INTERACTIVE_SETUP = "Choose which detected directories remain included."
+# Filled in by `capture.capture_help` from the capture model, so the groups
+# the help names cannot drift from the ones the resolver accepts (#2584).
+HELP_CAPTURE = (
+    "Capture GROUP on top of the defaults ({default_groups}). Opt-in groups: "
+    "{opt_in_groups}. {add}NAME adds and {drop}NAME drops a GROUP or a "
+    "relationship type such as {example_type}; {all} or {none} replaces the "
+    "selection, so {none} first captures only what follows ({none},{example_group}). "
+    "Repeatable or comma-separated; later values override CGR_CAPTURE. An "
+    "unknown group or type is an error."
+)
+
+HELP_ASK_AGENT = "Ask one question, write the answer to stdout, and exit."
+
+HELP_QUERY_OUTPUT_FORMAT = "Format --ask-agent output as table or json."
+
+HELP_MCP_TRANSPORT = "Transport to serve: stdio or http."
+HELP_MCP_HTTP_HOST = "HTTP bind host. Used only with --transport http."
+HELP_MCP_HTTP_PORT = "HTTP bind port. Used only with --transport http."
+HELP_MCP_READ_ONLY = (
+    "Serve only the tools that read (graph queries, file reads, ask_agent); "
+    "write_file, the edit tools, indexing, annotate and the delete tools are "
+    "neither listed nor run. Also set by MCP_READ_ONLY=true."
+)
+HELP_MCP_WORKSPACE = (
+    "Serve the projects of workspace NAME: `list_projects` shows them, a "
+    "`project` argument, when given, must name one (omitted, the server "
+    "takes the project rooted at its directory, or the workspace's only "
+    "one), and source is read from each repo's own root. Also read from the "
+    "MCP_WORKSPACE environment variable."
+)
+
+HELP_STATS_PROJECT = (
+    "Count only this project's nodes and relationships. Repeatable; without it "
+    "the totals cover every project in the shared graph."
+)
+HELP_STATS_WORKSPACE = "Count only the projects defined in workspace NAME."
+HELP_STATS_REPO_PATH = (
+    "Count the project this repository was indexed as, alongside any --project."
+)
+# `dead-code` and `duplicates` choose their project as `cgr graph` does
+# (issue #2415).
+HELP_SCAN_PROJECT = (
+    "Project to scan (default: the one --repo-path was indexed as; outside "
+    "any indexed checkout, the only indexed project)."
+)
+HELP_SCAN_REPO_PATH = (
+    "Repository whose project to scan when --project is not given "
+    "(default: the current directory)."
+)
+HELP_DEADCODE_ENTRY_POINT = (
+    "Mark symbols ending with this qualified-name suffix as entry points. Repeatable."
+)
+HELP_DEADCODE_DECORATOR_ROOT = (
+    "Mark symbols with this decorator as entry points. Extends the built-in set."
+)
+HELP_DEADCODE_EXCLUDE = (
+    "Exclude symbols whose file path matches GLOB. The glob must cover the "
+    "whole repo-relative path ('*' spans directories) and be quoted "
+    "('tests/*' for a root-level tests directory, '*/tests/*' for nested "
+    "ones) so the shell cannot expand it first. Repeatable."
+)
+HELP_DEADCODE_INCLUDE_TESTS = (
+    "Treat test code as reachable so exercised production code is not reported."
+)
+HELP_DEADCODE_CLASSES = (
+    "Also report unreachable classes. This can include false positives for "
+    "types used only by annotations or dynamic lookups."
+)
+HELP_DEADCODE_FORMAT = "Report format: table or json."
+HELP_DEADCODE_OUTPUT = "Write the report to this file instead of stdout."
+HELP_DEADCODE_ENDPOINT_ROOTS = (
+    "Treat a decorator-routed handler (FastAPI, Flask) as reachable by its "
+    "route decorator alone (default). With --no-endpoint-roots, such a "
+    "handler is live only if some indexed call site resolves to its endpoint "
+    "(RESOLVES_TO into it, or a direct READS_FROM/WRITES_TO for RPC and "
+    "dispatch resources), so an endpoint nobody calls is reported. A handler "
+    "registered by a call (Go HandleFunc, Express app.get) stays live "
+    "through that call. Endpoints are recorded only by the io capture group: "
+    "index the project with --capture io first, or the command refuses."
+)
+HELP_DEADCODE_MIN_RESOLUTION = (
+    "Ignore call edges below this confidence when deciding liveness: "
+    "heuristic < overload < exact < trace_confirmed (dynamic counts as confirmed)."
+)
+HELP_DEADCODE_FAIL_ON_FOUND = (
+    "Exit with status 1 when any candidate is found. Useful in CI."
+)
+HELP_DEADCODE_PUBLIC_ROOTS = (
+    "Treat every public or exported symbol as a root (default), as suits a "
+    "library whose API is called from outside the repository. With "
+    "--no-public-roots, for an application or service, a symbol is a root "
+    "only as an entry point, test, decorated handler or runtime hook, so "
+    "unused public code is reported. Symbols in structural-tier languages "
+    "stay roots, having no call graph."
+)
+
+HELP_DUPLICATES_THRESHOLD = (
+    "Minimum branch-overlap similarity for a near-duplicate pair, 0-1."
+)
+HELP_DUPLICATES_MIN_SIZE = (
+    "Minimum skeleton size (tree nodes) for a function to be considered. "
+    "Filters trivial getters and one-liners."
+)
+HELP_DUPLICATES_EXACT_ONLY = (
+    "Report only identical-fingerprint clone groups; skip similarity scoring."
+)
+HELP_DUPLICATES_EXCLUDE = (
+    "Exclude symbols whose file path matches GLOB. The glob must cover the "
+    "whole repo-relative path ('*' spans directories) and be quoted "
+    "('tests/*' for a root-level tests directory, '*/tests/*' for nested "
+    "ones) so the shell cannot expand it first. Repeatable."
+)
+HELP_DUPLICATES_FORMAT = "Report format: table or json."
+HELP_DUPLICATES_OUTPUT = "Write the report to this file instead of stdout."
+HELP_DUPLICATES_FAIL_ON_FOUND = (
+    "Exit with status 1 when any duplicate is found. Useful in CI."
+)
+HELP_DUPLICATES_OPEN = (
+    "Open group N's first two members side by side in your editor "
+    "(CGR_EDITOR picks the editor; CGR_DIFF_COMMAND overrides the command)."
+)
+
+HELP_DELETE_PROJECT = "Project to delete from the graph."
+HELP_DELETE_PROJECT_REPO_PATH = (
+    "Repository whose project to delete when --project is not given. Its "
+    "local hash cache is removed too."
+)
+HELP_PRUNE_DRY_RUN = "List the projects that would be pruned without deleting anything."
+HELP_PRUNE_YES = "Prune without asking for confirmation."
+CMD_PRUNE = "Prune projects whose repository root no longer exists"
+EXAMPLES_PRUNE = "EXAMPLE\n\n  cgr prune --dry-run\n\n  cgr prune --yes"
+HELP_COMMAND = "Command path to document, such as 'start' or 'daemon logs'."
+
+CMD_VERIFY_INDEX = "Verify a protobuf index against its provenance manifest"
+CMD_DIFF_INDEX = "Structural diff between two protobuf index snapshots"
+
+CLI_COMMANDS: dict[CLICommandName, str] = {
+    CLICommandName.START: CMD_START,
+    CLICommandName.OPTIMIZE: CMD_OPTIMIZE,
+    CLICommandName.MCP_SERVER: CMD_MCP_SERVER,
+    CLICommandName.INDEX: CMD_INDEX,
+    CLICommandName.WATCH: CMD_WATCH,
+    CLICommandName.EXPORT: CMD_EXPORT,
+    CLICommandName.GRAPH_LOADER: CMD_GRAPH_LOADER,
+    CLICommandName.STATS: CMD_STATS,
+    CLICommandName.DEAD_CODE: CMD_DEAD_CODE,
+    CLICommandName.DUPLICATES: CMD_DUPLICATES,
+    CLICommandName.DELETE_PROJECT: CMD_DELETE_PROJECT,
+    CLICommandName.PRUNE: CMD_PRUNE,
+    CLICommandName.LANGUAGE: CMD_LANGUAGE,
+    CLICommandName.DAEMON: CMD_DAEMON,
+    CLICommandName.TRACE: CMD_TRACE,
+    CLICommandName.EDITS: CMD_EDITS,
+    CLICommandName.GRAPH: CMD_GRAPH,
+    CLICommandName.CHECK: CMD_CHECK,
+    CLICommandName.RENAME: CMD_RENAME,
+    CLICommandName.CHANGE_SIGNATURE: CMD_CHANGE_SIGNATURE,
+    CLICommandName.MOVE: CMD_MOVE,
+    CLICommandName.CONTEXT: CMD_CONTEXT,
+    CLICommandName.PORT: CMD_PORT,
+    CLICommandName.WORKSPACE: CMD_WORKSPACE,
+    CLICommandName.STOP: CMD_STOP,
+    CLICommandName.STATUS: CMD_STATUS,
+    CLICommandName.DOCTOR: CMD_DOCTOR,
+    CLICommandName.HELP: CMD_HELP,
+    CLICommandName.VERIFY_INDEX: CMD_VERIFY_INDEX,
+    CLICommandName.DIFF_INDEX: CMD_DIFF_INDEX,
+}
+HELP_VERIFY_INDEX_DIR = "Directory holding the index artifacts and manifest.json."
+HELP_TRUSTED_MANIFEST_SHA = (
+    "Externally trusted sha256 of manifest.json (e.g. from an attestation); "
+    "anchors verification beyond local self-consistency."
+)
+HELP_DIFF_OLD = "Directory holding the OLD snapshot artifacts."
+HELP_DIFF_NEW = "Directory holding the NEW snapshot artifacts."
+HELP_DIFF_JSON_OUT = "Write the JSON delta to FILE instead of stdout."

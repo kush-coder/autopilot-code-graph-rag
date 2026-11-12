@@ -1,0 +1,8110 @@
+from __future__ import annotations
+
+import re
+from collections import defaultdict, deque
+from collections.abc import Collection, Iterable, Iterator, Mapping
+from pathlib import Path, PurePath
+from typing import NamedTuple
+
+from loguru import logger
+from tree_sitter import Node
+
+from .. import constants as cs
+from .. import logs as ls
+from ..language_spec import get_language_for_extension
+from ..types_defs import CppOperatorSignature, FunctionRegistryTrieProtocol, NodeType
+from ..utils import qn_markers
+from .cpp import utils as cpp_utils
+from .go import interfaces as go_ifaces
+from .go import utils as go_utils
+from .go.builds import ALWAYS, Expr, all_of, holds_wherever, possible
+from .go.interfaces import GoMethodSpec
+from .go.link_state import GoLinkState
+from .import_processor import ImportProcessor
+from .js_ts import utils as js_ts_utils
+from .js_ts.reexports import js_ts_module_qn
+from .lua import utils as lua_utils
+from .parameter_nodes import c_family_parameter_list
+from .php import class_names as php_class_names
+from .php.class_names import ClassPath as PhpClassPath
+from .php.class_names import ascii_fold as _php_fold
+from .py import resolve_class_name
+from .rs import utils as rs_utils
+from .semantic_call_join import call_site_key, declared_location
+from .type_inference import TypeInferenceEngine
+from .utils import module_qn_for_entity, safe_decode_text
+
+_SEPARATOR_PATTERN = re.compile(r"[.:]|::")
+# One initializer block's scope record, as held per module by
+# `ImportProcessor.rust_block_scope_imports`: (start, end, imports,
+# mod_holes, fn_holes, item_scopes).
+_RustBlockScope = tuple[
+    int,
+    int,
+    dict[str, str],
+    list[tuple[int, int]],
+    list[tuple[int, int]],
+    list[tuple[int, int, dict[str, tuple[int, int]]]],
+]
+_SEARCH_NAME_CACHE: dict[str, str] = {}
+_CHAINED_METHOD_PATTERN = re.compile(r"\.([^.()]+)$")
+# Chain bases whose value depends on the member they are written in.
+_JS_THIS_RECEIVERS = frozenset({cs.TS_THIS, cs.KEYWORD_SUPER})
+_JS_RECEIVER_MARKERS = frozenset({cs.JS_RECEIVER_INSTANCE, cs.JS_RECEIVER_CLASS})
+
+
+def _class_value_of(type_name: str) -> str | None:
+    # The class qn a hop's value is the class itself of (`typeof C`), else
+    # None for an instance type.
+    if type_name.startswith(cs.JS_CLASS_VALUE_PREFIX):
+        return type_name[len(cs.JS_CLASS_VALUE_PREFIX) :]
+    return None
+
+
+def _bind_receiver(returned: str | None, receiver: str | None) -> str | None:
+    # A `this` return is the class the call went through: an instance of
+    # it, or the class itself. With no such class there is nothing to name.
+    if returned == cs.JS_RECEIVER_INSTANCE:
+        return receiver
+    if returned == cs.JS_RECEIVER_CLASS:
+        return f"{cs.JS_CLASS_VALUE_PREFIX}{receiver}" if receiver else None
+    return returned
+
+
+_QN_SPLIT_CACHE: dict[str, tuple[list[str], int]] = {}
+_CHAIN_OPEN_BRACKETS = "([{"
+_CHAIN_CLOSE_BRACKETS = ")]}"
+# Node labels a Rust receiver type name may resolve to: a struct (Class), an
+# enum, a type alias, or a trait (Interface, when the receiver is typed to a
+# `dyn`/`impl` trait or a trait-returning factory); all can carry methods.
+_RS_TYPE_NODE_TYPES = frozenset(
+    {NodeType.CLASS, NodeType.ENUM, NodeType.TYPE, NodeType.INTERFACE}
+)
+# Registry kinds a CONSTRUCTION hop may name. Same members as the Rust set
+# above, kept separate because that one is about Rust receiver types while
+# this gates the import-prefix fold for every language (issue #2033).
+_CONSTRUCTIBLE_NODE_TYPES = frozenset(
+    {NodeType.CLASS, NodeType.ENUM, NodeType.TYPE, NodeType.INTERFACE}
+)
+# An unqualified Go call names a package-level function: a method needs its
+# receiver.
+_GO_PACKAGE_FUNCTION_TYPES = frozenset({NodeType.FUNCTION})
+# A definition nested inside one of these is scoped to that body, so the
+# simple-name fallback prefers candidates that are not (issue #945).
+_SCOPING_PARENT_TYPES = frozenset({NodeType.FUNCTION, NodeType.METHOD})
+# Registry kinds a Rust `Type::f()` qualifier may name and read methods off:
+# the type alias of the receiver set is missing because its target, which
+# owns the methods, is not recorded.
+_RS_OWNER_NODE_TYPES = frozenset(
+    {NodeType.CLASS, NodeType.ENUM, NodeType.UNION, NodeType.INTERFACE}
+)
+_PY_SELF_RECEIVERS = frozenset({cs.PY_KEYWORD_SELF, cs.PY_KEYWORD_CLS})
+
+
+class _PhpCasedIndex(NamedTuple):
+    """PHP definitions declared with capitals, by ASCII-folded name."""
+
+    # (owner qn, folded method name) -> method qn
+    methods: dict[tuple[str, str], str]
+    # folded class name -> class qns
+    classes: dict[str, list[str]]
+
+
+class _CallSite(NamedTuple):
+    """One `_resolve_function_call` request, handed whole to its phases."""
+
+    call_name: str
+    module_qn: str
+    local_var_types: dict[str, str] | None
+    class_context: str | None
+    caller_qn: str | None
+    language: cs.SupportedLanguage | None
+    call_point: int | None
+    constructing: bool
+
+
+def _rust_assoc_path(call: _CallSite) -> tuple[list[str], str] | None:
+    """A Rust `Type::f` call's object path and item, or None for any other shape.
+
+    Turbofish arguments (`Vec::<u8>::new`) drop out of the path. A dotted
+    receiver is a method call, and a `<T as Trait>::f` qualified path does
+    not name its owner in its first segment, so neither qualifies.
+    """
+    name = call.call_name
+    if (
+        call.language != cs.SupportedLanguage.RUST
+        or cs.SEPARATOR_DOUBLE_COLON not in name
+        or cs.SEPARATOR_DOT in name
+        or name.startswith(cs.CHAR_ANGLE_OPEN)
+    ):
+        return None
+    segments = [
+        segment
+        for segment in _drop_angle_groups(name).split(cs.SEPARATOR_DOUBLE_COLON)
+        if segment
+    ]
+    if len(segments) < 2:
+        return None
+    return segments[:-1], segments[-1]
+
+
+def _drop_angle_groups(text: str) -> str:
+    if cs.CHAR_ANGLE_OPEN not in text:
+        return text
+    kept: list[str] = []
+    depth = 0
+    for char in text:
+        if char == cs.CHAR_ANGLE_OPEN:
+            depth += 1
+        elif char == cs.CHAR_ANGLE_CLOSE:
+            depth = max(0, depth - 1)
+        elif depth == 0:
+            kept.append(char)
+    return "".join(kept)
+
+
+def _trie_search_name(call_name: str) -> str:
+    # The last name segment, the only part the simple-name fallback matches on.
+    search_name = _SEARCH_NAME_CACHE.get(call_name)
+    if search_name is None:
+        search_name = _SEPARATOR_PATTERN.split(call_name)[-1]
+        _SEARCH_NAME_CACHE[call_name] = search_name
+    return search_name
+
+
+def _split_receiver_chain(expr: str) -> list[str] | None:
+    # Split a receiver chain (`c.Find(1.5).Root`) on the `.` separators between
+    # hops only, never on a `.` inside call arguments, an index, or a generic
+    # (`1.5`, `x.y` args, `List<A.B>`), which a naive str.split would mangle.
+    # None for a chain of more than MAX_RECEIVER_CHAIN_HOPS hops, found without
+    # scanning past them: each call in a chain splits its own receiver, so an
+    # unbounded split made one long chain quadratic (#2262).
+    parts: list[str] = []
+    depth = 0
+    current: list[str] = []
+    for char in expr:
+        if char in _CHAIN_OPEN_BRACKETS:
+            depth += 1
+        elif char in _CHAIN_CLOSE_BRACKETS:
+            depth = max(0, depth - 1)
+        if char == cs.SEPARATOR_DOT and depth == 0:
+            parts.append("".join(current))
+            if len(parts) >= cs.MAX_RECEIVER_CHAIN_HOPS:
+                return None
+            current = []
+        else:
+            current.append(char)
+    parts.append("".join(current))
+    return parts
+
+
+def _split_csharp_qualified_path(path: str) -> list[str]:
+    parts: list[str] = []
+    current: list[str] = []
+    generic_depth = 0
+    for char in path:
+        if char == cs.CHAR_ANGLE_OPEN:
+            generic_depth += 1
+        elif char == cs.CHAR_ANGLE_CLOSE and generic_depth:
+            generic_depth -= 1
+        if char == cs.SEPARATOR_DOT and generic_depth == 0:
+            parts.append("".join(current))
+            current = []
+        else:
+            current.append(char)
+    parts.append("".join(current))
+    return parts
+
+
+def _rust_caller(
+    language: cs.SupportedLanguage | None, caller_qn: str | None
+) -> str | None:
+    # The caller whose inner-scope `use`s bind a Rust type name, or None for
+    # any other language, whose scopes those maps never describe.
+    return caller_qn if language == cs.SupportedLanguage.RUST else None
+
+
+PY_EXTERNAL_TARGET: tuple[str, str] = ("", "")
+
+
+def _module_level_assignments(root_node: Node) -> Iterator[Node]:
+    """Every `assignment` that is a top-level expression statement of the module.
+
+    A chained `Alias = Other = Outer` nests an assignment on the outer
+    right-hand side; each link is yielded, so every direct target is seen
+    (CodeRabbit, #1759).
+    """
+    for child in root_node.children:
+        if child.type != cs.TS_PY_EXPRESSION_STATEMENT or not child.children:
+            continue
+        assignment: Node | None = child.children[0]
+        while assignment is not None and assignment.type == cs.TS_PY_ASSIGNMENT:
+            yield assignment
+            assignment = assignment.child_by_field_name(cs.TS_FIELD_RIGHT)
+
+
+def _terminal_value(node: Node | None) -> Node | None:
+    """The value at the end of an assignment chain: `Outer` in `A = B = Outer`."""
+    while node is not None and node.type == cs.TS_PY_ASSIGNMENT:
+        node = node.child_by_field_name(cs.TS_FIELD_RIGHT)
+    return node
+
+
+def _rebound_alias(assignment: Node, name: str, bound: str | None) -> str | None:
+    """`bound` after `assignment`: the alias it binds `name` to, None when it
+    rebinds `name` to a value, `bound` unchanged when it does not touch `name`."""
+    left = assignment.child_by_field_name(cs.TS_FIELD_LEFT)
+    if left is None:
+        return bound
+    # An unpacking target (`Alias, other = make_pair()`) rebinds the name to
+    # a runtime value just as a plain assignment does, and it is never an
+    # alias (#1759 review).
+    if left.type in cs.PY_UNPACKING_TARGET_TYPES:
+        return None if _binds_identifier(left, name) else bound
+    if left.type != cs.TS_PY_IDENTIFIER or safe_decode_text(left) != name:
+        return bound
+    right = _terminal_value(assignment.child_by_field_name(cs.TS_FIELD_RIGHT))
+    if right is not None and right.type in (cs.TS_PY_IDENTIFIER, cs.TS_PY_ATTRIBUTE):
+        return safe_decode_text(right)
+    return None
+
+
+def _binds_identifier(target: Node, name: str) -> bool:
+    """Whether an unpacking target binds the bare name `name` at any depth.
+
+    Only bare identifiers bind a module-level name: `holder.Alias, x = ...`
+    assigns an attribute and `table[Alias], x = ...` a subscript, so those
+    subtrees are not descended into (#1759 review).
+    """
+    stack = [target]
+    while stack:
+        node = stack.pop()
+        if node.type in (cs.TS_PY_ATTRIBUTE, cs.TS_PY_SUBSCRIPT):
+            continue
+        if node.type == cs.TS_PY_IDENTIFIER and safe_decode_text(node) == name:
+            return True
+        stack.extend(node.named_children)
+    return False
+
+
+def _file_language(suffix: str) -> cs.SupportedLanguage | None:
+    # `.ipynb` maps to no grammar, but the only notebooks that become modules
+    # are Python ones, whose cells are parsed as Python (issue #2480).
+    if suffix == cs.EXT_IPYNB:
+        return cs.SupportedLanguage.PYTHON
+    return get_language_for_extension(suffix)
+
+
+class CallResolver:
+    __slots__ = (
+        "_py_rel_to_module",
+        "python_name_typed_params",
+        "python_shadowed_imports",
+        "go_local_scopes",
+        "python_local_names",
+        "function_registry",
+        "import_processor",
+        "type_inference",
+        "class_inheritance",
+        "type_aliases",
+        "interface_implementers",
+        "rehydrated_interface_implementers",
+        "guessed_implementations",
+        "go_methods",
+        "go_checked_files",
+        "go_builtin_shadows",
+        "go_variant_methods",
+        "go_declaration_variants",
+        "go_pair_builds",
+        "go_builds",
+        "_interface_impl_cache",
+        "_simple_resolution_cache",
+        "last_resolution",
+        "_resolution_labels",
+        "_wildcard_cache",
+        "_protocol_impl_cache",
+        "_field_bindings",
+        "_field_to_classes",
+        "_subclass_map_cache",
+        "_protocol_classes_cache",
+        "_struct_impl_cache",
+        "_cpp_free_operators",
+        "_ctor_params",
+        "_ctor_param_attrs",
+        "_pending_field_bindings",
+        "_module_language_cache",
+        "rehydrated_definition_paths",
+        "rust_function_modules",
+        "declared_module_qns",
+        "go_package_names",
+        "_php_class_namespaces",
+        "_php_cased_index",
+        "_js_return_class_cache",
+    )
+
+    def __init__(
+        self,
+        function_registry: FunctionRegistryTrieProtocol,
+        import_processor: ImportProcessor,
+        type_inference: TypeInferenceEngine,
+        class_inheritance: dict[str, list[str]],
+        type_aliases: dict[str, str] | None = None,
+        interface_implementers: dict[str, set[str]] | None = None,
+        rehydrated_definition_paths: dict[str, str] | None = None,
+        rust_function_modules: dict[str, str] | None = None,
+        declared_module_qns: set[str] | None = None,
+        rehydrated_interface_implementers: dict[str, set[str]] | None = None,
+        go_package_names: Mapping[str, str] | None = None,
+        go_links: GoLinkState | None = None,
+    ) -> None:
+        self.function_registry = function_registry
+        self.import_processor = import_processor
+        self.type_inference = type_inference
+        self.class_inheritance = class_inheritance
+        self._py_rel_to_module: dict[str, str] = {}
+        # caller qn -> untyped parameters typed only by their name (#2608);
+        # filled alongside python_shadowed_imports.
+        self.python_name_typed_params: dict[str, frozenset[str]] = {}
+        # caller qn -> import-map names that caller binds as locals (#1907);
+        # filled by the call processor before the caller's calls resolve.
+        self.python_shadowed_imports: dict[str, frozenset[str]] = {}
+        # Go caller qn -> the names it binds for itself (params, locals,
+        # closures) and the byte spans each is in scope over, filled by the
+        # call processor before the caller's calls resolve: a bare call to
+        # one of them inside its span calls that value (#2571).
+        self.go_local_scopes: dict[str, go_utils.GoLocalScopes] = {}
+        # caller qn -> every name that Python function binds itself (#2666);
+        # filled alongside python_shadowed_imports.
+        self.python_local_names: dict[str, frozenset[str]] = {}
+        # Every inline `mod` qn the class pass ingested (shared ref). A Rust
+        # enclosing scope is an inline mod IFF it is in here: an impl target is
+        # not, and neither is registered under a type label when it is a
+        # primitive or an unindexed foreign type, so absence-of-a-type-label
+        # cannot tell the two apart (issue #1093 review).
+        self.declared_module_qns = (
+            declared_module_qns if declared_module_qns is not None else set()
+        )
+        # {interface_qn: [implementer_qns]} (shared ref, populated during
+        # ingestion). Used to redirect an interface-typed call to the single
+        # concrete implementer's method (call-graph accuracy; single-impl only).
+        self.interface_implementers = (
+            interface_implementers if interface_implementers is not None else {}
+        )
+        # The pairs of implementers an incremental run did not re-parse, read
+        # back from the graph (shared ref). A sole implementer is one across
+        # both, or re-parsing only a caller loses its edge (issue #2403).
+        self.rehydrated_interface_implementers = (
+            rehydrated_interface_implementers
+            if rehydrated_interface_implementers is not None
+            else {}
+        )
+        # What the Go interface link shares, each container by reference
+        # (#2483): the pairs above it matched by name, so what dispatch
+        # through them reaches is a guess; each method's signature; the
+        # files go/types type-checked; the predeclared names each package
+        # declares; the declarations a type's build variants hold for it; each
+        # interface's build variants; the builds holding each pair; and each
+        # file's build constraint.
+        links = go_links if go_links is not None else GoLinkState()
+        self.guessed_implementations = links.guessed_implementations
+        self.go_methods: Mapping[str, GoMethodSpec] = links.methods
+        self.go_checked_files = links.checked_files
+        self.go_builtin_shadows: Mapping[str, frozenset[str]] = links.builtin_shadows
+        self.go_variant_methods: Mapping[str, Mapping[str, list[str]]] = (
+            links.variant_methods
+        )
+        self.go_declaration_variants: Mapping[str, tuple[str, ...]] = (
+            links.declaration_variants
+        )
+        self.go_pair_builds: Mapping[tuple[str, str], Expr] = links.pair_builds
+        self.go_builds = links.builds
+        self._interface_impl_cache: dict[str, str] | None = None
+        # C++ typedef/using alias -> underlying bare type, consulted when a
+        # receiver type name is mapped to a class (empty for other languages).
+        self.type_aliases = type_aliases if type_aliases is not None else {}
+        self._simple_resolution_cache: dict[
+            tuple[str, str, bool], tuple[str, str] | None
+        ] = {}
+        # The branch that produced the last answer (issue #1526), memoised
+        # beside the cache so a hit reports the same confidence as the miss.
+        self.last_resolution: str = cs.EdgeResolution.EXACT
+        self._resolution_labels: dict[tuple[str, str, bool], str] = {}
+        self._wildcard_cache: dict[int, list[tuple[str, str]]] = {}
+        self._protocol_impl_cache: dict[str, str] | None = None
+        self._field_bindings: dict[tuple[str, str], set[str]] = {}
+        self._field_to_classes: dict[str, set[str]] = {}
+        self._subclass_map_cache: dict[str, set[str]] | None = None
+        self._protocol_classes_cache: set[str] | None = None
+        self._struct_impl_cache: dict[str, set[str]] = {}
+        # {module qn: {free operator qn: its declarations' signatures}}.
+        self._cpp_free_operators: dict[
+            str, dict[str, tuple[CppOperatorSignature, ...]]
+        ] = {}
+        # Ordered constructor parameter names per class (explicit __init__
+        # params, or annotated class-body fields for NamedTuple/dataclass),
+        # plus the param -> stored-attribute renames found in __init__ bodies
+        # (self.ctx_factory = create_context). Construction-site bindings are
+        # held PENDING until every file's ctor metadata is collected, since a
+        # site may be scanned before its class's file.
+        self._ctor_params: dict[str, tuple[str, ...]] = {}
+        self._ctor_param_attrs: dict[tuple[str, str], str] = {}
+        self._pending_field_bindings: list[tuple[str, int | str, str]] = []
+        self._module_language_cache: dict[str, cs.SupportedLanguage | None] = {}
+        # {PHP module qn: {class qn: folded namespace it is declared in}},
+        # read off each file's declarations on first use (issue #2466).
+        self._php_class_namespaces: dict[str, dict[str, PhpClassPath]] = {}
+        self._php_cased_index: _PhpCasedIndex | None = None
+        # {JS/TS callable qn: the class a call to it returns}, read off its
+        # declaration on first use (issue #2468).
+        self._js_return_class_cache: dict[tuple[str, bool], str | None] = {}
+        # {definition qn: recorded file path} for definitions an incremental
+        # run rehydrated from the graph instead of re-parsing (shared ref).
+        self.rehydrated_definition_paths = (
+            rehydrated_definition_paths
+            if rehydrated_definition_paths is not None
+            else {}
+        )
+        # {Rust function qn: containing module qn}, recorded from the AST during
+        # ingestion (shared ref). The authority on how many levels a `super::`
+        # written inside it climbs (issue #1086).
+        self.rust_function_modules = (
+            rust_function_modules if rust_function_modules is not None else {}
+        )
+        # {Go module qn: its `package` clause} (shared ref). A directory is not
+        # a package: `package p_test` and `//go:build ignore` generators sit
+        # beside `package p`, so package scope is (directory, clause).
+        self.go_package_names: Mapping[str, str] = (
+            go_package_names if go_package_names is not None else {}
+        )
+
+    def record_ctor_params(self, class_qn: str, params: tuple[str, ...]) -> None:
+        self._ctor_params[class_qn] = params
+
+    def record_ctor_param_attr(self, class_qn: str, param: str, attr: str) -> None:
+        self._ctor_param_attrs[(class_qn, param)] = attr
+
+    def record_pending_field_binding(
+        self, class_qn: str, key: int | str, func_qn: str
+    ) -> None:
+        # key: keyword name, or positional index awaiting the ctor param order.
+        self._pending_field_bindings.append((class_qn, key, func_qn))
+
+    def finalize_field_bindings(self) -> None:
+        # Resolve pendings now that every class's ctor metadata is known. A
+        # subclass without its own __init__ inherits the base's params and
+        # field, so both a positional index and a keyword name resolve against
+        # the nearest self-or-ancestor that owns the ctor param, and the
+        # binding is recorded under THAT owner (where the field lives) so an
+        # inherited self.handler(), typed to the base, still matches.
+        for class_qn, key, func_qn in self._pending_field_bindings:
+            if isinstance(key, int):
+                owner_qn, params = self._ctor_params_owner(class_qn)
+                if key >= len(params):
+                    continue
+                param = params[key]
+            else:
+                param = key
+                owner_qn = self._ctor_param_owner(class_qn, param)
+            field = self._ctor_param_attrs.get((owner_qn, param), param)
+            self.record_callable_field_binding(owner_qn, field, func_qn)
+        self._pending_field_bindings.clear()
+
+    def _ctor_params_owner(self, class_qn: str) -> tuple[str, tuple[str, ...]]:
+        # Nearest self-or-ancestor with a non-empty recorded ctor param list
+        # (a subclass with no __init__ has an empty list, so keep walking).
+        for ancestor in self._mro(class_qn):
+            if params := self._ctor_params.get(ancestor):
+                return ancestor, params
+        return class_qn, self._ctor_params.get(class_qn, ())
+
+    def _ctor_param_owner(self, class_qn: str, param: str) -> str:
+        # Nearest self-or-ancestor whose ctor declares `param`, so an
+        # inherited keyword binding attaches to the class that owns the field.
+        for ancestor in self._mro(class_qn):
+            if param in self._ctor_params.get(ancestor, ()):
+                return ancestor
+        return class_qn
+
+    def _mro(self, class_qn: str) -> list[str]:
+        # BFS over the inheritance graph, self first; guards cycles.
+        seen: set[str] = set()
+        order: list[str] = []
+        queue: deque[str] = deque([class_qn])
+        while queue:
+            cur = queue.popleft()
+            if cur in seen:
+                continue
+            seen.add(cur)
+            order.append(cur)
+            queue.extend(self.class_inheritance.get(cur, []))
+        return order
+
+    def record_callable_field_binding(
+        self, class_qn: str, field: str, func_qn: str
+    ) -> None:
+        # A NamedTuple/dataclass field holding a function reference: every
+        # function bound to it at any construction site is a possible callee
+        # when the field is invoked. Recording all of them is a sound call
+        # graph (each runs for its own configuration), so recall is complete.
+        self._field_bindings.setdefault((class_qn, field), set()).add(func_qn)
+        self._field_to_classes.setdefault(field, set()).add(class_qn)
+
+    def callable_field_targets(
+        self, field: str, recv_type: str | None = None
+    ) -> set[str]:
+        classes = self._field_to_classes.get(field)
+        if not classes:
+            return set()
+        if recv_type:
+            simple = recv_type.rsplit(cs.SEPARATOR_DOT, 1)[-1]
+            matched = [
+                qn
+                for qn in classes
+                if qn == recv_type or qn.rsplit(cs.SEPARATOR_DOT, 1)[-1] == simple
+            ]
+            if len(matched) == 1:
+                return self._field_bindings.get((matched[0], field), set())
+        # Receiver type unknown or ambiguous: only resolve when exactly one
+        # class declares this callable field, so the targets are unambiguous.
+        if len(classes) == 1:
+            return self._field_bindings.get((next(iter(classes)), field), set())
+        return set()
+
+    def _resolve_class_qn_from_type(
+        self, var_type: str, import_map: dict[str, str], module_qn: str
+    ) -> str:
+        var_type = self._strip_optional(var_type)
+        if cs.SEPARATOR_DOUBLE_COLON in var_type:
+            return self._resolve_rust_class_qn(var_type, module_qn)
+        if cs.SEPARATOR_DOT in var_type:
+            return self._follow_reexports(var_type)
+        if var_type in import_map:
+            # A Rust import target is a raw `::`-path (`crate::parse::Parse`) that
+            # is not a registry qn; resolve it to the real type node so both
+            # local-type dispatch and the external-receiver guard see it as
+            # first-party (else its trie fallback is wrongly suppressed).
+            target = import_map[var_type]
+            if cs.SEPARATOR_DOUBLE_COLON in target:
+                return self._resolve_rust_class_qn(target, module_qn)
+            return self._follow_reexports(target)
+        if (scoped := self._rust_glob_imported_type(var_type, module_qn)) is not None:
+            return scoped
+        return self._resolve_class_name(var_type, module_qn) or ""
+
+    def _rust_glob_imported_type(self, name: str, module_qn: str) -> str | None:
+        # A Rust type the module brings in by a glob (`use crate::cmd::*;`)
+        # has no import-map key of its own. Look it up in the module's
+        # namespace the way rustc does, globs and their re-exports included,
+        # before the bare-name search can pick a same-named type from
+        # anywhere (issue #2542).
+        if self._module_language(module_qn) != cs.SupportedLanguage.RUST:
+            return None
+        return self._rust_scope_type(f"{module_qn}{cs.SEPARATOR_DOT}{name}")
+
+    def _rust_scope_type(self, qn: str) -> str | None:
+        hit = self._follow_rust_scope_target(qn)
+        return hit[1] if hit is not None and hit[0] in _RS_TYPE_NODE_TYPES else None
+
+    def _strip_optional(self, var_type: str) -> str:
+        # An Optional annotation (X | None) names a single concrete class; reduce it
+        # so attribute/operator resolution can find that class. Genuine multi-type
+        # unions stay unresolved (ambiguous).
+        if cs.PY_UNION_SEPARATOR not in var_type:
+            return var_type
+        non_none = [
+            member
+            for part in var_type.split(cs.PY_UNION_SEPARATOR)
+            if (member := part.strip()) and member != cs.PY_NONE
+        ]
+        return non_none[0] if len(non_none) == 1 else var_type
+
+    def _follow_reexports(self, class_qn: str) -> str:
+        if class_qn in self.function_registry:
+            return class_qn
+        # A JS/TS barrel passes on only what it exports: a type it imports
+        # for its own use must not type a receiver through it (#2560).
+        followed = self.import_processor.follow_module_reexports(
+            class_qn,
+            self.type_inference.module_qn_to_file_path,
+            self.function_registry,
+        )
+        if (
+            followed in self.function_registry
+            or self._module_language(followed) != cs.SupportedLanguage.RUST
+        ):
+            return followed
+        # A Rust glob re-export (`pub use inner::*;`) binds no name the walk
+        # above can follow, so a type exported through one stayed a dead
+        # qn and every method called on it lost its edge (issue #2542).
+        return self._rust_scope_type(followed) or followed
+
+    def _try_resolve_method(
+        self, class_qn: str, method_name: str, separator: str = cs.SEPARATOR_DOT
+    ) -> tuple[str, str] | None:
+        # A class-body alias of the name (issue #2620) lists every method
+        # the member may hold, its own `def` included when that survives.
+        if alias := self._member_alias(class_qn, method_name):
+            return alias
+        method_qn = f"{class_qn}{separator}{method_name}"
+        if method_qn in self.function_registry:
+            return self.function_registry[method_qn], method_qn
+        return self._resolve_inherited_method(class_qn, method_name)
+
+    def reset_resolution_caches(self) -> None:
+        # The watch pass deletes EVERY CALLS edge and recomputes them
+        # against re-parsed state; answers cached from the previous pass
+        # (and wildcard entries keyed by dict id, which recycles) must
+        # not survive into the recompute. The derived-structure memos
+        # reset with them: a second trait implementer created mid-watch
+        # must retire the sole-implementer companion edge, exactly as a
+        # fresh full run would.
+        self._simple_resolution_cache.clear()
+        self._wildcard_cache.clear()
+        self._interface_impl_cache = None
+        self._protocol_impl_cache = None
+        self._subclass_map_cache = None
+        self._protocol_classes_cache = None
+        self._struct_impl_cache.clear()
+        self._cpp_free_operators.clear()
+        # The qn -> language memo goes too: after a same-stem replacement
+        # across languages (`util.rs` deleted, `util.py` added) the bare qn
+        # `proj.util` now names a Python module, and a stale RUST answer
+        # makes `_languages_can_call` drop the candidate a clean index
+        # resolves (issue #1575).
+        self._module_language_cache.clear()
+        # A re-parsed PHP file may have moved a class between namespaces.
+        self._php_class_namespaces.clear()
+        self._php_cased_index = None
+        # A re-parsed TS file may declare a different return.
+        self._js_return_class_cache.clear()
+        # The rel-path -> module qn inverse rebuilds only when its size
+        # differs from `module_qn_to_file_path`; a rename removes one entry
+        # and adds one, so the size is unchanged and the memo would keep the
+        # old path and never learn the new one, and every JEDI fact
+        # targeting the renamed file would miss its declared location.
+        self._py_rel_to_module.clear()
+        # The C# chained-receiver memo (issue #1800) is a resolution cache
+        # like the rest and expires with them: it is keyed by byte span, and a
+        # re-parsed file's spans name different code. Reached through the
+        # PRIVATE attribute so a project with no C# does not build an engine
+        # just to clear an empty dict.
+        if (csharp := self.type_inference._csharp_type_inference) is not None:
+            csharp._call_memo.clear()
+        # The Java class headers (issue #2470) were read off the trees the
+        # last pass saw; a re-parsed superclass must be walked again.
+        if (java := self.type_inference._java_type_inference) is not None:
+            java.reset_resolution_memos()
+
+    def resolve_function_call(
+        self,
+        call_name: str,
+        module_qn: str,
+        local_var_types: dict[str, str] | None = None,
+        class_context: str | None = None,
+        caller_qn: str | None = None,
+        language: cs.SupportedLanguage | None = None,
+        call_point: int | None = None,
+        constructing: bool = False,
+    ) -> tuple[str, str] | None:
+        """`constructing`: the call is a Java/C# `new X(...)`, so `call_name`
+        names a TYPE and the simple-name fallback must not offer a method or
+        function that merely shares the name."""
+        self.last_resolution = cs.EdgeResolution.EXACT
+        result = self._reject_class_via_value_receiver(
+            self._redirect_protocol_method(
+                self._resolve_function_call(
+                    call_name,
+                    module_qn,
+                    local_var_types,
+                    class_context,
+                    caller_qn,
+                    language,
+                    call_point,
+                    constructing,
+                )
+            ),
+            call_name,
+            module_qn,
+            class_context,
+            local_var_types,
+            language,
+        )
+        # The probes filter their name-based candidates by crate already;
+        # this catches what reached a crate by another name-based route (a
+        # receiver typed by a recorded name, a match arm typed by its
+        # variant's), since no Rust call can land outside the caller's
+        # dependency closure, precise or not (issue #2622).
+        if (
+            result is not None
+            and language == cs.SupportedLanguage.RUST
+            and not self._rust_crate_reaches(module_qn, result[1])
+        ):
+            logger.debug(ls.CALL_RUST_OUTSIDE_CRATE, call_name=call_name, qn=result[1])
+            return None
+        if result is not None and self._receiver_typed_by_name(call_name, caller_qn):
+            # The receiver's class is only what its parameter's name spells
+            # (`payload` -> `Payload`): a guess, never an exact binding (#2608).
+            self.last_resolution = cs.EdgeResolution.HEURISTIC
+        return result
+
+    def _receiver_typed_by_name(self, call_name: str, caller_qn: str | None) -> bool:
+        if not caller_qn or cs.SEPARATOR_DOT not in call_name:
+            return False
+        guessed = self.python_name_typed_params.get(caller_qn)
+        return guessed is not None and (
+            call_name.split(cs.SEPARATOR_DOT, 1)[0] in guessed
+        )
+
+    def _is_python_local_name(self, call: _CallSite) -> bool:
+        if not call.caller_qn or cs.SEPARATOR_DOT in call.call_name:
+            return False
+        local = self.python_local_names.get(call.caller_qn)
+        return local is not None and call.call_name in local
+
+    def _receiver_is_untyped_shadow(
+        self,
+        call_name: str,
+        caller_qn: str | None,
+        local_var_types: dict[str, str] | None,
+    ) -> bool:
+        if not caller_qn or cs.SEPARATOR_DOT not in call_name:
+            return False
+        shadowed = self.python_shadowed_imports.get(caller_qn)
+        if not shadowed:
+            return False
+        head = call_name.split(cs.SEPARATOR_DOT, 1)[0]
+        return head in shadowed and not (local_var_types and head in local_var_types)
+
+    def _resolve_inline_receiver_call(
+        self,
+        call_name: str,
+        module_qn: str,
+        local_var_types: dict[str, str] | None,
+    ) -> tuple[bool, tuple[str, str] | None]:
+        """`(a / b).m()`, `(x or y).m()`: resolve `m` on the receiver's type.
+
+        A parenthesised receiver never becomes a variable, so nothing typed
+        it, and `_is_method_chain` does not see it either (it looks for a
+        segment holding both parens); the call fell all the way to the trie,
+        which matched `m` by name against every class defining it (issue
+        #1893, the call-site half of #1868). The receiver text is handed to
+        the same rules an assignment gets. Returns (handled, result): handled
+        with a result when the method resolves on the inferred class; handled
+        with None when the receiver IS typed but its class is not one the
+        project defines (`pathlib.Path`), which is a known non-edge rather
+        than a licence to guess; not handled when nothing can be inferred.
+        """
+        parts = _split_receiver_chain(call_name)
+        if (
+            parts is None
+            or len(parts) < 2
+            or not parts[0].startswith(cs.CHAR_PAREN_OPEN)
+        ):
+            return False, None
+        receiver = cs.SEPARATOR_DOT.join(parts[:-1])
+        method = parts[-1].split(cs.CHAR_PAREN_OPEN, 1)[0]
+        receiver_type = (
+            self.type_inference.python_type_inference._get_inline_expression_type(
+                receiver, module_qn, local_var_types
+            )
+        )
+        if not receiver_type:
+            return False, None
+        import_map = self.import_processor.import_mapping.get(module_qn, {})
+        class_qn = self._resolve_class_qn_from_type(
+            receiver_type, import_map, module_qn
+        )
+        if class_qn and (hit := self._try_resolve_method(class_qn, method)):
+            return True, hit
+        return True, None
+
+    def _reject_class_via_value_receiver(
+        self,
+        result: tuple[str, str] | None,
+        call_name: str,
+        module_qn: str,
+        class_context: str | None = None,
+        local_var_types: dict[str, str] | None = None,
+        language: cs.SupportedLanguage | None = None,
+    ) -> tuple[str, str] | None:
+        """Drop a CLASS answer for `value.Name()` -- a value never constructs.
+
+        Two independent paths reach a class by discarding the receiver and
+        looking the trailing name up on its own: `_try_resolve_module_method`
+        (same module) and `_try_resolve_via_trie` (cross module). Both then look
+        like construction to the emit site, which records INSTANTIATES for any
+        callee that resolved to a Class.
+
+        So `err.Error()` on a stdlib error became "constructs the first-party
+        `Error` struct", and `buf.String()` on a `bytes.Buffer` became
+        "constructs `render.text.String`". Go is worst hit because `Error()` and
+        `String()` are its two most idiomatic interface methods, but Python
+        reproduces it identically (issue #1641).
+
+        The receiver decides. `Outer.Inner()` IS a genuine instantiation whose
+        receiver is a class, and `pkg.Thing()` one whose receiver is a module,
+        so this rejects only a receiver that resolves to neither -- an ordinary
+        identifier holding a value. Guarding here rather than at either lookup
+        keeps one rule for both paths; JS/TS and Dart already carry their own
+        version of it further down (`_resolve_two_part_call`, the unique-member
+        gate), which is why neither reproduced.
+        """
+        if result is None or result[0] != cs.NodeLabel.CLASS:
+            return result
+        # `::` and `:` are static paths (`Type::new`, `Class::method`), where a
+        # type receiver is the normal spelling; only a `.` receiver can be a value.
+        if cs.SEPARATOR_DOT not in call_name:
+            return result
+        receiver = call_name.rsplit(cs.SEPARATOR_DOT, 1)[0]
+        # `::` is a static path (`Type::new`), where a type receiver is the
+        # normal spelling. A BARE `:` is not: in Python it is a slice or a dict
+        # key inside the receiver expression (`xs[1:2].Error()`), and exempting
+        # on it let the defect straight through.
+        if cs.SEPARATOR_DOUBLE_COLON in receiver:
+            return result
+        if (
+            language == cs.SupportedLanguage.CSHARP
+            and self._try_resolve_csharp_qualified_call(
+                call_name, module_qn, local_var_types
+            )
+        ):
+            return result
+        if self._receiver_names_a_type_or_module(
+            receiver, module_qn, result[1], class_context, local_var_types
+        ):
+            return result
+        # The member lookup that produced `result` searches by bare name and
+        # can land on a same-named class nested in ANOTHER type (`Other.Inner`
+        # for `Outer.Inner()`). Rejecting that answer must not lose the
+        # construction the call spells out, so resolve the member under the
+        # receiver class itself, walking its bases (#1759 review).
+        member = call_name.rsplit(cs.SEPARATOR_DOT, 1)[-1]
+        if redirected := self._nested_class_under_receiver(receiver, module_qn, member):
+            return cs.NodeLabel.CLASS, redirected
+        logger.debug(ls.CALL_UNRESOLVED, call_name=call_name)
+        return None
+
+    def _nested_class_under_receiver(
+        self, receiver: str, module_qn: str, member: str
+    ) -> str | None:
+        """`<receiver class>.<member>` when the receiver names a class that
+        declares (or inherits) a nested class called `member`."""
+        head, _, rest = receiver.partition(cs.SEPARATOR_DOT)
+        if not head or not head.isidentifier():
+            return None
+        base = self._receiver_base_qn(head, module_qn)
+        if base is None:
+            return None
+        owner = base if not rest else f"{base}{cs.SEPARATOR_DOT}{rest}"
+        if self.function_registry.get(owner) != cs.NodeLabel.CLASS:
+            return None
+        for ancestor in self._mro(owner):
+            candidate = f"{ancestor}{cs.SEPARATOR_DOT}{member}"
+            if self.function_registry.get(candidate) == cs.NodeLabel.CLASS:
+                return candidate
+        return None
+
+    def _receiver_names_a_type_or_module(
+        self,
+        receiver: str,
+        module_qn: str,
+        # Required rather than defaulted: an omitted resolved qn would make the
+        # nesting check answer False and silently reject every `self.Inner()`
+        # and typed-local construction, with no error to notice.
+        resolved_qn: str,
+        class_context: str | None = None,
+        local_var_types: dict[str, str] | None = None,
+    ) -> bool:
+        """Whether a receiver expression names something constructible-through.
+
+        A class (nested-class construction), or a module/package the caller
+        imported. Anything else -- a parameter, a field, a chained call -- holds
+        a VALUE at runtime.
+
+        `self`/`cls`/`this` and a local typed to a class are the awkward cases:
+        the receiver is spelled as a value but `self.Inner()` and `o.Inner()`
+        really do construct a nested class, and the receiver-aware paths upstream
+        resolve them correctly. Dropping them would delete edges `origin/main`
+        gets right, so both are consulted here rather than judged by name.
+        """
+        head, _, rest = receiver.partition(cs.SEPARATOR_DOT)
+        if not head or not head.isidentifier():
+            return False
+        # Single-segment only: `self.err.Error()` reaches a FIELD, an ordinary
+        # value, so a chain falls through to the namespace resolution below.
+        if not rest and self._receiver_owns_nested_class(
+            head, module_qn, resolved_qn, class_context, local_var_types
+        ):
+            return True
+        base = self._receiver_base_qn(head, module_qn)
+        if base is None:
+            return False
+        # Resolve the WHOLE receiver, not just its head. `mod_a.instance` has a
+        # module for a head and a value for a tail, and judging it by the head
+        # alone accepted `mod_a.instance.Error()` -- the original defect reached
+        # through one more segment. Being imported also says nothing about KIND:
+        # `from m import instance` and `import m` both land in the map, and only
+        # the second is a namespace.
+        full = base if not rest else f"{base}{cs.SEPARATOR_DOT}{rest}"
+        # A CLASS receiver constructs only its own nested classes: the member
+        # lookup that produced `resolved_qn` falls back to a search by the
+        # bare member name, which can land on a same-named class nested in
+        # another type, and an alias receiver has no precise member path at
+        # all (CodeRabbit, #1759). A module receiver keeps the namespace
+        # check.
+        if self.function_registry.get(full) == cs.NodeLabel.CLASS:
+            return self._class_is_nested_in(resolved_qn, full)
+        return self._import_target_is_a_namespace(full)
+
+    def _receiver_owns_nested_class(
+        self,
+        head: str,
+        module_qn: str,
+        resolved_qn: str,
+        class_context: str | None,
+        local_var_types: dict[str, str] | None,
+    ) -> bool:
+        """Whether `head` names a type whose OWN nested class is being built.
+
+        `self`/`cls`/`this` and a local typed to a class are spelled as values
+        but really do construct: `self.Inner()` is a nested-class construction,
+        while `self.Error()` naming a module-level `Error` is the #1641 defect
+        wearing a new receiver. So each admits only a class nested in its type.
+        """
+        if head in cs.SELF_RECEIVER_KEYWORDS and class_context:
+            if self._class_is_nested_in(resolved_qn, class_context):
+                return True
+        if not local_var_types:
+            return False
+        var_type = local_var_types.get(head)
+        if not var_type:
+            return False
+        typed_qn = self._resolve_class_name(self._strip_optional(var_type), module_qn)
+        return bool(
+            typed_qn
+            and self.function_registry.get(typed_qn) == cs.NodeLabel.CLASS
+            and self._class_is_nested_in(resolved_qn, typed_qn)
+        )
+
+    def _receiver_base_qn(self, head: str, module_qn: str) -> str | None:
+        """The qn the receiver's first segment names, if it names a namespace.
+
+        `_resolve_class_name` follows the import map without checking what it
+        landed on, so it answers `mod_a.helper` for an imported FUNCTION named
+        `helper`. Confirm the qn it returns really is a Class before trusting
+        it; the name alone is not evidence of classness.
+        """
+        class_qn = self._resolve_class_name(head, module_qn)
+        if class_qn and self.function_registry.get(class_qn) == cs.NodeLabel.CLASS:
+            return class_qn
+        import_map = self.import_processor.import_mapping.get(module_qn) or {}
+        if (imported := import_map.get(head)) is not None:
+            if self.function_registry.get(
+                imported
+            ) == cs.NodeLabel.CLASS or self._import_target_is_a_namespace(imported):
+                return imported
+            # An imported name that is neither a class nor a namespace may be
+            # an alias defined in the module it was imported FROM
+            # (`from mod_b import Alias` where mod_b says `Alias = Outer`);
+            # look it up there (#1672 local review).
+            owner_qn, _, alias_name = imported.rpartition(cs.SEPARATOR_DOT)
+            return self._class_bound_by_module_alias(alias_name, owner_qn)
+        # A module-level `Alias = Outer` names the class it binds: it is an
+        # assignment rather than an import, so it is in neither the class
+        # lookup nor the import map, and `Alias.Inner()` lost the INSTANTIATES
+        # edge `Outer.Inner()` keeps (issue #1672). Only a right-hand side
+        # that itself resolves to a Class counts; `inst = make()` still holds
+        # a value.
+        return self._class_bound_by_module_alias(head, module_qn)
+
+    def _class_bound_by_module_alias(self, name: str, module_qn: str) -> str | None:
+        if not name or not module_qn:
+            return None
+        target = self._module_level_alias_target(name, module_qn)
+        if target is None:
+            return None
+        alias_qn = self._resolve_class_name(target, module_qn)
+        if alias_qn and self.function_registry.get(alias_qn) == cs.NodeLabel.CLASS:
+            return alias_qn
+        return None
+
+    def _module_level_alias_target(self, name: str, module_qn: str) -> str | None:
+        """The name a module-level Python `name = Other` binds, or None.
+
+        Reads the module's cached AST rather than a recorded map: the
+        definition pass records no module-level assignments, and the
+        dotted spelling (`Alias = pkg.Outer`) is kept so the class lookup
+        can follow the import it names. The LAST module-level binding
+        decides: `Alias = Outer` followed by `Alias = make()` holds a value
+        by the time anything runs, so it names nothing (#1672 local review).
+        """
+        root_node = self._cached_module_root(module_qn)
+        if root_node is None:
+            return None
+        bound: str | None = None
+        for assignment in _module_level_assignments(root_node):
+            bound = _rebound_alias(assignment, name, bound)
+        return bound
+
+    def _cached_module_root(self, module_qn: str) -> Node | None:
+        file_path = self.type_inference.module_qn_to_file_path.get(module_qn)
+        if file_path is None:
+            return None
+        entry = self.type_inference.ast_cache.load(file_path)
+        # A guard, not a contract: resolver tests drive this with a stub cache
+        # whose `load` answers something that is not a (root, language) pair.
+        if not isinstance(entry, tuple) or len(entry) != 2:
+            return None
+        root_node = entry[0]
+        return root_node if isinstance(root_node, Node) else None
+
+    def _class_is_nested_in(self, class_qn: str, owner_qn: str) -> bool:
+        """Whether `class_qn` is declared inside `owner_qn` or one of its bases.
+
+        `self.Inner()` inside a `Derived(Base)` resolves to `Base.Inner`, which
+        is a real construction, so a prefix test against the enclosing type
+        alone rejects an edge that is correct. Walking the MRO makes this a
+        question about the TYPE rather than about qualified-name spelling.
+
+        The trailing separator is load-bearing: without it `Outer2.Inner` would
+        match owner `Outer` and a sibling class would read as a nested one.
+        """
+        if not class_qn or not owner_qn:
+            return False
+        return any(
+            class_qn.startswith(f"{ancestor}{cs.SEPARATOR_DOT}")
+            for ancestor in self._mro(owner_qn)
+        )
+
+    def _import_target_is_a_namespace(self, target: str) -> bool:
+        """Whether an imported name refers to something you construct THROUGH.
+
+        A class (`from m import Outer` then `Outer.Inner()`) or a module
+        (`import m` then `m.Thing()`). A function, a method or a module-level
+        instance is a VALUE, and `value.Name()` is a method call however it
+        arrived in scope.
+        """
+        kind = self.function_registry.get(target)
+        if kind is not None:
+            return kind == cs.NodeLabel.CLASS
+        # Unregistered, so it is a module IFF the registry holds anything under
+        # its qn. A module node itself is not in the function registry, but its
+        # contents are; an imported instance has an empty subtree.
+        #
+        # The label check above must stay FIRST: `find_with_prefix` returns the
+        # subtree INCLUDING the target, so an imported function reports one
+        # descendant (itself) and a prefix-only test would call it a namespace.
+        return bool(self.function_registry.find_with_prefix(target))
+
+    def _resolve_js_prototype_sibling(
+        self,
+        call_name: str,
+        caller_qn: str | None,
+        language: cs.SupportedLanguage | None,
+    ) -> tuple[str, str] | None:
+        # Only a two-part `this.m` call in a JS/TS caller qualifies; the caller's
+        # parent scope (module.Date for Date.prototype.strftime) is where the
+        # prototype siblings were registered. A module-level caller degrades to
+        # the same module-method lookup the CommonJS fallback performs.
+        # A dotless caller_qn has no parent scope: rsplit would return the
+        # caller itself and the lookup would land on the caller's own NESTED
+        # function, which `this.m` never names.
+        if language not in cs.JS_TS_LANGUAGES or not caller_qn:
+            return None
+        if cs.SEPARATOR_DOT not in caller_qn:
+            return None
+        if not call_name.startswith(cs.JS_THIS_CALL_PREFIX):
+            return None
+        method_name = call_name[len(cs.JS_THIS_CALL_PREFIX) :]
+        if not method_name or cs.SEPARATOR_DOT in method_name:
+            return None
+        parent_scope = caller_qn.rsplit(cs.SEPARATOR_DOT, 1)[0]
+        method_qn = f"{parent_scope}{cs.SEPARATOR_DOT}{method_name}"
+        if func_type := self.function_registry.get(method_qn):
+            return func_type, method_qn
+        return None
+
+    def _resolve_enclosing_scope(
+        self,
+        call_name: str,
+        caller_qn: str | None,
+        module_qn: str,
+        language: cs.SupportedLanguage | None = None,
+    ) -> tuple[str, str] | None:
+        # Python LEGB: a bare name defined in the caller's own body or an enclosing
+        # FUNCTION scope (a nested def) shadows module-level and same-named nested
+        # defs in sibling scopes. The module-keyed trie fallback cannot tell two
+        # sibling `traverse` defs apart, so resolve against the caller's scope chain
+        # first. Walk up only through function/method scopes (each ancestor must be
+        # in the registry); a class or the module boundary stops the walk, because
+        # class scope is NOT part of a method's name-lookup chain in Python.
+        if not caller_qn or cs.SEPARATOR_DOT in call_name:
+            return None
+        scope = caller_qn
+        while True:
+            if hit := self._probe_scope(scope, call_name, language):
+                return hit
+            if cs.SEPARATOR_DOT not in scope:
+                return None
+            parent = scope.rsplit(cs.SEPARATOR_DOT, 1)[0]
+            if parent == module_qn or parent not in self.function_registry:
+                return None
+            # A class is in the registry too, so the check above let the walk
+            # step from a method into its class and answer the method's own
+            # parameter `run` with the sibling method `run` (issue #2666).
+            if self._local_stops_at_class(call_name, caller_qn, parent):
+                return None
+            scope = parent
+
+    def _probe_scope(
+        self, scope: str, call_name: str, language: cs.SupportedLanguage | None
+    ) -> tuple[str, str] | None:
+        # One step of the scope-chain walk: the name defined directly in
+        # `scope`, then in its variant-stripped form, then `scope`'s own
+        # body-scoped name.
+        return (
+            self._scope_candidate(scope, call_name, language)
+            or self._dup_variant_scope_candidate(scope, call_name, language)
+            or self._own_body_scoped_name(scope, call_name)
+        )
+
+    def _own_body_scoped_name(
+        self, scope: str, call_name: str
+    ) -> tuple[str, str] | None:
+        # A JS/TS named function expression's name is in scope inside its own
+        # body, the one place a bare call can reach it by that name (issue
+        # #2402). Answered from the caller's scope chain, ahead of the
+        # module-keyed cache, since callers elsewhere must not see it. The
+        # natural qn is what the same-module probe used to return, so the
+        # `@line` variants fan out exactly as they did.
+        if not self.function_registry.is_body_scoped_name(scope):
+            return None
+        natural = qn_markers.natural_qn(scope)
+        if natural.rsplit(cs.SEPARATOR_DOT, 1)[-1] != call_name:
+            return None
+        target = natural if natural in self.function_registry else scope
+        return self.function_registry[target], target
+
+    def _name_hidden_in_body(self, qualified_name: str) -> bool:
+        # A JS/TS function expression's own name, which only its body can call
+        # (issue #2402). A same-named definition beside it (an `@line`
+        # variant) keeps the name bound, so the variant group stays nameable
+        # and fans out as before.
+        registry = self.function_registry
+        if not registry.is_body_scoped_name(qualified_name):
+            return False
+        return all(
+            registry.is_body_scoped_name(variant)
+            for variant in registry.variants(qn_markers.natural_qn(qualified_name))
+        )
+
+    def _local_stops_at_class(self, call_name: str, caller_qn: str, scope: str) -> bool:
+        return (
+            call_name in self.python_local_names.get(caller_qn, frozenset())
+            and self.function_registry[scope] == cs.NodeLabel.CLASS.value
+        )
+
+    def _scope_candidate(
+        self, scope: str, call_name: str, language: cs.SupportedLanguage | None
+    ) -> tuple[str, str] | None:
+        candidate = f"{scope}{cs.SEPARATOR_DOT}{call_name}"
+        if (
+            candidate in self.function_registry
+            and self._bare_call_allowed(language, candidate)
+            and not self._name_hidden_in_body(candidate)
+        ):
+            return self.function_registry[candidate], candidate
+        return None
+
+    def _dup_variant_scope_candidate(
+        self, scope: str, call_name: str, language: cs.SupportedLanguage | None
+    ) -> tuple[str, str] | None:
+        # A duplicate-variant caller (a def rebinding a name an earlier def
+        # already holds registers as `command@168`) owns nested defs the
+        # def pass registers under the NATURAL qn (`command.decorator`);
+        # probe the variant-stripped scope too, or the call falls to the
+        # module trie and mis-binds to a sibling's same-named nested.
+        # The stripped form, not the presence of the marker character: a C#
+        # verbatim identifier (`@event`) carries the character without a
+        # marker, and re-probing the identical scope is wasted work that can
+        # only re-bind what the caller already tried (issue #2017).
+        natural_scope = qn_markers.natural_qn(scope)
+        if natural_scope == scope:
+            return None
+        return self._scope_candidate(natural_scope, call_name, language)
+
+    def _bare_call_allowed(
+        self, language: cs.SupportedLanguage | None, qn: str
+    ) -> bool:
+        # A bare Rust path NEVER names a method: inherent methods are
+        # reachable only via self./Self::/Type:: (rustc-verified; the bare
+        # spelling calls the module item, issue #1011). Other languages
+        # keep their scope-chain semantics, except that no bare name
+        # reaches a JS/TS object literal's function value (issue #2435).
+        if self._only_object_members(qn):
+            return False
+        return (
+            language != cs.SupportedLanguage.RUST
+            or self.function_registry[qn] != cs.NodeLabel.METHOD.value
+        )
+
+    def _only_object_members(self, qualified_name: str) -> bool:
+        # A JS/TS object literal's function value is reached through its
+        # object (`options.retry.delay()`), never by its key alone, although
+        # its qn reads like a name the enclosing scope declares (issue
+        # #2435). A real binding of the same name in its `@line` group keeps
+        # the group nameable; `lexical_call_targets` then drops the members
+        # from the call's fan-out.
+        registry = self.function_registry
+        if not registry.is_object_member(qualified_name):
+            return False
+        return all(
+            registry.is_object_member(variant)
+            for variant in registry.variants(qn_markers.natural_qn(qualified_name))
+        )
+
+    def lexical_call_targets(
+        self,
+        call_name: str,
+        module_qn: str,
+        targets: list[str],
+        caller_qn: str | None = None,
+    ) -> list[str]:
+        """The members of a bare call's `@line` group its name can reach.
+
+        `function delay` and `{delay: () => 0}` in one file share a group, and
+        the bare name means the declaration, not the object's value (issue
+        #2435). A name the module imports is left whole: the import may bind
+        a module's exported object member, which it does reach by name.
+        Inside a JS/TS named function expression's own body, its name is that
+        expression and shadows every same-named declaration (issue #2402).
+        """
+        if len(targets) < 2 or cs.SEPARATOR_DOT in call_name:
+            return targets
+        registry = self.function_registry
+        if self._calls_own_body_name(call_name, caller_qn, targets):
+            # Same-named function expressions keep their spread (#2403).
+            return [qn for qn in targets if registry.is_body_scoped_name(qn)]
+        if call_name in self.import_processor.import_mapping.get(module_qn, {}):
+            return targets
+        bound = [qn for qn in targets if not registry.is_object_member(qn)]
+        return bound or targets
+
+    def _calls_own_body_name(
+        self, call_name: str, caller_qn: str | None, targets: list[str]
+    ) -> bool:
+        # The caller is a body-scoped function expression in the call's
+        # `@line` group, calling the group's name: its own name, which inside
+        # its body binds to it alone, whatever else shares the group.
+        if caller_qn is None or caller_qn not in targets:
+            return False
+        if not self.function_registry.is_body_scoped_name(caller_qn):
+            return False
+        natural = qn_markers.natural_qn(caller_qn)
+        return natural.rsplit(cs.SEPARATOR_DOT, 1)[-1] == call_name
+
+    def _protocol_impl_map(self) -> dict[str, str]:
+        # A Protocol stub never runs; the concrete implementer does. Map each
+        # XxxProtocol to a unique non-Protocol class named Xxx (the suffix
+        # convention disambiguates the real impl from test mocks or other
+        # structural conformers, which structural matching alone cannot).
+        if self._protocol_impl_cache is not None:
+            return self._protocol_impl_cache
+        sep = cs.SEPARATOR_DOT
+        protocols: set[str] = set()
+        classes_by_simple: dict[str, list[str]] = defaultdict(list)
+        for qn, bases in self.class_inheritance.items():
+            classes_by_simple[qn.rsplit(sep, 1)[-1]].append(qn)
+            if any(base.rsplit(sep, 1)[-1] == cs.PY_PROTOCOL for base in bases):
+                protocols.add(qn)
+        impl: dict[str, str] = {}
+        for protocol_qn in protocols:
+            simple = protocol_qn.rsplit(sep, 1)[-1]
+            if simple == cs.PY_PROTOCOL or not simple.endswith(cs.PY_PROTOCOL):
+                continue
+            base_name = simple[: -len(cs.PY_PROTOCOL)]
+            candidates = [
+                qn for qn in classes_by_simple.get(base_name, []) if qn not in protocols
+            ]
+            if len(candidates) == 1:
+                impl[protocol_qn] = candidates[0]
+        self._protocol_impl_cache = impl
+        return impl
+
+    def _protocol_classes(self) -> set[str]:
+        if self._protocol_classes_cache is None:
+            sep = cs.SEPARATOR_DOT
+            self._protocol_classes_cache = {
+                qn
+                for qn, bases in self.class_inheritance.items()
+                if any(base.rsplit(sep, 1)[-1] == cs.PY_PROTOCOL for base in bases)
+            }
+        return self._protocol_classes_cache
+
+    def protocol_dispatch_targets(self, callee_qn: str) -> set[tuple[str, str]]:
+        # A call resolved to a Protocol stub method (P.M) never runs the stub: the
+        # runtime receiver is some conformer, so the sound call graph emits an edge
+        # to M on every class that implements P. Gating on the resolved target
+        # being a Protocol method keeps this from firing on ordinary calls.
+        class_qn, sep, method_name = callee_qn.rpartition(cs.SEPARATOR_DOT)
+        if not sep or class_qn not in self._protocol_classes():
+            return set()
+        protocols = self._protocol_classes()
+        # The receiver is a class that implements the Protocol: one defining
+        # every method it declares, or its XxxProtocol -> Xxx implementer. A
+        # class that merely shares this method's name (an LRU cache's `get`
+        # beside a client Protocol's `get`/`set`) is not one (issue #2931).
+        conformers = set(self._protocol_structural_implementers(class_qn))
+        if named_impl := self._protocol_impl_map().get(class_qn):
+            conformers.add(named_impl)
+        methods = {
+            resolved[1]
+            for conformer in conformers
+            if (resolved := self._try_resolve_method(conformer, method_name))
+        }
+        # The definers of a same-named method, read from the registry, which
+        # an incremental run holds whole: the class hierarchy those scans
+        # walk holds only the re-parsed files' classes then (issue #532).
+        required = self._protocol_method_names(class_qn)
+        definers = {
+            definer: qn
+            for qn in self.function_registry.find_ending_with(method_name)
+            if (parts := qn.rpartition(cs.SEPARATOR_DOT))[1]
+            and parts[2] == method_name
+            and (definer := parts[0]) not in protocols
+        }
+        # The XxxProtocol -> Xxx convention, held to the uniqueness
+        # `_protocol_impl_map` asks of it.
+        simple = class_qn.rsplit(cs.SEPARATOR_DOT, 1)[-1]
+        named = [
+            definer
+            for definer in definers
+            if simple != cs.PY_PROTOCOL
+            and simple.endswith(cs.PY_PROTOCOL)
+            and definer.rsplit(cs.SEPARATOR_DOT, 1)[-1]
+            == simple.removesuffix(cs.PY_PROTOCOL)
+        ]
+        for definer, qn in definers.items():
+            if (len(named) == 1 and definer == named[0]) or all(
+                self._try_resolve_method(definer, m) for m in required
+            ):
+                methods.add(qn)
+        targets: set[tuple[str, str]] = set()
+        # The same reachability bound the simple-name fallback uses applies:
+        # nothing written in a language the Protocol's own cannot call into
+        # conforms to it (issue #945).
+        for qn in self._nameable_candidates(sorted(methods), class_qn):
+            definer, dot, name = qn.rpartition(cs.SEPARATOR_DOT)
+            if dot and name == method_name and definer not in protocols:
+                targets.add((self.function_registry[qn], qn))
+        return targets
+
+    def self_dispatch_targets(
+        self, class_context: str, method_name: str
+    ) -> set[tuple[str, str]]:
+        # self.M()/cls.M() statically targets the enclosing class's own or inherited
+        # M, and dynamically dispatches to any concrete subclass override of M. Anchor
+        # on the ENCLOSING class (not the resolved callee, which the trie may pick as
+        # an arbitrary sibling override when M is abstract with several overrides) and
+        # emit an edge to the enclosing-class method AND every concrete override, so an
+        # override or an abstract base reached only through a self-call is not reported
+        # dead.
+        if not class_context or not method_name:
+            return set()
+        targets: set[tuple[str, str]] = set()
+        # Skip abstract targets: an @abstractmethod stub never runs (the concrete
+        # override does), so it must not be a call target; a concrete sibling/impl
+        # wins. Abstract methods only "reached" polymorphically are handled as
+        # dead-code roots, not by a spurious CALLS edge.
+        if (base := self._try_resolve_method(class_context, method_name)) and (
+            not self.function_registry.is_abstract(base[1])
+        ):
+            targets.add(base)
+        for subclass_qn in self._concrete_subclasses(class_context):
+            override_qn = f"{subclass_qn}{cs.SEPARATOR_DOT}{method_name}"
+            if override_qn in self.function_registry and not (
+                self.function_registry.is_abstract(override_qn)
+            ):
+                targets.add((self.function_registry[override_qn], override_qn))
+        # `self.Inner()` where `Inner` is a NESTED CLASS is a construction, not a
+        # virtual method call: the name resolves to `Outer.Inner`, which is a
+        # Class node, and CALLS may only target a Function/Method/Enum/Type. The
+        # construction already reaches the graph as INSTANTIATES plus a CALLS to
+        # `__init__`, so a class here is a duplicate the schema rejects outright
+        # (issue #1650).
+        return {target for target in targets if target[0] != cs.NodeLabel.CLASS.value}
+
+    def js_member_twin_targets(self, callee_qn: str) -> set[tuple[str, str]]:
+        # `View.prototype.lookup = function lookup(...)` registers TWO nodes for
+        # one method: the prototype path's `View.lookup` and the fn-expr's
+        # own-name module-flat `view.lookup`. A call binds one twin and the
+        # other reports dead. Return the same-name twin(s) whose parent chain
+        # extends (or is extended by) the callee's parent, i.e. the same
+        # module's flat/member pair, so the caller can edge both (the
+        # duplicate-QN keep-both design). Never crosses modules.
+        parent_qn, sep, leaf = callee_qn.rpartition(cs.SEPARATOR_DOT)
+        if not sep:
+            return set()
+        twins: set[tuple[str, str]] = set()
+        for qn in self.function_registry.find_ending_with(leaf):
+            if qn == callee_qn:
+                continue
+            other_parent, d, other_leaf = qn.rpartition(cs.SEPARATOR_DOT)
+            if not d or other_leaf != leaf:
+                continue
+            if not (
+                other_parent.startswith(f"{parent_qn}{cs.SEPARATOR_DOT}")
+                or parent_qn.startswith(f"{other_parent}{cs.SEPARATOR_DOT}")
+            ):
+                continue
+            label = self.function_registry.get(qn)
+            if label in (cs.NodeLabel.FUNCTION, cs.NodeLabel.METHOD):
+                twins.add((str(label), qn))
+        return twins
+
+    def go_package_sibling_targets(self, callee_qn: str) -> set[tuple[str, str]]:
+        # Go package-level functions are package-scoped, but cgr keys each file as
+        # its own module (`pkgdir.file.name`). Two same-package functions with the
+        # same name can ONLY be mutually-exclusive build-tag variants (gin's
+        # `validate` under `//go:build !nomsgpack` vs `nomsgpack`); the compiler
+        # rejects duplicate top-level identifiers in a package otherwise. A bare call
+        # resolves to just one file's copy, orphaning the other build's copy; return
+        # every same-package same-name package-level sibling so no build variant is
+        # reported dead. Revive-only and precise: a same-name function in a DIFFERENT
+        # package (different directory) is a distinct function, never a variant, so
+        # the package-dir equality guard excludes it.
+        file_module_qn, sep, name = callee_qn.rpartition(cs.SEPARATOR_DOT)
+        if not sep:
+            return set()
+        pkg_dir, dsep, _file = file_module_qn.rpartition(cs.SEPARATOR_DOT)
+        if not dsep:
+            return set()
+        clause = self.go_package_names.get(file_module_qn)
+        targets: set[tuple[str, str]] = set()
+        for qn in self.function_registry.find_ending_with(name):
+            label = self.function_registry.get(qn)
+            if qn == callee_qn or label != cs.NodeLabel.FUNCTION:
+                continue
+            other_module, d, other_name = qn.rpartition(cs.SEPARATOR_DOT)
+            if not d or other_name != name or other_module == file_module_qn:
+                continue
+            other_pkg, d2, other_file = other_module.rpartition(cs.SEPARATOR_DOT)
+            # Same directory is necessary but not sufficient for same-package: Go
+            # permits an external test package (`package p_test`) in a `_test.go` file
+            # sharing the directory. Production code can never call a function defined
+            # in a `_test.go` file, so exclude such siblings; else a genuinely
+            # test-only dead function would be masked as live. A file under
+            # another `package` clause (a `//go:build ignore` generator's
+            # `package main`) is another package too, never a build variant,
+            # and its edge would carry the callee's `exact` label (#2571).
+            # A module qn drops its file's extension, so a `gen.py` or
+            # `preview.js` beside the package's `.go` files looked like another
+            # build variant and `main` called their `render` too (#3026). Only
+            # Go code is in a Go package.
+            other_clause = self.go_package_names.get(other_module)
+            if (
+                d2
+                and other_pkg == pkg_dir
+                and not other_file.endswith(cs.GO_TEST_FILE_SUFFIX)
+                and (clause is None or other_clause in (None, clause))
+                and self._definition_language(qn, other_module)
+                == cs.SupportedLanguage.GO
+            ):
+                targets.add((label, qn))
+        return targets
+
+    def _go_declaring_path(self, declaration_qn: str) -> PurePath | None:
+        # The file declaring Go `declaration_qn`, which cgr files directly
+        # under that file's module (`pkg.file.Name`). An incremental run
+        # parses changed files only, so an unchanged file is known by the
+        # repo-relative path its definition was rehydrated with.
+        modules = self.type_inference.module_qn_to_file_path
+        declaring_qn = declaration_qn.rpartition(cs.SEPARATOR_DOT)[0]
+        if (path := modules.get(declaring_qn)) is not None:
+            return path
+        if rehydrated := self.rehydrated_definition_paths.get(declaration_qn):
+            return self.type_inference.repo_path / rehydrated
+        return None
+
+    def _go_declaring_dir(self, declaration_qn: str) -> PurePath | None:
+        path = self._go_declaring_path(declaration_qn)
+        return path.parent if path is not None else None
+
+    def go_declaration_is_visible(self, declaration_qn: str, module_qn: str) -> bool:
+        """Whether Go `declaration_qn` is in scope for `module_qn`.
+
+        A directory is not a package: `package m_test` files sit beside
+        `package m` files and are a DIFFERENT package, and any `_test.go` is
+        compiled only under `go test`. Without this filter a production
+        `Error{}` in a third file of the package saw both `types.Error` and a
+        same-named `Error` from `m_test.go`, and the ambiguity rule emitted
+        nothing (CodeRabbit, #1747). A test file is visible only to a test
+        requester of the same package, and within the requester's own
+        directory the `package` clauses must agree. A lookup through an
+        import is into ANOTHER package, whose clause the requester does not
+        share, so only the test rule applies there.
+
+        An incremental run parses changed files only, so an unchanged
+        declaring file is known by the path its definition was rehydrated
+        with; its clause is unknown then and does not exclude it.
+        """
+        declaring_path = self._go_declaring_path(declaration_qn)
+        if declaring_path is None:
+            return True
+        declaring_qn = declaration_qn.rpartition(cs.SEPARATOR_DOT)[0]
+        requester = self.type_inference.module_qn_to_file_path.get(module_qn)
+        requester_is_test = requester is not None and requester.stem.endswith(
+            cs.GO_TEST_FILE_SUFFIX
+        )
+        # The package is the directory, whatever dots the file stems hold
+        # (#2616 review); path-less registrations (mock harnesses) group by qn.
+        own_package = (
+            declaring_path.parent == requester.parent
+            if requester is not None
+            else declaring_qn.rpartition(cs.SEPARATOR_DOT)[0]
+            == module_qn.rpartition(cs.SEPARATOR_DOT)[0]
+        )
+        if declaring_path.stem.endswith(cs.GO_TEST_FILE_SUFFIX) and not (
+            requester_is_test and own_package
+        ):
+            return False
+        if not own_package:
+            return True
+        requester_package = self.go_package_names.get(module_qn)
+        declaring_package = self.go_package_names.get(declaring_qn)
+        return (
+            requester_package is None
+            or declaring_package is None
+            or declaring_package == requester_package
+        )
+
+    def _go_package_scope(
+        self, name: str, module_qn: str, labels: frozenset[NodeType]
+    ) -> list[str]:
+        # The `labels` definitions an unqualified `name` in Go file `module_qn`
+        # can bind through its package block: declared in any file of the same
+        # directory and `package` clause, `_test.go` files for test callers
+        # only. Every parsed Go file has its clause recorded, so a caller
+        # without one is another language and gets no answer here.
+        if module_qn not in self.go_package_names:
+            return []
+        requester = self.type_inference.module_qn_to_file_path.get(module_qn)
+        if requester is None:
+            return []
+        package_dir = requester.parent
+        prefix = self._go_package_prefix(module_qn, package_dir)
+        return [
+            qn
+            for qn in go_utils.package_level_definitions(
+                self.function_registry,
+                name,
+                labels,
+                lambda qn: (
+                    qn.startswith(prefix) and self._go_declaring_dir(qn) == package_dir
+                ),
+            )
+            # The directory alone would let `pkg/helper.py`'s `helper` pass
+            # for a Go function of `pkg`.
+            if self._definition_language(qn, self._parent_qn(qn))
+            == cs.SupportedLanguage.GO
+            and self.go_declaration_is_visible(qn, module_qn)
+        ]
+
+    def _go_package_prefix(self, module_qn: str, package_dir: PurePath) -> str:
+        # `project.dir.`, the qn prefix `base_module_qn` gives every file of
+        # `package_dir`: a string test that drops the other packages' same
+        # names before any path lookup. Empty, dropping nothing, when the
+        # caller's own qn does not carry it.
+        try:
+            parts = package_dir.relative_to(self.type_inference.repo_path).parts
+        except ValueError:
+            return ""
+        project = self.import_processor.project_name
+        prefix = cs.SEPARATOR_DOT.join((project, *parts, ""))
+        return prefix if module_qn.startswith(prefix) else ""
+
+    def _try_resolve_go_same_package(
+        self, call_name: str, module_qn: str
+    ) -> tuple[str, str] | None:
+        # `helper()` in `a.go` naming `func helper()` in `b.go` of the same
+        # package is as certain as a same-file call: Go shares one namespace
+        # across the package's files and rejects a duplicate (#2571). Two
+        # candidates are build variants (`h_linux.go`, `h_windows.go`) only
+        # when no build compiles them together: the caller then binds the
+        # first its builds may hold, labelled by the builds it reaches
+        # (`_go_build_targets`), and its sibling fan-out reaches the rest.
+        # The name-only fallback took another package's same-named function
+        # there, `p_test`'s even, and no variant (#3360 review).
+        candidates = self._go_build_variant_candidates(
+            self._go_package_scope(call_name, module_qn, _GO_PACKAGE_FUNCTION_TYPES),
+            module_qn,
+        )
+        if not candidates:
+            return None
+        qn = candidates[0]
+        logger.debug(ls.CALL_GO_SAME_PACKAGE, call_name=call_name, qn=qn)
+        return self.function_registry[qn], qn
+
+    def _go_build_variant_candidates(
+        self, candidates: list[str], module_qn: str
+    ) -> list[str]:
+        # The one candidate, or, of several, those a build compiling the
+        # caller may hold when no build compiles two of them together; []
+        # for any other several.
+        if len(candidates) <= 1 or self.go_builds is None:
+            return candidates
+        caller = self.go_caller_rel(module_qn)
+        files = {qn: self.go_declaring_rel(qn) for qn in candidates}
+        reachable = sorted(
+            qn for qn in candidates if not self.go_builds.apart((caller, files[qn]))
+        )
+        apart = all(
+            self.go_builds.apart((files[first], files[second]))
+            for index, first in enumerate(reachable)
+            for second in reachable[index + 1 :]
+        )
+        return reachable if apart else []
+
+    def _go_package_type(self, name: str, module_qn: str) -> str | None:
+        # A bare Go type name (`var m Mux`, `q *Mux`, the `*Mux` a same-package
+        # `NewRouter()` returns) is the caller's package's type. The repo-wide
+        # search by simple name behind this took whichever same-named type
+        # sorted first, often another package's, and labelled the method call
+        # on it exact (#2571).
+        if cs.SEPARATOR_DOT in name:
+            return None
+        candidates = self._go_package_scope(
+            name, module_qn, go_utils.TYPE_DECLARATION_TYPES
+        )
+        if len(candidates) > 1:
+            # A function-local type is filed directly under its module too,
+            # and shadows the package-level one in its own file. Directly:
+            # a sibling's stem can extend this file's (`helper.gen.go` beside
+            # `helper.go`), so a qn prefix is not enough.
+            own = [
+                qn
+                for qn in candidates
+                if qn.rpartition(cs.SEPARATOR_DOT)[0] == module_qn
+            ]
+            candidates = own if own else candidates
+        # An interface each build declares again is the first of its
+        # variants; a call through it binds per build at emission.
+        found = go_utils.one_declaration(candidates, self.go_declaration_variants)
+        # The Go type walker reduces a declared `*aaa.Mux` to `Mux` as well,
+        # so a name that a package this file imports also declares may be
+        # that one; it keeps the lookup it had before.
+        if found is None or self._go_imports_declare_type(name, module_qn):
+            return None
+        return found
+
+    def _go_imports_declare_type(self, name: str, module_qn: str) -> bool:
+        imported = set(
+            (self.import_processor.import_mapping.get(module_qn) or {}).values()
+        )
+        return any(
+            self.function_registry.get(qn) in go_utils.TYPE_DECLARATION_TYPES
+            and qn.rpartition(cs.SEPARATOR_DOT)[0].rpartition(cs.SEPARATOR_DOT)[0]
+            in imported
+            for qn in self.function_registry.find_ending_with(name)
+        )
+
+    def java_constructor_targets(self, class_qn: str) -> set[tuple[str, str]]:
+        # A Java constructor is registered as a method directly under its class whose
+        # simple name equals the class's simple name (`Foo.Foo(int)`). `new Foo(...)`
+        # resolves to the CLASS, so redirect a CALLS edge to each declared constructor
+        # (all overloads); argument-type overload selection is not attempted, which is
+        # unnecessary for reachability and never fabricates a call to a
+        # non-constructor. Only constructors DIRECTLY on the class match (a nested
+        # class's constructor has an extra qn segment and is excluded).
+        # A duplicate-suffixed class (`Box@8` for `class Box<T>` beside `class
+        # Box`) declares its constructor under its natural name, so the
+        # marker is not part of the name to match (issue #2007), and nor is a
+        # generic twin's CLR arity (`PB`1` declares `PB(...)`, issue #2579).
+        simple = qn_markers.strip_arity_marker(
+            qn_markers.strip_dup_marker(class_qn.rsplit(cs.SEPARATOR_DOT, 1)[-1])
+        )
+        targets: set[tuple[str, str]] = set()
+        for qn, node_type in self.function_registry.find_with_prefix(class_qn):
+            head = qn.split(cs.CHAR_PAREN_OPEN, 1)[0]
+            parent, dot, mname = head.rpartition(cs.SEPARATOR_DOT)
+            if dot and parent == class_qn and mname == simple:
+                targets.add((node_type, qn))
+        return targets
+
+    def cpp_destructor_targets(self, class_qn: str) -> set[tuple[str, str]]:
+        # Constructing a C++ object guarantees `~X` runs at end of
+        # lifetime, but no call node ever names it, so construction sites
+        # redirect a CALLS edge to the class's destructor exactly as they
+        # do to its constructors (same direct-member gate as
+        # java_constructor_targets: a nested class's dtor has an extra qn
+        # segment and is excluded).
+        # Destroying an object runs its own dtor AND every ancestor dtor
+        # unconditionally (issue #892), so the whole INHERITS closure's
+        # declared dtors are targets. The full chain matters even when an
+        # intermediate dtor is declared: its definition may live outside
+        # the parsed source, in which case no caller pass ever emits its
+        # own base-dtor edge (Greptile, PR #894). A destructor cannot be
+        # overloaded, so each qn is one direct registry lookup (PR #799).
+        targets: set[tuple[str, str]] = set()
+        seen: set[str] = set()
+        stack = [class_qn]
+        while stack:
+            current = stack.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            simple = qn_markers.strip_dup_marker(
+                current.rsplit(cs.SEPARATOR_DOT, 1)[-1]
+            )
+            dtor_qn = f"{current}{cs.SEPARATOR_DOT}{cs.CPP_DESTRUCTOR_PREFIX}{simple}"
+            dtor_type = self.function_registry.get(dtor_qn)
+            if dtor_type is not None:
+                targets.add((dtor_type, dtor_qn))
+            stack.extend(self.class_inheritance.get(current, ()))
+        return targets
+
+    def cpp_braced_return_class(self, caller_qn: str, module_qn: str) -> str | None:
+        # The class constructed by a `return {...};` inside caller_qn: the
+        # caller's recorded return type, resolved to a registered class
+        # (None for primitives/auto/unrecorded).
+        return_type = self.type_inference.method_return_types.get(caller_qn)
+        if not return_type:
+            return None
+        return self._resolve_type_to_class_qn(return_type, module_qn)
+
+    def cpp_dispatch_targets(
+        self,
+        call_name: str,
+        local_var_types: dict[str, str] | None,
+        template_params: frozenset[str],
+    ) -> set[tuple[str, str]]:
+        # A C++ call through a template-parameter receiver (`sax->start_object()`
+        # inside a `template<typename SAX>` fn) has no concrete receiver type, so
+        # precise resolution fails and the trie binds one arbitrary same-named method
+        # (or the external-type guard drops the edge), leaving every OTHER structural
+        # interface implementer reported dead (nlohmann/json's json_sax_* visitors).
+        # When the receiver does NOT resolve to a first-party class, fan the call out
+        # to the method on EVERY class that defines it. A receiver typed to a concrete
+        # first-party class dispatches precisely and is skipped, so this only adds
+        # edges the precise path could not place. Full-fallback by design: a
+        # template-parameter or unresolved receiver is indistinguishable from an
+        # external one by name, so std::-typed receivers also fan out.
+        parts = call_name.split(cs.SEPARATOR_DOT)
+        if len(parts) != 2:
+            return set()
+        object_name, method_name = parts
+        # Fan out only when the receiver is typed to a template PARAMETER (`SAX* sax`
+        # in a `template<typename SAX>` fn), whose concrete type is the argument at
+        # each instantiation, unknowable statically, so every implementer is a
+        # possible target. A concrete type is left to the precise path (a first-party
+        # class dispatches exactly; an external `std::string` receiver must NOT be
+        # rebound to an unrelated first-party method). An untyped receiver is left to
+        # the single-best trie fallback; fanning every untyped call out to all
+        # same-named methods would flood the graph with false edges.
+        if (local_var_types or {}).get(object_name) not in template_params:
+            return set()
+        targets: set[tuple[str, str]] = set()
+        for qn in self.function_registry.find_ending_with(method_name):
+            _, dot, name = qn.rpartition(cs.SEPARATOR_DOT)
+            if (
+                dot
+                and name == method_name
+                and self.function_registry[qn] == cs.NodeLabel.METHOD
+            ):
+                targets.add((self.function_registry[qn], qn))
+        return targets
+
+    def _interface_impl_map(self) -> dict[str, str]:
+        # Map an interface to its SOLE first-party implementer. A call typed to an
+        # interface resolves to the interface's own method declaration (the static
+        # callee); when the interface has exactly one implementer the concrete
+        # method is the one that runs, so ALSO edge it (call-graph accuracy).
+        # >1 implementer is ambiguous -> not mapped -> the call stays on the
+        # interface method alone (no precision risk, recall preserved).
+        if self._interface_impl_cache is None:
+            implementers_of: dict[str, set[str]] = {}
+            for source in (
+                self.interface_implementers,
+                self.rehydrated_interface_implementers,
+            ):
+                for interface_qn, implementers in source.items():
+                    implementers_of.setdefault(interface_qn, set()).update(implementers)
+            self._interface_impl_cache = {
+                interface_qn: next(iter(implementers))
+                for interface_qn, implementers in implementers_of.items()
+                if len(implementers) == 1
+            }
+        return self._interface_impl_cache
+
+    def interface_sole_impl_targets(self, callee_qn: str) -> set[tuple[str, str]]:
+        # A callee that IS an interface/trait method (the receiver was typed to
+        # the interface -- a concrete receiver dispatches to the impl directly)
+        # with exactly one implementer also runs the concrete method, so return
+        # it for an additional CALLS edge. REPLACING the interface edge instead
+        # (the pre-#665-era redirect) orphaned the interface stub: OVERRIDES
+        # expansion only walks interface -> impl, so the stub's declaration
+        # (gson's FieldNamingStrategy.translateName) reported dead.
+        class_qn, sep, method_name = callee_qn.rpartition(cs.SEPARATOR_DOT)
+        if not sep:
+            return set()
+        impl_qn = self._interface_impl_map().get(class_qn)
+        if impl_qn is None:
+            return set()
+        if result := self._try_resolve_method(impl_qn, method_name):
+            return {result}
+        return set()
+
+    def interface_dispatch_targets(
+        self, callee_qn: str
+    ) -> dict[tuple[str, str], dict[str, bool]]:
+        # A Go call through an interface runs whichever implementation the
+        # value holds, and the types implement it implicitly, so a sole
+        # implementer is no likelier than one of many: every implementer's
+        # method is a target (issue #2483). Each maps to the implementers it
+        # runs for, each with whether only a guess ties it to the interface
+        # (a pair matched by name and arity), which its edge then says rather
+        # than borrowing the call's own label.
+        class_qn, sep, method_name = callee_qn.rpartition(cs.SEPARATOR_DOT)
+        if not sep or self.function_registry.get(class_qn) != NodeType.INTERFACE:
+            return {}
+        targets: dict[tuple[str, str], dict[str, bool]] = {}
+        for implementer in self.interface_implementers.get(class_qn, ()):
+            guessed = (class_qn, implementer) in self.guessed_implementations
+            found = [
+                (cs.NodeLabel.METHOD.value, qn)
+                for qn in self.go_variant_methods.get(implementer, {}).get(
+                    method_name, ()
+                )
+            ]
+            if result := self._try_resolve_method(implementer, method_name):
+                found.append(result)
+            for target in found:
+                targets.setdefault(target, {})[implementer] = guessed
+        return targets
+
+    def go_declaration_satisfies(
+        self, method_qn: str, interface_method_qn: str
+    ) -> bool:
+        # A build that declares the method again declares its own copy
+        # (`T.M@5`), and one whose signature cannot be the interface
+        # method's never runs for a call through the interface: in that
+        # build the type is no implementer.
+        have = self.go_methods.get(method_qn)
+        want = self.go_methods.get(interface_method_qn)
+        return (
+            have is None
+            or want is None
+            or go_ifaces.compatible(
+                go_ifaces.in_package(have, self.go_builtin_shadows),
+                go_ifaces.in_package(want, self.go_builtin_shadows),
+            )
+        )
+
+    def go_declaration_read(self, method_qn: str) -> bool:
+        spec = self.go_methods.get(method_qn)
+        return spec is None or spec.file in self.go_checked_files
+
+    def _with_go_variants(self, bases: Iterable[str]) -> list[str]:
+        # A Go interface embedding a name each build declares again embeds
+        # the one its build holds, so a method only one build's declares is
+        # still reached through it (#3360 review).
+        found: list[str] = []
+        for base in bases:
+            found.append(base)
+            found.extend(
+                variant
+                for variant in self.go_declaration_variants.get(base, ())
+                if variant != base
+            )
+        return found
+
+    def go_variant_callees(
+        self, callee_qn: str, module_qn: str
+    ) -> list[tuple[str, bool]] | None:
+        """For a Go call bound to `callee_qn`, a method of an interface each
+        build declares again, the method of every declaration a build
+        compiling the caller's file may hold, each with whether every such
+        build holds it. None when the interface has no build variants.
+
+        `J` embedding `p.I` reached `i_linux.go`'s `M` for a caller every
+        build compiles: an exact edge true on Linux alone, and Windows'
+        `M` never reached (#3360 review)."""
+        owner, dot, name = callee_qn.rpartition(cs.SEPARATOR_DOT)
+        group = self.go_declaration_variants.get(owner)
+        if not dot or not group or self.go_builds is None:
+            return None
+        caller = self.go_caller_rel(module_qn)
+        reached = [
+            (method_qn, file)
+            for variant in group
+            if (method_qn := f"{variant}{cs.SEPARATOR_DOT}{name}")
+            in self.function_registry
+            and self.go_builds.together(
+                (caller, file := self.go_declaring_rel(variant))
+            )
+        ]
+        exact = len(reached) == 1 and self.go_builds.covered(caller, [reached[0][1]])
+        return [(method_qn, exact) for method_qn, _ in reached]
+
+    def go_reaches_everywhere(
+        self, module_qn: str, declarations: Iterable[str]
+    ) -> bool:
+        """Whether every build compiling Go file `module_qn` compiles every
+        one of `declarations`: an edge to one only some of them hold is no
+        exact edge."""
+        if self.go_builds is None:
+            return True
+        return self.go_builds.everywhere(
+            self.go_caller_rel(module_qn),
+            [self.go_declaring_rel(qn) for qn in declarations],
+        )
+
+    def go_dispatch_builds(
+        self,
+        module_qn: str,
+        interface_qn: str,
+        implementer: str,
+        declaration: str,
+    ) -> tuple[bool, bool]:
+        """Whether `declaration` runs for `implementer` through a call through
+        `interface_qn` from Go file `module_qn` in some build compiling the
+        caller, and whether in every one."""
+        if self.go_builds is None:
+            return True, True
+        caller = self.go_builds.constraint(self.go_caller_rel(module_qn))
+        runs = all_of(
+            (
+                self.go_pair_builds.get((interface_qn, implementer), ALWAYS),
+                self.go_builds.constraint(self.go_declaring_rel(declaration)),
+            )
+        )
+        return possible((caller, runs)), holds_wherever(caller, runs)
+
+    def go_apart_from_caller(self, module_qn: str, declaration: str) -> bool:
+        """Whether no build compiles Go file `module_qn` with `declaration`:
+        its call never reaches that one."""
+        return self.go_builds is not None and self.go_builds.apart(
+            (self.go_caller_rel(module_qn), self.go_declaring_rel(declaration))
+        )
+
+    def go_caller_rel(self, module_qn: str) -> str:
+        return go_utils.rel_file(
+            self.type_inference.module_qn_to_file_path.get(module_qn),
+            self.type_inference.repo_path,
+        )
+
+    def go_declaring_rel(self, qn: str) -> str:
+        # The repo-relative file declaring Go method or package-level `qn`.
+        if (spec := self.go_methods.get(qn)) is not None:
+            return spec.file
+        path = self._go_declaring_path(qn)
+        return (
+            go_utils.rel_file(Path(path), self.type_inference.repo_path) if path else ""
+        )
+
+    def _redirect_protocol_method(
+        self, result: tuple[str, str] | None
+    ) -> tuple[str, str] | None:
+        # Only Python Protocol stubs REPLACE the resolved target: a Protocol
+        # method body never runs (it is `...`), so the concrete method is the
+        # sole real callee. An interface/trait method is a live declaration the
+        # call depends on, so its sole-impl companion edge is ADDITIVE
+        # (interface_sole_impl_targets), never a replacement.
+        if result is None:
+            return result
+        class_qn, sep, method_name = result[1].rpartition(cs.SEPARATOR_DOT)
+        if not sep:
+            return result
+        impl_qn = self._protocol_impl_map().get(class_qn)
+        if impl_qn is None:
+            return result
+        redirected = f"{impl_qn}{cs.SEPARATOR_DOT}{method_name}"
+        if redirected in self.function_registry:
+            return self.function_registry[redirected], redirected
+        return result
+
+    def _resolve_function_call(
+        self,
+        call_name: str,
+        module_qn: str,
+        local_var_types: dict[str, str] | None = None,
+        class_context: str | None = None,
+        caller_qn: str | None = None,
+        language: cs.SupportedLanguage | None = None,
+        call_point: int | None = None,
+        constructing: bool = False,
+    ) -> tuple[str, str] | None:
+        call = _CallSite(
+            call_name,
+            module_qn,
+            self._rust_scoped_local_types(
+                local_var_types, module_qn, caller_qn, language
+            ),
+            class_context,
+            caller_qn,
+            language,
+            call_point,
+            constructing,
+        )
+        handled, result = self._resolve_caller_scoped_stages(call)
+        if handled:
+            return result
+        # After the scope walk, which answers a nested def or class of the
+        # name: any other local is a value the graph cannot follow, and the
+        # same-module, class, import and trie stages below would bind it to
+        # the definition it shadows (issue #2666). Before the cache, whose
+        # answers are caller-independent.
+        if self._is_python_local_name(call):
+            return None
+
+        cache_key = self._resolution_cache_key(call)
+        if cache_key is not None and cache_key in self._simple_resolution_cache:
+            self.last_resolution = self._resolution_labels.get(
+                cache_key, cs.EdgeResolution.EXACT
+            )
+            return self._simple_resolution_cache[cache_key]
+
+        handled, result = self._resolve_structural_call(call)
+        if handled:
+            return result
+        handled, result = self._resolve_rust_prefixed_or_local(call, cache_key)
+        if handled:
+            return result
+        handled, result = self._resolve_rust_external_path(call, cache_key)
+        if handled:
+            return result
+        handled, result = self._resolve_typed_receiver_or_csharp(call)
+        if handled:
+            return result
+        # Ahead of the import probe: for a receiver it cannot place, that probe
+        # binds `subprocess.run` to a same-module function named `run`.
+        if self._receiver_is_external_python_module(call):
+            self._remember_cacheable(cache_key, None)
+            return None
+        handled, result = self._resolve_imported_or_module_member(call, cache_key)
+        if handled:
+            return result
+        handled, result = self._resolve_external_target(call, cache_key)
+        if handled:
+            return result
+        handled, result = self._resolve_untyped_member_or_unresolvable(call, cache_key)
+        if handled:
+            return result
+        handled, result = self._resolve_rust_named_owner(call, cache_key)
+        if handled:
+            return result
+        if self._untyped_receiver_guess_is_ambiguous(call):
+            logger.debug(ls.CALL_AMBIGUOUS_UNTYPED_RECEIVER, call_name=call_name)
+            self._remember_cacheable(cache_key, None)
+            return None
+
+        result = self._try_resolve_via_trie(
+            call_name, module_qn, language, call_point, constructing
+        )
+        self._remember_cacheable(cache_key, result)
+        return result
+
+    def _rust_scoped_local_types(
+        self,
+        local_var_types: dict[str, str] | None,
+        module_qn: str,
+        caller_qn: str | None,
+        language: cs.SupportedLanguage | None,
+    ) -> dict[str, str] | None:
+        # A receiver's recorded type is the bare name its binding spells
+        # (`b: Builder`, or the `Builder` that `Builder::new()` returns), and
+        # every probe resolves a bare type name through the FILE's bindings.
+        # A `use` in the caller's own body or enclosing inline mod rebinds
+        # that name for this caller alone, so `b.build()` in
+        # `mod tests { use my_beta::Builder; }` reached the crate's own
+        # `Builder` (issue #2622). A declared module path (`x: self::Builder`)
+        # is read through the file module too, which an inline mod's
+        # `self::`, `super::` and bare paths do not count from. Rebinding the
+        # map once covers them all.
+        if (
+            language != cs.SupportedLanguage.RUST
+            or not local_var_types
+            or not caller_qn
+        ):
+            return local_var_types
+        scoped: dict[str, str] | None = None
+        for name, type_name in local_var_types.items():
+            if cs.SEPARATOR_DOT in type_name:
+                continue
+            if cs.SEPARATOR_DOUBLE_COLON in type_name:
+                bound = self._rust_inline_path_type(type_name, module_qn, caller_qn)
+            else:
+                bound = self._rust_scoped_type(type_name, module_qn, caller_qn)
+            if bound is None:
+                continue
+            if scoped is None:
+                scoped = dict(local_var_types)
+            scoped[name] = bound
+        return local_var_types if scoped is None else scoped
+
+    def _rust_inline_path_type(
+        self, path: str, module_qn: str, caller_qn: str
+    ) -> str | None:
+        """The type a module path declared in an inline `mod` names there.
+
+        `self::` and `super::` count from the innermost inline mod around the
+        caller, and a bare head names that mod's own child module or `use`
+        first. Read through the file module instead, `x: self::Builder` in
+        `mod inner` bound the file's `Builder` and `super::Builder` in
+        `mod inner { mod deeper {..} }` climbed past `inner` (PR #2791
+        review). A `self::`/`super::` path naming no type there names none
+        of the file's either, so it binds the unresolvable sentinel. None
+        for a caller at file level, a `crate::` path, and a bare path the mod
+        does not resolve: the file's reading then decides, as before.
+        """
+        effective = self.rust_function_modules.get(caller_qn)
+        if effective is None:
+            # No ingest record (a rehydrated definition): the innermost
+            # declared mod around the caller stands in for it.
+            mods = self._rust_enclosing_mod_scopes(module_qn, caller_qn)
+            effective = mods[0] if mods else module_qn
+        head = path.split(cs.SEPARATOR_DOUBLE_COLON, 1)[0]
+        if effective == module_qn or head == cs.RUST_CRATE_KEYWORD:
+            return None
+        relative = head in (cs.KEYWORD_SELF, cs.KEYWORD_SUPER)
+        hit = self._rust_module_path_type(path, effective)
+        if hit is None and relative:
+            hit = self._rust_relative_use_path_type(path, effective)
+        if hit is None and not relative:
+            # A child mod written inline has no file and no import-map key
+            # of its own, so only its qn under the mod finds it.
+            hit = self._rust_module_path_type(
+                f"{cs.KEYWORD_SELF}{cs.SEPARATOR_DOUBLE_COLON}{path}", effective
+            )
+        if hit is None and relative:
+            return cs.RUST_UNRESOLVABLE_QN
+        return hit
+
+    def _rust_relative_use_path_type(self, path: str, effective: str) -> str | None:
+        """The type a `self::`/`super::` path names through `use` bindings.
+
+        The relative rewrite attaches every segment as a child module, so a
+        segment the named mod binds by `use` led nowhere: `self::alias::X`
+        after `use crate::a as alias;` lost its edge (PR #2791 review). Each
+        segment is read as the current mod's child module first, then as its
+        `use` binding; a binding that leaves the repo names no first-party
+        type, so the walk stops with None.
+        """
+        parts = path.split(cs.SEPARATOR_DOUBLE_COLON)
+        depth = 0
+        while depth < len(parts) and parts[depth] == cs.KEYWORD_SUPER:
+            depth += 1
+        if depth:
+            current: str | None = self.import_processor._rust_super_base(
+                effective, depth
+            )
+            rest = parts[depth:]
+        else:
+            current, rest = effective, parts[1:]
+        for segment in rest[:-1]:
+            if current is None:
+                return None
+            current = self._rust_scope_module(current, segment)
+        if current is None or not rest:
+            return None
+        hit = self._follow_rust_scope_target(f"{current}{cs.SEPARATOR_DOT}{rest[-1]}")
+        return hit[1] if hit is not None and hit[0] in _RS_TYPE_NODE_TYPES else None
+
+    def _rust_scope_module(self, scope: str, segment: str) -> str | None:
+        # The module `segment` names inside `scope`: a child module, or the
+        # module a `use` there binds it to (`{self}` imports first, as they
+        # name a module even where a value took the shared slot, #1054).
+        child = f"{scope}{cs.SEPARATOR_DOT}{segment}"
+        if (
+            child in self.declared_module_qns
+            or child in self.type_inference.module_qn_to_file_path
+            or child in self.import_processor.import_mapping
+        ):
+            return child
+        imports = self.import_processor
+        mapped = imports.rust_self_module_imports.get(scope, {}).get(
+            segment
+        ) or imports.import_mapping.get(scope, {}).get(segment)
+        if mapped is None or mapped == cs.RUST_UNRESOLVABLE_QN:
+            return None
+        return self._rust_local_qn(mapped, scope)
+
+    def _resolve_caller_scoped_stages(
+        self, call: _CallSite
+    ) -> tuple[bool, tuple[str, str] | None]:
+        # The stages whose answers depend on the caller, in order, ahead of
+        # the caller-independent resolution cache.
+        for stage in (
+            self._resolve_receiver_shadow,
+            self._resolve_rust_block_scope,
+            self._resolve_caller_scope,
+        ):
+            handled, result = stage(call)
+            if handled:
+                return True, result
+        return False, None
+
+    def _resolve_receiver_shadow(
+        self, call: _CallSite
+    ) -> tuple[bool, tuple[str, str] | None]:
+        if call.language == cs.SupportedLanguage.PYTHON:
+            handled, inline = self._resolve_inline_receiver_call(
+                call.call_name, call.module_qn, call.local_var_types
+            )
+            if handled:
+                return True, inline
+            # `helpers.make_pair()` where the caller binds `helpers` itself:
+            # the receiver is a local the type map could not type, so the
+            # call is on an unknown value. It must not reach the import probe
+            # (which would answer with the module the name shadows) nor the
+            # caller-independent cache (a sibling caller's answer, or ours
+            # poisoning theirs), and the bare-name trie must not guess
+            # either (issue #1907). A typed shadow (`helpers: W = ...`)
+            # resolves through its type as any local does.
+            if self._receiver_is_untyped_shadow(
+                call.call_name, call.caller_qn, call.local_var_types
+            ):
+                return True, None
+        # Dart's counterpart: a local or parameter named like an import
+        # prefix makes `p.Box(1)` a call on that value, so the import map
+        # must not answer for it (issue #2088). The binding spans are
+        # syntactic, so `var p = 1`, which inference leaves untyped, counts.
+        # A shadow the type map holds resolves through its type as usual.
+        if call.language == cs.SupportedLanguage.DART and self._dart_call_on_shadow(
+            call.call_name, call.module_qn, call.local_var_types, call.call_point
+        ):
+            return True, None
+        return False, None
+
+    def _resolve_rust_block_scope(
+        self, call: _CallSite
+    ) -> tuple[bool, tuple[str, str] | None]:
+        call_name, module_qn, caller_qn = call.call_name, call.module_qn, call.caller_qn
+        # A Rust call sited inside a const/static initializer block binds
+        # the block's own use before ANY other probe, including the
+        # enclosing-scope and same-module ones below: a use shadows outer
+        # items for the remainder of its block (rustc-verified), so even
+        # the file's own same-named item loses to it. A nested fn's own
+        # body use still outranks the block. Ahead of all of it stands an
+        # item the call's own block declares, which every use loses to;
+        # that probe belongs HERE rather than with the scope walk, since
+        # a module-level initializer's caller qn is the module itself and
+        # never reaches the walk (issues #1026 and #1061). A `::`-qualified
+        # first segment
+        # bound by the block (`T::assoc()` under `use crate::beta::T`)
+        # resolves through a map holding just that binding.
+        if not (
+            call.language == cs.SupportedLanguage.RUST
+            and caller_qn
+            and cs.SEPARATOR_DOT not in call_name
+        ):
+            return False, None
+        if cs.SEPARATOR_DOUBLE_COLON not in call_name and (
+            item_qn := self._rust_block_item_at(module_qn, call_name, call.call_point)
+        ):
+            return True, (self.function_registry[item_qn], item_qn)
+        first = call_name.split(cs.SEPARATOR_DOUBLE_COLON, 1)[0]
+        block_hit = self._rust_block_import_at(module_qn, first, call.call_point)
+        if not block_hit:
+            return False, None
+        block_target, defers = block_hit
+        # A nested fn's own body use outranks the block for BOTH
+        # shapes: the bare call and the `First::rest` path whose
+        # first segment it binds (`use crate::delta::T; T::assoc()`).
+        if defers and (
+            strong := self.import_processor.rust_fn_scope_imports.get(
+                caller_qn, {}
+            ).get(first)
+        ):
+            block_target = strong
+        if first != call_name:
+            return True, self._resolve_rust_block_path(call, first, block_target)
+        return True, self._follow_rust_scope_target(block_target)
+
+    def _resolve_rust_block_path(
+        self, call: _CallSite, first: str, block_target: str
+    ) -> tuple[str, str] | None:
+        # `T::assoc()` under the block's `use crate::beta::T`. The qualified
+        # probe reads `T`'s own members alone, so a block written away from
+        # `T`'s definition, or a trait default `T` inherits, is found the
+        # way a scoped `use` finds it (PR #2791 review).
+        result = self._try_resolve_qualified_call(
+            call.call_name,
+            {first: block_target},
+            call.module_qn,
+            call.local_var_types,
+            call.language,
+        )
+        item = call.call_name.partition(cs.SEPARATOR_DOUBLE_COLON)[2]
+        if result is not None or cs.SEPARATOR_DOUBLE_COLON in item:
+            return result
+        bound = self._rust_scoped_use_type(block_target, call.module_qn, call.module_qn)
+        if bound is None:
+            return None
+        return self._rust_bound_type_method(bound, item, first, call)
+
+    def _resolve_caller_scope(
+        self, call: _CallSite
+    ) -> tuple[bool, tuple[str, str] | None]:
+        # `self.run()` where a class body aliases `run` (issue #2620) is a
+        # member of the enclosing class, which the module-keyed cache does
+        # not know about.
+        if call.language == cs.SupportedLanguage.PYTHON and call.class_context:
+            handled, result = self._resolve_self_member_alias(
+                call.call_name, call.class_context, call.local_var_types
+            )
+            if handled:
+                return True, result
+
+        # Enclosing-scope (nested def) lookup is caller-specific, so it must run
+        # before the module-keyed cache/trie, which would otherwise return a sibling
+        # scope's same-named nested function.
+        # `new X(...)` names a type, so an enclosing scope answers it only
+        # with a class: a static factory named like the class it constructs
+        # (`Some.LogEventProperty()` building `new LogEventProperty()`) is the
+        # enclosing member, and taking it bound nothing at all (issue #1997).
+        if (
+            result := self._resolve_enclosing_scope(
+                call.call_name, call.caller_qn, call.module_qn, call.language
+            )
+        ) and (not call.constructing or result[0] == cs.NodeLabel.CLASS.value):
+            return True, result
+
+        # `this.m()` inside a prototype-assigned function dispatches to a sibling
+        # method of the same prototype target (Date.prototype.strftime calling
+        # this.getTwoDigitMonth()); the caller's parent scope names that target.
+        # Caller-specific, so it too must run before the module-keyed cache; the
+        # CommonJS module-receiver fallback still applies when no sibling exists.
+        if result := self._resolve_js_prototype_sibling(
+            call.call_name, call.caller_qn, call.language
+        ):
+            return True, result
+
+        # `helper := func() {...}; helper()`, or a `helper func()` parameter,
+        # calls the local value, so the package-scope probes must not certify
+        # a same-named package function as the target (#2571). Caller-specific,
+        # so it answers before the module-keyed cache; the name trie keeps
+        # the edge it gave before, labelled for what it is.
+        if call.language == cs.SupportedLanguage.GO and self._go_local_in_scope(call):
+            return True, self._try_resolve_via_trie(
+                call.call_name, call.module_qn, call.language, call.call_point
+            )
+        return False, None
+
+    def _go_local_in_scope(self, call: _CallSite) -> bool:
+        # Only where the local is in scope: a `helper()` before an inner
+        # block's `helper := ...`, or after that block closes, is the
+        # package's function (#2616 review). A call with no position falls
+        # back to the whole function.
+        if not call.caller_qn or cs.SEPARATOR_DOT in call.call_name:
+            return False
+        spans = self.go_local_scopes.get(call.caller_qn, {}).get(call.call_name)
+        if not spans:
+            return False
+        point = call.call_point
+        return point is None or any(start <= point < end for start, end in spans)
+
+    def _resolution_cache_key(self, call: _CallSite) -> tuple[str, str, bool] | None:
+        module_qn, caller_qn = call.module_qn, call.caller_qn
+        # The cache is keyed by (call_name, module_qn) only, so a caller whose
+        # class carries extends-clause type arguments must bypass it: its
+        # member resolution is class-context-dependent (#875) and a sibling
+        # class's cached answer for the same name would be wrong.
+        use_cache = not call.local_var_types and not (
+            call.language == cs.SupportedLanguage.DART
+            and call.class_context in self.type_inference.dart_extends_type_args
+        )
+        # A Rust caller nested below the file module (an inline `mod` block)
+        # or holding function-body `use` declarations of its own resolves
+        # caller-dependently: its scope's imports shadow file items, so the
+        # file-keyed cache would serve it another caller's answer. A file
+        # holding initializer-block uses resolves SITE-dependently (the
+        # block's use answers only calls inside its span), so no caller in
+        # it may share cached answers either. A Julia caller inside a nested
+        # `module` block is caller-dependent for the same reason (the block's
+        # own `using` shadows the file-level bindings).
+        nested_caller = (
+            caller_qn is not None
+            and caller_qn.startswith(f"{module_qn}{cs.SEPARATOR_DOT}")
+            and cs.SEPARATOR_DOT in caller_qn[len(module_qn) + 1 :]
+        )
+        if (
+            call.language == cs.SupportedLanguage.RUST
+            and caller_qn
+            and (
+                module_qn in self.import_processor.rust_block_scope_imports
+                or module_qn in self.import_processor.rust_block_items
+                or (
+                    caller_qn.startswith(f"{module_qn}{cs.SEPARATOR_DOT}")
+                    and (
+                        cs.SEPARATOR_DOT in caller_qn[len(module_qn) + 1 :]
+                        or caller_qn in self.import_processor.rust_fn_scope_imports
+                    )
+                )
+            )
+        ) or (call.language == cs.SupportedLanguage.JULIA and nested_caller):
+            use_cache = False
+        if not use_cache:
+            return None
+        # `new X()` and a bare `X()` in one module are different
+        # questions with different answers, so they never share a slot.
+        return (call.call_name, module_qn, call.constructing)
+
+    def _resolve_structural_call(
+        self, call: _CallSite
+    ) -> tuple[bool, tuple[str, str] | None]:
+        call_name, module_qn = call.call_name, call.module_qn
+        if result := self._try_resolve_iife(call_name, module_qn):
+            return True, result
+
+        # A JS/TS chain off `super.m()` is typed hop by hop like one off
+        # `this.m()`; the super lookup reads only a single member name.
+        if self._is_super_call(call_name) and not (
+            call.language in cs.JS_TS_LANGUAGES
+            and self._is_method_chain(call_name, call.language)
+        ):
+            return True, self._resolve_super_call(call_name, call.class_context)
+
+        if cs.SEPARATOR_DOT in call_name and self._is_method_chain(
+            call_name, call.language
+        ):
+            # A chained call resolves via return-type inference only; it does NOT
+            # fall through to the trie fallback, because a hop returning a container
+            # (`Kids() []Command`) or an unknown type must drop the edge rather than
+            # rebind the final method by bare name (a false `Command.Run`). C++ is the
+            # exception: a `foo().bar()` receiver with an unrecordable return type
+            # (`auto`/trailing/decltype, e.g. fmt's get_container(out).append) fell to
+            # the bare-method trie before chained typing existed, so preserve that
+            # fallback for C++ to avoid dropping edges the typing can't yet recover.
+            return True, self._resolve_chained_call(
+                call_name,
+                module_qn,
+                call.local_var_types,
+                call.class_context,
+                call.caller_qn,
+                call.language,
+                call.call_point,
+            )
+
+        # A Rust caller INSIDE an inline `mod` block sees that module's own
+        # items and imports first (its `use` shadows the enclosing file's
+        # items for code within the block). Caller-dependent, so never
+        # cached under the file-scoped key.
+        if call.language == cs.SupportedLanguage.RUST and call.caller_qn:
+            scoped = self._try_resolve_rust_inline_scope(
+                call_name, module_qn, call.caller_qn, call.call_point
+            )
+            if scoped is not None:
+                return True, scoped[0]
+            return self._resolve_rust_scoped_type_path(call)
+        return False, None
+
+    def _resolve_rust_scoped_type_path(
+        self, call: _CallSite
+    ) -> tuple[bool, tuple[str, str] | None]:
+        # `Type::f()` where a `use` in the caller's own body or enclosing
+        # inline mod names `Type`. Every probe below reads the FILE's
+        # bindings and then searches types by simple name, so the crate's
+        # own `Builder` answered for `mod tests { use my_beta::Builder; }`
+        # and any first-party `Parser` for a function-scoped
+        # `use regex_syntax::Parser;`, both as exact edges (issue #2622).
+        # Caller-dependent, and the cache key already excludes such callers.
+        type_name, sep, item = call.call_name.partition(cs.SEPARATOR_DOUBLE_COLON)
+        if (
+            not sep
+            or not type_name
+            or cs.SEPARATOR_DOUBLE_COLON in item
+            or cs.SEPARATOR_DOT in call.call_name
+        ):
+            return False, None
+        bound = self._rust_scoped_type(type_name, call.module_qn, call.caller_qn)
+        if bound is None:
+            return False, None
+        return True, self._rust_bound_type_method(bound, item, type_name, call)
+
+    def _rust_bound_type_method(
+        self, bound: str, item: str, type_name: str, call: _CallSite
+    ) -> tuple[str, str] | None:
+        """The method `item` of the one type a caller's scoped `use` binds.
+
+        The type's own or inherited method first. Failing that, what the
+        named-owner and external-path stages find for a type the file
+        binds: a block written away from the type's definition, registered
+        under `<its module>.<Type>`, or a trait default the type does not
+        override; for an external `bound`, which holds no methods in the
+        graph, only the crate's own impl on it can. A block counts only when
+        its own written self path names `bound`: the path names this type,
+        so no other type's same-named item is the target, the shadowed one
+        the bare-name guess would bind included (PR #2791 review). None
+        when the graph holds no such method (a derive or a macro made it).
+        """
+        if bound == cs.RUST_UNRESOLVABLE_QN:
+            return None
+        if bound in self.function_registry:
+            if own := self._try_method_on_class(
+                bound, item, cs.SEPARATOR_DOT, call.call_name, type_name, type_name
+            ):
+                return own
+            owners, name = frozenset({bound}), bound.rpartition(cs.SEPARATOR_DOT)[2]
+        else:
+            owners = frozenset()
+            name = bound.rpartition(cs.SEPARATOR_DOUBLE_COLON)[2]
+        return self._rust_owned_method(
+            item, call, owners, frozenset({name}), self_type=bound
+        )
+
+    def _resolve_rust_prefixed_or_local(
+        self, call: _CallSite, cache_key: tuple[str, str, bool] | None
+    ) -> tuple[bool, tuple[str, str] | None]:
+        call_name, module_qn = call.call_name, call.module_qn
+        # A `crate::`/`self::`/`super::` path says outright which module holds
+        # the item, so it must not reach the probes that answer by NAME. Both
+        # the same-module and the import probe ignore the prefix and hand back
+        # the caller's OWN item of that name, which for `super::` is one module
+        # too low (issue #1093). Undecided here means the path names nothing
+        # first-party, so the ordinary fallbacks still run.
+        if (
+            call.language == cs.SupportedLanguage.RUST
+            and cs.SEPARATOR_DOUBLE_COLON in call_name
+            and call_name.split(cs.SEPARATOR_DOUBLE_COLON, 1)[0]
+            in (cs.RUST_CRATE_KEYWORD, cs.KEYWORD_SELF, cs.KEYWORD_SUPER)
+        ):
+            prefixed, decided = self._try_resolve_rust_module_qualified(
+                call_name, module_qn, call.caller_qn
+            )
+            if decided:
+                self._remember_cacheable(cache_key, prefixed)
+                return True, prefixed
+
+        # Rust name resolution prefers items defined in the module itself: a
+        # glob import NEVER shadows a local item, and a MODULE-scoped named
+        # use colliding with one is a compile error (E0255). A use inside a
+        # function body DOES shadow module items, but it is stored under the
+        # function's qn and already answered by the scope walk above, so at
+        # this point same-module wins. Elsewhere imports shadow module-level
+        # definitions.
+        if call.language == cs.SupportedLanguage.RUST and (
+            result := self._try_resolve_same_module(
+                call_name, module_qn, call.call_point
+            )
+        ):
+            self._remember_cacheable(cache_key, result)
+            return True, result
+        return False, None
+
+    def _resolve_typed_receiver_or_csharp(
+        self, call: _CallSite
+    ) -> tuple[bool, tuple[str, str] | None]:
+        call_name, module_qn = call.call_name, call.module_qn
+        # A member call whose receiver has a known FIRST-PARTY class type that
+        # defines no such method (own or inherited) is a known non-edge, not an
+        # unknown one. The chained and inline receiver paths already drop this
+        # shape; the plain-variable path let it reach the probes below, where
+        # the same-module function fallback inside the import probe, or the
+        # bare-name trie at the end, bound `p.go()` on a `Product` without `go`
+        # to an unrelated `go` (issue #1897). Ahead of the import probe for that
+        # reason; never cached, because it can only fire with a non-empty local
+        # type map and `use_cache` is already False then.
+        if self._typed_receiver_lacks_method(
+            call_name, module_qn, call.local_var_types, call.language
+        ):
+            return True, None
+
+        if call.language == cs.SupportedLanguage.CSHARP and (
+            cs.SEPARATOR_DOUBLE_COLON in call_name or cs.SEPARATOR_DOT in call_name
+        ):
+            result, decided = self._resolve_csharp_qualified_call(
+                call_name, module_qn, call.local_var_types
+            )
+            if result is not None:
+                return True, result
+            if decided or cs.SEPARATOR_DOUBLE_COLON in call_name:
+                return True, None
+        # `new W(1)` under `using W = Zeta.Widget;` names no registered type
+        # by its written name, so the trie has no `W` to offer; the type
+        # lookup expands the alias to its target (issue #2002).
+        if (
+            call.language == cs.SupportedLanguage.CSHARP
+            and call.constructing
+            and (
+                type_qn := self.type_inference.csharp_type_inference._type_name_to_qn(
+                    call_name, module_qn
+                )
+            )
+        ):
+            return True, (self.function_registry[type_qn], type_qn)
+        return False, None
+
+    def _resolve_imported_or_module_member(
+        self, call: _CallSite, cache_key: tuple[str, str, bool] | None
+    ) -> tuple[bool, tuple[str, str] | None]:
+        call_name, module_qn = call.call_name, call.module_qn
+        if result := self._try_resolve_via_imports(
+            call_name, module_qn, call.local_var_types, call.language, call.caller_qn
+        ):
+            self._remember_cacheable(cache_key, result)
+            return True, result
+
+        if result := self._try_resolve_same_module(
+            call_name, module_qn, call.call_point
+        ):
+            self._remember_cacheable(cache_key, result)
+            return True, result
+
+        if (
+            call.language == cs.SupportedLanguage.GO
+            and cs.SEPARATOR_DOT not in call_name
+            and (result := self._try_resolve_go_same_package(call_name, module_qn))
+        ):
+            self._remember_cacheable(cache_key, result)
+            return True, result
+
+        # The same probe for a Lua table member spelled with the other
+        # separator than its definition (`Account.deposit` for
+        # `function Account:deposit`), in a file the import probe skipped.
+        if call.language == cs.SupportedLanguage.LUA and (
+            result := self._try_resolve_lua_same_module_member(call_name, module_qn)
+        ):
+            self._remember_cacheable(cache_key, result)
+            return True, result
+
+        # A Rust `module::item` call names its function through the module
+        # path, so it binds inside that module: a direct item, or the
+        # module's own `use` re-export (ripgrep's flags::parse() through
+        # flags/mod.rs). Runs after the import probes, so an aliased or
+        # imported first segment keeps its precise resolution, and DECIDES
+        # whenever the path names a real first-party module: an item the
+        # module does not hold is a drop, never a bare-name trie guess at
+        # an unrelated same-named function (issue #1009).
+        if (
+            call.language == cs.SupportedLanguage.RUST
+            and cs.SEPARATOR_DOUBLE_COLON in call_name
+        ):
+            result, decided = self._try_resolve_rust_module_qualified(
+                call_name, module_qn, call.caller_qn
+            )
+            if decided:
+                self._remember_cacheable(cache_key, result)
+                return True, result
+
+        if call.class_context and (
+            result := self._resolve_self_sibling_method(call_name, call.class_context)
+        ):
+            return True, result
+        return False, None
+
+    def _resolve_external_target(
+        self, call: _CallSite, cache_key: tuple[str, str, bool] | None
+    ) -> tuple[bool, tuple[str, str] | None]:
+        call_name, module_qn = call.call_name, call.module_qn
+        # A bare name explicitly imported from outside the project binds to that
+        # external symbol. Since precise import / same-module resolution above
+        # already failed, the symbol is unindexed; do NOT let the simple-name
+        # trie fallback rebind it to an unrelated first-party symbol of the same
+        # name. (The instantiation eval caught `from evals import GraphData;
+        # GraphData()` being resolved to codebase_rag's own GraphData class.)
+        if cs.SEPARATOR_DOT not in call_name and self._is_external_import(
+            call_name, module_qn, call.language
+        ):
+            self._remember_cacheable(cache_key, None)
+            return True, None
+
+        # Likewise for a JS/TS name the export walk followed to another
+        # binding (`export { beta as renamed } from "left-pad"`): the import
+        # names that binding, which nothing above resolved, so no same-named
+        # function is it. The guard above reads only the importer's own
+        # target, which names the barrel (bot review on PR #2994).
+        if self._js_reexport_led_nowhere(call_name, module_qn, call.language):
+            self._remember_cacheable(cache_key, None)
+            return True, None
+
+        # A dotted call on an import whose target still holds a raw
+        # slash-separated module path (github.com/x/y) is a call into an
+        # EXTERNAL module: local Go paths were rewritten to project qns at
+        # import time, so a surviving slash path is definitionally outside
+        # the repo. The symbol is unindexed; do not let the last-segment trie
+        # fallback rebind it to an unrelated first-party function.
+        if self._is_external_path_import(call_name, module_qn):
+            self._remember_cacheable(cache_key, None)
+            return True, None
+
+        # A member call `obj.method` whose receiver has a KNOWN inferred type that is
+        # not a first-party class is a call on an external object (e.g. a
+        # `std::string`). Precise local-type resolution above already failed, so the
+        # method lives on the external type; do NOT let the simple-name trie fallback
+        # rebind it to an unrelated first-party method of the same name. Untyped
+        # receivers keep the fallback (their type is unknown, not known-external).
+        if self._receiver_type_is_external(call_name, module_qn, call.local_var_types):
+            self._remember_cacheable(cache_key, None)
+            return True, None
+        return False, None
+
+    def _resolve_untyped_member_or_unresolvable(
+        self, call: _CallSite, cache_key: tuple[str, str, bool] | None
+    ) -> tuple[bool, tuple[str, str] | None]:
+        call_name, module_qn, language = call.call_name, call.module_qn, call.language
+        # A JS/TS/Dart member call on an UNTYPED receiver (`view.render(...)`
+        # where `view` is a param constructed in the caller) targets a MEMBER:
+        # the bare-name trie would rebind it to an arbitrary same-named
+        # candidate (express's application.render; a Dart `h.greet()` picking
+        # the closest class's greet), a false edge that also hides the real
+        # method from dead-code. Bind the UNIQUE member-like candidate (parent
+        # qn itself registered) or drop. Typed Dart receivers never reach this:
+        # the local-type path above already bound them.
+        if (
+            language in cs.JS_TS_LANGUAGES or language == cs.SupportedLanguage.DART
+        ) and cs.SEPARATOR_DOT in call_name:
+            if language == cs.SupportedLanguage.DART and (
+                result := self._resolve_dart_external_base_arg_member(
+                    call_name, call.class_context, call.local_var_types
+                )
+            ):
+                return True, result
+            result = self._resolve_js_member_call_unique(call_name, module_qn)
+            if language in cs.JS_TS_LANGUAGES:
+                # Chosen because no other visible class defines the name, not
+                # because anything says the receiver is that class (issue
+                # #2609). Only the call site's AST can say that, so the call
+                # processor confirms or drops the pick from the receiver's
+                # declaration, and picks again with the declared class in
+                # view, which an imported alias of it may alone name (issue
+                # #3276), so no pick is judged too; this caller-independent
+                # verdict is what caches.
+                self.last_resolution = cs.EdgeResolution.HEURISTIC
+            self._remember_cacheable(cache_key, result)
+            return True, result
+
+        # A bare name imported from an unrepresentable #[path] module is
+        # spoken for by that (unresolvable) import: the precise probes above
+        # already declined, so drop it rather than let the trie rebind it to
+        # a name-derived shadow file that merely shares the name (issue #1082).
+        if (
+            language == cs.SupportedLanguage.RUST
+            and cs.SEPARATOR_DOT not in call_name
+            and self._rust_name_maps_unresolvable(call_name, module_qn, call.caller_qn)
+        ):
+            self._remember_cacheable(cache_key, None)
+            return True, None
+        return False, None
+
+    def _remember_cacheable(
+        self, cache_key: tuple[str, str, bool] | None, result: tuple[str, str] | None
+    ) -> None:
+        if cache_key is not None:
+            self._remember(cache_key, result)
+
+    def _remember(
+        self, cache_key: tuple[str, str, bool], result: tuple[str, str] | None
+    ) -> None:
+        self._simple_resolution_cache[cache_key] = result
+        self._resolution_labels[cache_key] = self.last_resolution
+
+    def _rust_name_maps_unresolvable(
+        self, call_name: str, module_qn: str, caller_qn: str | None
+    ) -> bool:
+        import_mapping = self.import_processor.import_mapping
+        for scope in (*self._rust_enclosing_scopes(module_qn, caller_qn), module_qn):
+            if import_mapping.get(scope, {}).get(call_name) == cs.RUST_UNRESOLVABLE_QN:
+                return True
+        return False
+
+    def _resolve_rust_external_path(
+        self, call: _CallSite, cache_key: tuple[str, str, bool] | None
+    ) -> tuple[bool, tuple[str, str] | None]:
+        # A Rust path whose head binds an item outside the project names
+        # that crate's associated function: `String::new()`,
+        # `Default::default()`, `std::mem::take(..)`, `fmt::Debug::fmt(..)`
+        # under `use std::fmt`, `tokio::sync::Mutex::new(..)` with tokio in
+        # the manifest. The graph holds none of them, and every probe below
+        # answers by name alone: the type lookup with an out-of-scope
+        # first-party `String`, the same-module guess with the file's own
+        # `fn new`, the trie with any type's `new` (issue #2543). Only an
+        # impl block ON the external type (`impl From<Foo> for u8`) can
+        # hold a first-party target, so the path decides here.
+        path = _rust_assoc_path(call)
+        if path is None:
+            return False, None
+        object_path, item = path
+        if not self._rust_head_is_external(
+            object_path[0], call.module_qn, call.caller_qn
+        ):
+            return False, None
+        result = self._rust_owned_method(
+            item, call, frozenset(), frozenset({object_path[-1]})
+        )
+        self._remember_cacheable(cache_key, result)
+        return True, result
+
+    def _resolve_rust_named_owner(
+        self, call: _CallSite, cache_key: tuple[str, str, bool] | None
+    ) -> tuple[bool, tuple[str, str] | None]:
+        # The last stop before the bare-name trie for a Rust call that names
+        # the type owning its target: `Type::f()` or `Self::f()` on a
+        # first-party type, or a method on a literal, whose type is a
+        # primitive. Every precise probe has missed, so the target is a
+        # method the graph cannot see (a derive's `Config::default()`,
+        # clap's `Cli::parse()`) unless an impl block elsewhere or a trait
+        # default supplies it; the trie would bind whatever type's
+        # same-named method sat closest (issue #2543). A type alias, a
+        # generic parameter or an external type the probes above did not
+        # place is unknown rather than known, and keeps the trie.
+        if path := _rust_assoc_path(call):
+            object_path, item = path
+            # A path names one type, so a block written away from it counts
+            # only when its own self path names that type: by name alone,
+            # another same-named type's block won on import distance.
+            if (bound := self._rust_path_type_qn(object_path, call)) is not None:
+                result = self._rust_bound_type_method(
+                    bound, item, object_path[-1], call
+                )
+                self._remember_cacheable(cache_key, result)
+                return True, result
+            owners = self._rust_qualifier_types(
+                object_path, call.module_qn, call.class_context
+            )
+            if owners is None:
+                return False, None
+            names = frozenset(qn.rpartition(cs.SEPARATOR_DOT)[2] for qn in owners)
+            result = self._rust_owned_method(item, call, owners, names)
+            # `Self` means the caller's impl target, so the answer is the
+            # caller's, never the module's.
+            if object_path != [cs.RS_SELF_TYPE]:
+                self._remember_cacheable(cache_key, result)
+            return True, result
+        if call.language != cs.SupportedLanguage.RUST:
+            return False, None
+        receiver, _sep, item = call.call_name.rpartition(cs.SEPARATOR_DOT)
+        if not receiver or (types := rs_utils.literal_receiver_types(receiver)) is None:
+            return False, None
+        result = self._rust_owned_method(item, call, frozenset(), types)
+        self._remember_cacheable(cache_key, result)
+        return True, result
+
+    def _rust_qualifier_types(
+        self, object_path: list[str], module_qn: str, class_context: str | None
+    ) -> frozenset[str] | None:
+        """The first-party type qns a Rust `Type::` qualifier names, or None.
+
+        `Self` is the caller's impl target; when that impl block sits away
+        from its type's definition its qn is unregistered, so the type it
+        names is added. Any other qualifier counts only when it resolves to
+        a registered struct, enum, union or trait: a type alias's target is
+        not recorded, so its methods are not knowable from its qn.
+        """
+        qualifier = object_path[-1]
+        owners: set[str] = set()
+        if object_path == [cs.RS_SELF_TYPE]:
+            if not class_context:
+                return None
+            owners.add(class_context)
+            if class_context in self.function_registry:
+                return frozenset(owners)
+            qualifier = class_context.rpartition(cs.SEPARATOR_DOT)[2]
+        type_qn = self._resolve_class_name(qualifier, module_qn)
+        if type_qn is not None and self.function_registry.get(type_qn) in (
+            _RS_OWNER_NODE_TYPES
+        ):
+            owners.add(type_qn)
+        return frozenset(owners) or None
+
+    def _rust_path_type_qn(self, object_path: list[str], call: _CallSite) -> str | None:
+        # A qualifier written with its path (`grep_searcher::BinaryDetection`,
+        # `crate::searcher::BinaryDetection`) names one type, read where the
+        # call is written the way a receiver's declared path is: an inline
+        # mod's `self::` counts from the mod, and a head may be a module of
+        # the caller's own that re-exports the type. Handing the bare last
+        # segment to the class lookup dropped the path, and that lookup
+        # declines a name several types share (issue #2982).
+        if len(object_path) < 2:
+            return None
+        path = cs.SEPARATOR_DOUBLE_COLON.join(object_path)
+        type_qn = (
+            self._rust_inline_path_type(path, call.module_qn, call.caller_qn)
+            if call.caller_qn
+            else None
+        ) or self._rust_module_path_type(path, call.module_qn)
+        if type_qn is None or (
+            self.function_registry.get(type_qn) not in _RS_OWNER_NODE_TYPES
+        ):
+            return None
+        return type_qn
+
+    def _rust_owned_method(
+        self,
+        item: str,
+        call: _CallSite,
+        owners: frozenset[str],
+        names: frozenset[str],
+        self_type: str | None = None,
+    ) -> tuple[str, str] | None:
+        """The method `item` of the Rust type a call names, or None.
+
+        A candidate counts when its owner is one of `owners`, an impl block
+        on a type called one of `names` written in another module (which
+        registers under an unregistered owner qn of that name), or a trait
+        either of those implements, for its default method. Free functions
+        never count: a path through a type or a method call names neither.
+        With `self_type`, such a block counts only when its written self
+        path names that type, which makes its method that type's own.
+        """
+        candidates = [
+            qn
+            for qn in self._nameable_candidates(
+                self.function_registry.find_ending_with(item),
+                call.module_qn,
+                call.call_point,
+            )
+            if self.function_registry[qn] == cs.NodeLabel.METHOD.value
+            and self._rust_method_owner_matches(qn, owners, names, self_type)
+        ]
+        if not candidates:
+            logger.debug(ls.CALL_RUST_OWNER_UNRESOLVED, call_name=call.call_name)
+            return None
+        best = self._best_trie_candidate(candidates, call.module_qn)
+        owner = best.rpartition(cs.SEPARATOR_DOT)[0]
+        self.last_resolution = (
+            cs.EdgeResolution.EXACT
+            if owner in owners
+            or (self_type is not None and owner not in self.function_registry)
+            else cs.EdgeResolution.HEURISTIC
+        )
+        return self.function_registry[best], best
+
+    def _rust_method_owner_matches(
+        self,
+        method_qn: str,
+        owners: frozenset[str],
+        names: frozenset[str],
+        self_type: str | None = None,
+    ) -> bool:
+        owner = method_qn.rpartition(cs.SEPARATOR_DOT)[0]
+        if self._rust_owner_is(owner, owners, names, method_qn, self_type):
+            return True
+        if self.function_registry.get(owner) != NodeType.INTERFACE:
+            return False
+        # The read-back pairs too: a run that re-parsed only the caller has
+        # `impl FloatErrors for u64` in them alone, and `u64::error_halfscale()`
+        # lost the trait method a clean index binds (issue #2403).
+        implementers = self.interface_implementers.get(
+            owner, set()
+        ) | self.rehydrated_interface_implementers.get(owner, set())
+        return any(
+            self._rust_owner_is(implementer, owners, names, self_type=self_type)
+            for implementer in implementers
+        )
+
+    def _rust_owner_is(
+        self,
+        owner: str,
+        owners: frozenset[str],
+        names: frozenset[str],
+        method_qn: str | None = None,
+        self_type: str | None = None,
+    ) -> bool:
+        if owner in owners:
+            return True
+        if (
+            owner in self.function_registry
+            or owner.rpartition(cs.SEPARATOR_DOT)[2] not in names
+        ):
+            return False
+        if self_type is not None:
+            return self._rust_impl_names_type(owner, method_qn, self_type)
+        # With no first-party owner the names are external or primitive
+        # types, and the impl block must be on that type, not on the
+        # crate's own type of the same name.
+        return bool(owners) or self._rust_impl_on_external_type(owner, method_qn)
+
+    def _rust_impl_names_type(
+        self, owner: str, method_qn: str | None, type_qn: str
+    ) -> bool:
+        """Whether the impl block registered under `owner` is on `type_qn`.
+
+        Its self type as written, read in the block's own module the way
+        rustc reads it: `impl Builder` under `use crate::model::Builder;`
+        and `impl crate::model::Builder` both name the model's type, while
+        the same name bound to another type there names that one. A block
+        not parsed this run (an unchanged file on an incremental run) has
+        no recorded path, and its bare type name stands in for one.
+        """
+        impl_module, _sep, name = owner.rpartition(cs.SEPARATOR_DOT)
+        paths = self.import_processor.rust_impl_self_paths
+        written = (
+            (paths.get(method_qn) if method_qn else None) or paths.get(owner) or {name}
+        )
+        return any(
+            self._rust_written_type(path, impl_module) == type_qn for path in written
+        )
+
+    def _rust_written_type(self, path: str, module_qn: str) -> str | None:
+        # The type a path written in `module_qn` names: a first-party type's
+        # qn, or the raw path of an external one. A bare name binds the
+        # module's own type or its `use` or glob import, never a type found
+        # by searching for the name.
+        if cs.SEPARATOR_DOUBLE_COLON in path:
+            if self._rust_path_is_external(path, module_qn):
+                return path
+            return self._rust_module_path_type(path, module_qn)
+        target = self.import_processor.import_mapping.get(module_qn, {}).get(path)
+        if target is not None:
+            return self._rust_scoped_use_type(target, module_qn, module_qn)
+        return self._rust_scope_type(f"{module_qn}{cs.SEPARATOR_DOT}{path}")
+
+    def _rust_impl_on_external_type(
+        self, owner: str, method_qn: str | None = None
+    ) -> bool:
+        """Whether an impl block registered under `owner` is on a type the
+        crate does not define.
+
+        An impl block registers under `<its module>.<Type>`, a qn nothing
+        else holds, both for a type outside the crate (`impl From<Foo> for
+        u8`, `impl Describe for std::string::String`) and for the crate's own
+        type written away from its definition (`impl String { fn new() }`
+        beside a `use crate::shadow::String`). The self type as written
+        decides, read the way rustc reads it in the impl's own module: its
+        first segment's binding there, the prelude for a bare `String`
+        nothing rebinds, `crate::`/`self::`/`super::` for the crate's own
+        (#2595 review). A crate type that merely shares the name decides
+        nothing.
+        """
+        impl_module = owner.rpartition(cs.SEPARATOR_DOT)[0]
+        paths = self.import_processor.rust_impl_self_paths
+        # The method's own block when known: two blocks of one module share
+        # `owner` while naming different types.
+        written = (paths.get(method_qn) if method_qn else None) or paths.get(owner)
+        if not written:
+            # Not parsed this run (an unchanged file on an incremental run):
+            # no path to read, so a crate type of the name is taken to mean
+            # its own, as rustc allows a foreign type only a trait impl.
+            return self._rust_unwritten_impl_is_external(owner)
+        return any(
+            self._rust_head_is_external(
+                path.split(cs.SEPARATOR_DOUBLE_COLON, 1)[0], impl_module, None
+            )
+            for path in written
+        )
+
+    def _rust_unwritten_impl_is_external(self, owner: str) -> bool:
+        impl_module, _sep, name = owner.rpartition(cs.SEPARATOR_DOT)
+        if self._rust_head_binding(name, impl_module, None) is not None:
+            return self._rust_head_is_external(name, impl_module, None)
+        return not any(
+            qn.rpartition(cs.SEPARATOR_DOT)[2] == name
+            and self.function_registry.get(qn) in cs.RS_TYPE_SCOPE_LABELS
+            and self._module_language(qn) == cs.SupportedLanguage.RUST
+            for qn in self.function_registry.find_ending_with(name)
+        )
+
+    def _rust_head_is_external(
+        self, head: str, module_qn: str, caller_qn: str | None
+    ) -> bool:
+        """Whether a Rust path's first segment binds an item outside the project.
+
+        A binding in scope decides by where it points: a first-party item or
+        a `use` of a local module says no, a `use` from a std crate or a
+        manifest-proven external dependency says yes. Unbound, a prelude or
+        primitive name is the language's own, and any other head names a
+        crate, external on the same evidence.
+        """
+        binding = self._rust_head_binding(head, module_qn, caller_qn)
+        path = head if binding is None else binding
+        if self._rust_local_qn(path, module_qn) is not None:
+            return False
+        if binding is None and head in cs.RS_PRELUDE_NAMES:
+            return True
+        crate = path.split(cs.SEPARATOR_DOUBLE_COLON, 1)[0]
+        # A pathless entry renamed onto a workspace member (`base-alias =
+        # { version = "1", package = "my-base" }`) fetches the crate the repo
+        # holds, so its head is first-party though no lib bears the name.
+        return crate in cs.RS_STDLIB_CRATES or (
+            not self.import_processor.rust_head_is_repo_crate(crate)
+            and not self.import_processor.rust_head_is_member_dep(crate, module_qn)
+            and self.import_processor.rust_head_is_external_dep(crate, module_qn)
+        )
+
+    def _rust_head_binding(
+        self, head: str, module_qn: str, caller_qn: str | None
+    ) -> str | None:
+        """What binds a Rust path head at a call site, innermost scope first.
+
+        A `use` target (raw `::` path when external), or the qn of the
+        first-party type a scope defines or glob-imports; None when nothing
+        in scope binds the name. A path head is a type, trait or module,
+        never a function, so a same-named function or method (`fmt` inside
+        `impl Debug`) is no binding; a module holds no registry entry and
+        is left to the caller's module check.
+        """
+        if self_module := self._rust_self_module_head(head, module_qn, caller_qn):
+            return self_module[0]
+        if caller_qn and (
+            target := self.import_processor.rust_fn_scope_imports.get(
+                caller_qn, {}
+            ).get(head)
+        ):
+            return target
+        import_mapping = self.import_processor.import_mapping
+        for scope in (*self._rust_enclosing_scopes(module_qn, caller_qn), module_qn):
+            local = f"{scope}{cs.SEPARATOR_DOT}{head}"
+            if self.function_registry.get(local) in cs.RS_TYPE_SCOPE_LABELS:
+                return local
+            scope_map = import_mapping.get(scope, {})
+            if (target := scope_map.get(head)) is not None:
+                return target
+            if glob_hit := self._rust_glob_type(scope_map, scope, head):
+                return glob_hit
+        return None
+
+    def _rust_glob_type(
+        self, scope_map: dict[str, str], scope: str, name: str
+    ) -> str | None:
+        for key, value in scope_map.items():
+            if not key.startswith(cs.RS_WILDCARD_PREFIX):
+                continue
+            base = self._rust_local_qn(value, scope)
+            if base is None:
+                continue
+            hit = self._follow_rust_scope_target(f"{base}{cs.SEPARATOR_DOT}{name}")
+            if hit is not None and hit[0] in cs.RS_TYPE_SCOPE_LABELS:
+                return hit[1]
+        return None
+
+    def _resolve_dart_external_base_arg_member(
+        self,
+        call_name: str,
+        class_context: str | None,
+        local_var_types: dict[str, str] | None,
+    ) -> tuple[str, str] | None:
+        # `recv.member(...)` on a receiver undeclared in first-party scope,
+        # inside a class extending an EXTERNAL generic base: the only
+        # first-party types the base can hand back are its type arguments
+        # (`State<GridBtn>.widget` is a GridBtn), so bind when exactly one
+        # argument's class defines the member (issue #875). A first-party
+        # base, a declared receiver, or a member named like the receiver on
+        # the class or ANY registered ancestor (a first-party mixin's getter
+        # is inherited, not handed back by the external base) all fall
+        # through to the unique-member gate instead.
+        if not class_context:
+            return None
+        type_args = self.type_inference.dart_extends_type_args.get(class_context)
+        if not type_args:
+            return None
+        receiver, sep, member = call_name.partition(cs.SEPARATOR_DOT)
+        if not sep or cs.SEPARATOR_DOT in member:
+            return None
+        if local_var_types and receiver in local_var_types:
+            return None
+        if self._dart_registered_member_named(class_context, receiver):
+            return None
+        bases = self.class_inheritance.get(class_context)
+        # resolve_deferred_inherits rewrote bases in place, so a registered
+        # bases[0] means a first-party extends base owns its members.
+        if not bases or self.function_registry.get(bases[0]) is not None:
+            return None
+        matches = [
+            qn
+            for arg_qn in dict.fromkeys(type_args)
+            if (qn := f"{arg_qn}{cs.SEPARATOR_DOT}{member}") in self.function_registry
+        ]
+        if len(matches) == 1:
+            return self.function_registry[matches[0]], matches[0]
+        return None
+
+    def _dart_registered_member_named(self, class_qn: str, name: str) -> bool:
+        # True when the class or any registered first-party ancestor
+        # (extends base or `with` mixin, both in class_inheritance) defines
+        # a member with this name. Dart `implements` contributes interface
+        # only, never implementation, so it cannot supply a receiver.
+        seen: set[str] = set()
+        stack = [class_qn]
+        while stack:
+            current = stack.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            if f"{current}{cs.SEPARATOR_DOT}{name}" in self.function_registry:
+                return True
+            stack.extend(self.class_inheritance.get(current, ()))
+        return False
+
+    def ts_type_alias(self, module_qn: str, name: str) -> Node | None:
+        """The module's top-level `type <name> = ...` declaration, if any."""
+        file_path = self.type_inference.module_qn_to_file_path.get(module_qn)
+        entry = self.type_inference.ast_cache.load(file_path) if file_path else None
+        if not entry:
+            return None
+        root, _language = entry
+        for child in root.named_children:
+            declaration = (
+                child.child_by_field_name(cs.TS_DECLARATION)
+                if child.type == cs.TS_EXPORT_STATEMENT
+                else child
+            )
+            if (
+                declaration is not None
+                and declaration.type == cs.TS_TYPE_ALIAS_DECLARATION
+                and safe_decode_text(declaration.child_by_field_name(cs.FIELD_NAME))
+                == name
+            ):
+                return declaration
+        return None
+
+    def _resolve_js_member_call_unique(
+        self, call_name: str, module_qn: str, in_view: str | None = None
+    ) -> tuple[str, str] | None:
+        """`in_view`: a class the call site's receiver is declared as, in view
+        for that call as an imported one is (issue #3276)."""
+        method_name = call_name.rsplit(cs.SEPARATOR_DOT, 1)[-1]
+        candidates: list[str] = []
+        for qn in self.function_registry.find_ending_with(method_name):
+            parent_qn, sep, leaf = qn.rpartition(cs.SEPARATOR_DOT)
+            if not sep or leaf != method_name:
+                continue
+            # Member-like: the parent is itself a registered node (a class, a
+            # prototype constructor Function, an object scope); a free
+            # function's parent is a module, which is never in the registry.
+            if parent_qn in self.function_registry:
+                candidates.append(qn)
+        # Only candidates VISIBLE to the calling module count: parent module
+        # imported here or defined here (express's tryRender imports ./view, so
+        # View.render qualifies; an unrelated example's GithubView.render does
+        # not). Required even for a SINGLETON: an untyped `client.render()` in
+        # a file with no relation to the sole View.render must drop, not grow a
+        # false cross-module edge that hides real dead code. A JS require maps
+        # the MODULE (`require('./view')` -> express.lib.view), so a visible
+        # candidate's parent may equal an import or sit anywhere under one.
+        import_map = self.import_processor.import_mapping.get(module_qn) or {}
+        imported = set(import_map.values())
+        # A default import names `<module>.default`; the class the module
+        # default-exports is what it makes visible (issue #3179).
+        imported |= {
+            self.import_processor.follow_js_default_import(
+                value,
+                self.type_inference.module_qn_to_file_path,
+                self.function_registry,
+            )
+            for value in imported
+        }
+        if in_view is not None:
+            imported.add(in_view)
+        visible = [
+            qn
+            for qn in candidates
+            if qn.startswith(f"{module_qn}{cs.SEPARATOR_DOT}")
+            or any(
+                qn.rpartition(cs.SEPARATOR_DOT)[0] == imp
+                or qn.rpartition(cs.SEPARATOR_DOT)[0].startswith(
+                    f"{imp}{cs.SEPARATOR_DOT}"
+                )
+                for imp in imported
+            )
+        ]
+        # A declaration that never runs (an interface or abstract member, issue
+        # #2524) must not make its sole implementation ambiguous: the two share
+        # the name by design. It is chosen only when nothing implements it.
+        visible = [
+            qn for qn in visible if not self._is_bodiless_declaration(qn)
+        ] or visible
+        if len(visible) == 1:
+            return self.function_registry[visible[0]], visible[0]
+        return None
+
+    def _is_bodiless_declaration(self, qn: str) -> bool:
+        # Interface ownership is read from the owner's label, which an
+        # incremental run rehydrates for unchanged files; the abstract mark
+        # exists only for members this run parsed.
+        if self.function_registry.is_abstract(qn):
+            return True
+        owner_qn = qn.rpartition(cs.SEPARATOR_DOT)[0]
+        return self.function_registry.get(owner_qn) == NodeType.INTERFACE
+
+    def _is_external_path_import(self, call_name: str, module_qn: str) -> bool:
+        # True when the dotted call's object segment is imported from a target
+        # that is still a slash-separated module path; for Go, every local
+        # path was rewritten to a project qn at import time, so a surviving
+        # slash means external. JS/TS non-standard-scheme imports
+        # (ext:deno_node/y) alias first-party code and keep their trie
+        # fallback, mirroring _is_external_import.
+        if cs.SEPARATOR_DOT not in call_name:
+            return False
+        object_name = call_name.split(cs.SEPARATOR_DOT, 1)[0]
+        import_map = self.import_processor.import_mapping.get(module_qn)
+        if not import_map:
+            return False
+        target = import_map.get(object_name)
+        if not target or cs.SEPARATOR_SLASH not in target:
+            return False
+        bare_imports = self.import_processor.js_ts_bare_imports.get(module_qn)
+        return not (bare_imports and object_name in bare_imports)
+
+    def _is_external_import(
+        self,
+        call_name: str,
+        module_qn: str,
+        language: cs.SupportedLanguage | None = None,
+    ) -> bool:
+        # True when call_name is imported in module_qn from a module outside the
+        # project. First-party imports are written either project-prefixed
+        # (`from proj.w import X`) or bare (`from utils.helpers import X`, where
+        # the registered node is `proj.utils.helpers.X`); both are first-party
+        # and left to the trie fallback. Only a target neither rooted at the
+        # project nor registered under the project prefix is external, so this
+        # suppresses cross-project fuzzy rebinds without dropping real
+        # first-party calls.
+        import_map = self.import_processor.import_mapping.get(module_qn)
+        if not import_map:
+            return False
+        target = import_map.get(call_name)
+        if not target:
+            return False
+        # A PHP `use function A\B\c` target is a namespace path, which never
+        # matches cgr's file-path qualified name (a global helper declares
+        # `namespace Illuminate\Support` from Collections/functions.php). Treating
+        # it as external would suppress the simple-name trie fallback that a bare
+        # PHP call already relies on, dropping the call; leave it to the trie.
+        # NARROWED (#1185 stage 1): the `namespace` declaration IS now tracked,
+        # in `import_processor.php_module_namespaces`, and
+        # `_php_target_for_namespace_import` uses it to bind a `use function`
+        # import to the module declaring that namespace. So a first-party
+        # target whose namespace is declared somewhere in the repo resolves
+        # rather than deferring.
+        #
+        # What remains: a target whose namespace NO indexed module declares is
+        # still indistinguishable here from a first-party one the resolver
+        # could not place, and both defer to the trie exactly as a bare
+        # `helper()` call does. That is a smaller gap than the original
+        # comment described, and deferring stays the right behaviour for it --
+        # treating it as external would suppress the trie fallback and drop
+        # the call.
+        php_imports = self.import_processor.php_function_imports.get(module_qn)
+        if php_imports and call_name in php_imports:
+            return False
+        # A JS/TS import with a non-standard scheme (deno `ext:deno_node/x`) does
+        # not resolve to a file-path module qn, so its target is unregistered and
+        # looks external even though it aliases first-party code. Defer to the
+        # simple-name trie (like a relative import that misses) instead of
+        # suppressing. Ordinary package specifiers (bare, scoped, node:/npm:) are
+        # NOT recorded here, so genuine external calls stay suppressed.
+        bare_imports = self.import_processor.js_ts_bare_imports.get(module_qn)
+        if bare_imports and call_name in bare_imports:
+            return False
+        # Only dotted absolute-path imports (Python/Java `pkg.mod.Name`) are
+        # judged here. Rust/C++ record relative or `::`-separated targets
+        # (`super::b::helper`) that never carry the project prefix and rely on
+        # the trie fallback to resolve, so they must not be mistaken external.
+        # A JS/TS target is judged dot-free too: every relative specifier was
+        # rewritten to a project qn at import time, so a bare package name
+        # left as written (`require('http-errors')`) is external (#2402).
+        if cs.SEPARATOR_DOUBLE_COLON in target or (
+            cs.SEPARATOR_DOT not in target and language not in cs.JS_TS_LANGUAGES
+        ):
+            return False
+        project_root = module_qn.split(cs.SEPARATOR_DOT, 1)[0]
+        if target.split(cs.SEPARATOR_DOT, 1)[0] == project_root:
+            return False
+        return f"{project_root}{cs.SEPARATOR_DOT}{target}" not in self.function_registry
+
+    def js_member_head_is_external(self, member_name: str, module_qn: str) -> bool:
+        """Whether a dotted JS/TS name's head is imported from a package.
+
+        `<Prim.Item>` under `import * as Prim from "@radix-ui/react-accordion"`
+        (or a default, named or `require` binding of a package) names a member
+        of that package, which the project never indexes, so its last segment
+        is no licence to bind a same-named first-party symbol (issue #2535).
+        Only the import processor can tell a package from project code: a
+        bare `react` resolves to the qn `react`, which a project named
+        `react` or a repo-root `react.tsx` also spells, so the head's target
+        qn is never compared with project paths. Relative, tsconfig-alias,
+        workspace and aliased-scheme (deno `ext:`) imports are first-party
+        and keep today's resolution.
+        """
+        head, sep, _member = member_name.partition(cs.SEPARATOR_DOT)
+        if not sep:
+            return False
+        package_imports = self.import_processor.js_ts_package_imports.get(module_qn)
+        return bool(package_imports) and head in package_imports
+
+    def _two_part_receiver_type(
+        self, call_name: str, local_var_types: dict[str, str] | None
+    ) -> str | None:
+        """The inferred local type of `obj` in a two-part `obj.method` call, or None."""
+        if not local_var_types or cs.SEPARATOR_DOT not in call_name:
+            return None
+        parts = call_name.split(cs.SEPARATOR_DOT)
+        if len(parts) != 2:
+            return None
+        return local_var_types.get(parts[0])
+
+    def _registered_class_qn(self, class_qn: str, module_qn: str) -> str | None:
+        """The registry's spelling of a first-party class qn, or None if unindexed.
+
+        A first-party qn may be written without the project prefix (a bare
+        `from models.user import User` gives `models.user.User` while the
+        registry stores `proj.models.user.User`), so both spellings are tried.
+        """
+        if class_qn in self.function_registry:
+            return class_qn
+        project_root = module_qn.split(cs.SEPARATOR_DOT, 1)[0]
+        prefixed = f"{project_root}{cs.SEPARATOR_DOT}{class_qn}"
+        if prefixed in self.function_registry:
+            return prefixed
+        return None
+
+    def _typed_receiver_lacks_method(
+        self,
+        call_name: str,
+        module_qn: str,
+        local_var_types: dict[str, str] | None,
+        language: cs.SupportedLanguage | None,
+    ) -> bool:
+        # True for a Python `obj.method` where `obj` has a known type that IS
+        # an indexed first-party class, and neither that class, a base it
+        # inherits from, nor any same-named class in this module defines
+        # `method`. The precise local-type path already failed for exactly
+        # that reason, so the call cannot be this class's method; binding it
+        # by bare name to some other `method` is a false edge. An untyped
+        # receiver, an external type (`_receiver_type_is_external`) or a type
+        # that resolves to no indexed class stays out: unknown, not absent.
+        #
+        # Python only. Elsewhere a type's method set is not readable from its
+        # class qn: Go promotes methods from an embedded struct the inheritance
+        # walk does not model, and Rust registers `impl` methods under the
+        # impl's module and trait defaults under the trait. There the fallback
+        # stays as it was (found by the local review and CI on this change).
+        if language != cs.SupportedLanguage.PYTHON:
+            return False
+        var_type = self._two_part_receiver_type(call_name, local_var_types)
+        if var_type is None:
+            return False
+        import_map = self.import_processor.import_mapping.get(module_qn, {})
+        class_qn = self._resolve_class_qn_from_type(var_type, import_map, module_qn)
+        if not class_qn:
+            return False
+        registered = self._registered_class_qn(class_qn, module_qn)
+        if registered is None:
+            return False
+        if self.function_registry[registered] != cs.NodeLabel.CLASS.value:
+            return False
+        method_name = call_name.split(cs.SEPARATOR_DOT)[1]
+        # Own or inherited under the registered spelling. The precise
+        # local-type path has normally already answered both, so this
+        # re-check matters where that path used an unprefixed class qn.
+        if self._try_resolve_method(registered, method_name) is not None:
+            return False
+        # A bare type name that several classes in THIS module carry (two
+        # functions each defining a local `Analyzer`) resolved to one of them
+        # above, possibly the wrong one; if any same-named class defined in
+        # this module has the method, the call is left to the fallback. A
+        # same-named class in another module, a CHILD module of a package
+        # included, is unrelated and does not rescue the call. The annotation
+        # is reduced first: `Product | None` names `Product`.
+        simple_type = self._strip_optional(var_type).rsplit(cs.SEPARATOR_DOT, 1)[-1]
+        return not any(
+            self._is_class_method_defined_in(qn, module_qn)
+            for qn in self.function_registry.find_ending_with(
+                f"{simple_type}{cs.SEPARATOR_DOT}{method_name}"
+            )
+        )
+
+    def _is_class_method_defined_in(self, qn: str, module_qn: str) -> bool:
+        """Whether `qn` is a method of a CLASS that `module_qn` itself defines.
+
+        The owner must be a registered class (a nested function named like
+        the type, `factory.Product.go`, does not count), and it must live in
+        `module_qn` at any scope depth: every scope between the module and the
+        class (`second` in `proj.app.second.Analyzer`) must be a definition
+        this module registered. An unregistered scope is a module boundary,
+        `proj.app.util` under the `proj.app` package, or unknown; either way
+        not this module. Modules are not registry entries, and the module map
+        holds only re-parsed files during an incremental run, so the registry
+        (rehydrated for every file) is what decides, with the map as a second
+        check where it does know the scope.
+        """
+        owner, _sep, _method = qn.rpartition(cs.SEPARATOR_DOT)
+        if self.function_registry.get(owner) != cs.NodeLabel.CLASS.value:
+            return False
+        prefix = f"{module_qn}{cs.SEPARATOR_DOT}"
+        if not owner.startswith(prefix):
+            return False
+        modules = self.type_inference.module_qn_to_file_path
+        scope = module_qn
+        for segment in owner[len(prefix) :].split(cs.SEPARATOR_DOT)[:-1]:
+            scope = f"{scope}{cs.SEPARATOR_DOT}{segment}"
+            if scope in modules or scope not in self.function_registry:
+                return False
+        return True
+
+    def _receiver_type_is_external(
+        self,
+        call_name: str,
+        module_qn: str,
+        local_var_types: dict[str, str] | None,
+    ) -> bool:
+        # True only for a two-part dotted member call `obj.method` whose `obj` has an
+        # inferred local type that is known to be external. The receiver type is
+        # external when it resolves to nothing, or to a qn neither registered nor
+        # rooted at the project (a `std::string` -> `std.string`). Then the method
+        # lives on the external type, so the simple-name trie fallback must not
+        # rebind it to a same-named first-party method. An untyped receiver (obj
+        # absent from the map) or a project-rooted type is left alone: its method may
+        # still be resolved by the fallback (e.g. a cross-file imported-class call the
+        # precise path missed), so only a provably external type is suppressed.
+        var_type = self._two_part_receiver_type(call_name, local_var_types)
+        if var_type is None:
+            return False
+        import_map = self.import_processor.import_mapping.get(module_qn, {})
+        class_qn = self._resolve_class_qn_from_type(var_type, import_map, module_qn)
+        if not class_qn:
+            return True
+        # A project-rooted qn is always treated as first-party; otherwise the
+        # registry decides, under either spelling (see `_registered_class_qn`).
+        project_root = module_qn.split(cs.SEPARATOR_DOT, 1)[0]
+        if class_qn.split(cs.SEPARATOR_DOT, 1)[0] == project_root:
+            return False
+        return self._registered_class_qn(class_qn, module_qn) is None
+
+    def _is_python_call(self, call: _CallSite) -> bool:
+        # The pre-passes (constructor fields, decorators, property reads) omit
+        # the language, and their answers share the module-keyed cache with
+        # the call scan's, so a gate on `call.language` alone would let a
+        # pre-pass cache the very guess the scan is meant to refuse.
+        language = call.language or self._module_language(call.module_qn)
+        return language == cs.SupportedLanguage.PYTHON
+
+    def _receiver_is_external_python_module(self, call: _CallSite) -> bool:
+        # True for a Python `mod.attr(...)` whose `mod` is bound by an import
+        # of a module outside the project (`import subprocess`, `from
+        # concurrent import futures`). The attribute lives in that module, so
+        # the call has no first-party target, yet the name-only probes bound
+        # `subprocess.run` to whichever first-party `run` sat closest:
+        # `GraphUpdater.run` on this repository (issue #2360).
+        call_name, module_qn = call.call_name, call.module_qn
+        head, sep, _ = call_name.partition(cs.SEPARATOR_DOT)
+        if not sep or not self._is_python_call(call):
+            return False
+        # A local of that name shadows the module; the typed paths own it.
+        if call.local_var_types and head in call.local_var_types:
+            return False
+        import_map = self.import_processor.import_mapping.get(module_qn)
+        target = import_map.get(head) if import_map else None
+        if not target:
+            return False
+        # Every binding must be external: `try: import tomllib` / `except
+        # ImportError: import tomli as tomllib` is, while a branch that binds
+        # the name to first-party code leaves the fallbacks to find it.
+        rebinds = self.import_processor.python_import_rebinds.get(module_qn, {})
+        if not all(
+            self._import_target_is_external(bound, call_name, module_qn)
+            for bound in {target, *rebinds.get(head, ())}
+        ):
+            return False
+        logger.debug(
+            ls.CALL_EXTERNAL_MODULE_RECEIVER, call_name=call_name, target=target
+        )
+        return True
+
+    def _import_target_is_external(
+        self, target: str, call_name: str, module_qn: str
+    ) -> bool:
+        # The import processor writes a first-party target project-prefixed,
+        # but records bare the modules it cannot place: a script's `import
+        # helper` of the sibling `helper.py`, or `import helpers` in a
+        # repository whose root is a package. Such a target is first-party
+        # when the registry holds it under the project, or when a
+        # first-party definition spells out the called member in full.
+        project_root = module_qn.split(cs.SEPARATOR_DOT, 1)[0]
+        if target.split(cs.SEPARATOR_DOT, 1)[0] == project_root:
+            return False
+        if self._registered_class_qn(target, module_qn) is not None:
+            return False
+        if self._import_target_is_a_namespace(
+            f"{project_root}{cs.SEPARATOR_DOT}{target}"
+        ):
+            return False
+        member = call_name.partition(cs.SEPARATOR_DOT)[2]
+        module_name = target.rsplit(cs.SEPARATOR_DOT, 1)[-1]
+        spelled = f"{cs.SEPARATOR_DOT}{module_name}{cs.SEPARATOR_DOT}{member}"
+        return not any(
+            qn.endswith(spelled)
+            for qn in self.function_registry.find_ending_with(
+                _trie_search_name(call_name)
+            )
+        )
+
+    def _untyped_receiver_guess_is_ambiguous(self, call: _CallSite) -> bool:
+        # True for a Python member call on a receiver holding a value nothing
+        # typed (a parameter, a dict lookup's result, an unannotated field)
+        # when several first-party definitions share the member's name. The
+        # simple-name fallback picks among them by import distance alone,
+        # which is how `frontend.run()` and `agent.run()` bound
+        # `GraphUpdater.run` (issue #2360). A unique name still binds as a
+        # heuristic edge, the rule callable fields of unknown receiver type
+        # follow. A namespace receiver (an import, a class, a module-level
+        # alias) is not a value, and a typed receiver (a bare `self.m()`, an
+        # annotated field) is the typed paths' to answer or refuse, so all of
+        # them keep the fallback exactly as before.
+        call_name = call.call_name
+        if call.constructing or cs.SEPARATOR_DOT not in call_name:
+            return False
+        parts = call_name.split(cs.SEPARATOR_DOT)
+        head = parts[0]
+        if not head.isidentifier() or not self._is_python_call(call):
+            return False
+        on_self = head in _PY_SELF_RECEIVERS
+        if on_self and len(parts) == 2:
+            return False
+        if self._receiver_is_bound(call, parts, on_self):
+            return False
+        if len(self._trie_candidates(call_name, call.module_qn, call.call_point)) < 2:
+            return False
+        # Last, being the one probe that reads the module's AST.
+        return on_self or self._receiver_base_qn(head, call.module_qn) is None
+
+    def _receiver_is_bound(
+        self, call: _CallSite, parts: list[str], on_self: bool
+    ) -> bool:
+        # A typed local or an import names the receiver, so the typed and
+        # import paths answer the call and the fallback guard stays out.
+        local_types = call.local_var_types or {}
+        if cs.SEPARATOR_DOT.join(parts[:-1]) in local_types:
+            return True
+        if on_self:
+            return False
+        head = parts[0]
+        if head in local_types:
+            return True
+        import_map = self.import_processor.import_mapping.get(call.module_qn)
+        return bool(import_map) and head in import_map
+
+    def _try_resolve_iife(
+        self, call_name: str, module_qn: str
+    ) -> tuple[str, str] | None:
+        if not call_name:
+            return None
+        if not (
+            call_name.startswith(cs.IIFE_FUNC_PREFIX)
+            or call_name.startswith(cs.IIFE_ARROW_PREFIX)
+            or call_name.startswith(cs.PREFIX_IIFE_DIRECT)
+        ):
+            return None
+        iife_qn = f"{module_qn}.{call_name}"
+        if iife_qn in self.function_registry:
+            return self.function_registry[iife_qn], iife_qn
+        return None
+
+    def _is_super_call(self, call_name: str) -> bool:
+        return (
+            call_name == cs.KEYWORD_SUPER
+            or call_name.startswith(f"{cs.KEYWORD_SUPER}.")
+            or call_name.startswith(f"{cs.KEYWORD_SUPER}()")
+        )
+
+    def _followed_js_reexport(
+        self,
+        call_name: str,
+        import_map: dict[str, str],
+        language: cs.SupportedLanguage | None,
+        module_qn: str,
+    ) -> str | None:
+        # `import { plus } from "./lib"` maps `plus` to `lib.plus`, where a
+        # barrel registers nothing: its `export { add as plus } from` names
+        # the definition, possibly through further barrels. Without this the
+        # call fell to the name-only fallback, which found no `plus` at all,
+        # or only guessed the right `add` (issue #2464). None when the name
+        # leads nowhere else.
+        if language not in cs.JS_TS_LANGUAGES or call_name not in import_map:
+            return None
+        # `const fn = require("./lib")` maps `fn` to the module `pkg.lib`,
+        # which spells the same as `pkg/index.js`'s export `lib`: walked, the
+        # whole-module import reached that unrelated export (bot review on
+        # PR #2994).
+        if self.import_processor.binds_js_whole_module(module_qn, call_name):
+            return None
+        imported_qn = import_map[call_name]
+        followed = self.import_processor.follow_js_reexports(
+            imported_qn,
+            self.type_inference.module_qn_to_file_path,
+            self.function_registry,
+        )
+        return None if followed == imported_qn else followed
+
+    def _js_reexport_led_nowhere(
+        self, call_name: str, module_qn: str, language: cs.SupportedLanguage | None
+    ) -> bool:
+        # Asked once every precise lookup has failed, so a followed name is
+        # one whose end resolved to nothing. An end behind a non-standard
+        # scheme (`ext:`) is first-party code the walk cannot read, and keeps
+        # the name-only fallback, as a direct import of it does.
+        import_map = self.import_processor.import_mapping.get(module_qn)
+        if not import_map:
+            return False
+        followed = self._followed_js_reexport(
+            call_name, import_map, language, module_qn
+        )
+        return followed is not None and not (
+            self.import_processor.names_js_aliased_scheme(followed)
+        )
+
+    def _try_resolve_via_imports(
+        self,
+        call_name: str,
+        module_qn: str,
+        local_var_types: dict[str, str] | None,
+        language: cs.SupportedLanguage | None = None,
+        caller_qn: str | None = None,
+    ) -> tuple[str, str] | None:
+        if language == cs.SupportedLanguage.JULIA and caller_qn:
+            # A `using` inside a Julia `module` block binds only that block,
+            # so a nested module's imports shadow the file-level ones: walk
+            # the caller's module scopes innermost first.
+            for scope in self._julia_caller_scopes(caller_qn, module_qn):
+                import_map = self.import_processor.import_mapping.get(scope)
+                if not import_map:
+                    continue
+                if result := self._try_resolve_direct_import(
+                    call_name, import_map, language, scope
+                ):
+                    return result
+        import_map = self.import_processor.import_mapping.get(module_qn)
+        if import_map is None:
+            # A module with no `use`/import statements can still resolve a member
+            # call `obj.method()` through an inferred local/self type (a
+            # self-contained Rust lib.rs is the common case). Only the
+            # import-dependent lookups below (direct, qualified-by-import,
+            # wildcard) are no-ops here, so proceed with an empty map when there
+            # is type info to drive resolution; otherwise nothing would match.
+            if not local_var_types:
+                return None
+            import_map = {}
+
+        # The export walk goes first: a module may publish a name for another
+        # of its bindings (`export { beta as renamed }`, `module.exports = {
+        # renamed: beta }`) beside a local of that name, and the import gets
+        # the published one (bot review on PR #2994). The chain's end
+        # resolves as a direct import of it would, so a CommonJS whole-module
+        # export there is still reached; when it resolves to nothing (an
+        # external package), the module's own `renamed` is still not what
+        # the import names, so the direct import of it is skipped.
+        if followed := self._followed_js_reexport(
+            call_name, import_map, language, module_qn
+        ):
+            if result := self._try_resolve_direct_import(
+                call_name, {call_name: followed}, language, module_qn
+            ):
+                return result
+        elif result := self._try_resolve_direct_import(
+            call_name, import_map, language, module_qn
+        ):
+            return result
+
+        if result := self._try_resolve_qualified_call(
+            call_name, import_map, module_qn, local_var_types, language
+        ):
+            return result
+
+        return self._try_resolve_wildcard_imports(
+            call_name, import_map, language, module_qn
+        )
+
+    def _php_target_for_namespace_import(
+        self, imported_path: str, kind: NodeType | None = None
+    ) -> str | None:
+        """Map a PHP `use function A\\B\\c` target onto the qn that registers it.
+
+        CGR qualifies PHP by file path, so the import target `App.Text.format`
+        never equals the registered `project.text.format`. Previously that miss
+        dropped through to the simple-name trie, which binds to whichever
+        same-named function it reaches first -- so `use function App\\Text\\format`
+        could resolve to `App\\Money\\format` (issue #1185). A wrong edge, not a
+        missing one.
+
+        Splits the target into the namespace it names and the symbol within it,
+        then finds the module that DECLARED that namespace and looks the symbol
+        up there. PSR-4 maps a namespace prefix to a directory root, so the two
+        cannot be derived from one another -- the declaration is the only link.
+
+        Returns None rather than guessing whenever the answer is not unique:
+        no module declares the namespace, or several do (PHP permits one
+        namespace across many files, and two files may both define `format`).
+        The trie fallback then applies exactly as before, so this can only
+        replace an arbitrary binding with a determined one, never introduce a
+        new arbitrary one.
+
+        Matching is ASCII CASE-INSENSITIVE, because namespaces and function
+        names are in PHP: `use function app\\text\\FORMAT` binds to
+        `App\\Text\\format`, verified by executing it under PHP 8.5. Comparing
+        with exact casing sent such imports to the trie, which is the same
+        wrong-edge path this function exists to avoid.
+
+        ASCII-only rather than `str.casefold()`: PHP folds A-Z only, so
+        folding non-ASCII identifiers would match names the language treats as
+        distinct -- trading a missed binding for a wrong one. The registered
+        qualified name is returned unchanged; folding is for COMPARISON, never
+        for the value handed back, which must stay the graph's real key.
+        """
+        # A fully-qualified import (`use function \App\Text\format`) is
+        # idiomatic PHP and runs identically to the unqualified spelling,
+        # verified under PHP 8.5. The leading backslash becomes a leading
+        # separator when the path is dotted, which would never match a
+        # declared `App.Text`. Stripping it is a spelling normalisation, not a
+        # semantic change -- in PHP a `use` path is ALWAYS resolved from the
+        # global namespace whether or not the backslash is written.
+        imported_path = imported_path.lstrip(cs.SEPARATOR_DOT)
+        namespace, separator, symbol = imported_path.rpartition(cs.SEPARATOR_DOT)
+        if not separator or not namespace or not symbol:
+            return None
+        wanted = _php_fold(namespace)
+        namespaces = self.import_processor.php_module_namespaces
+        matches = [
+            (module_qn, f"{module_qn}{cs.SEPARATOR_DOT}{symbol}")
+            for module_qn, declared in namespaces.items()
+            if _php_fold(declared) == wanted
+        ]
+        found: list[str] = []
+        for module_qn, exact_qn in matches:
+            # `kind` keeps PHP's separate symbol tables apart: a class and a
+            # function may share a name in one namespace (issue #2466).
+            if exact_qn in self.function_registry and (
+                kind is None or self.function_registry[exact_qn] == kind
+            ):
+                found.append(exact_qn)
+                continue
+            # The symbol's casing may differ from the registration too, so a
+            # direct lookup can miss where PHP would bind. `find_with_prefix`
+            # is the registry's own scoped query -- iterating the whole
+            # registry is not part of the trie protocol at all, and would be
+            # a full scan per import even where it happened to work.
+            #
+            # NO trailing separator. The trie splits the prefix on dots and
+            # walks a node per part, so `"proj.text."` yields a final EMPTY
+            # part that is never a key and the lookup always returns []. An
+            # earlier version passed the dot and the whole case-insensitive
+            # fallback was silently dead (caught in review on #1484). The
+            # boundary is re-established below by requiring the remainder to
+            # start with the separator.
+            prefix = module_qn
+            wanted_symbol = _php_fold(symbol)
+            found.extend(
+                qn
+                for qn, qn_kind in self.function_registry.find_with_prefix(prefix)
+                if (kind is None or qn_kind == kind)
+                # `find_with_prefix` walks whole dot-separated parts, so the
+                # remainder always starts with the separator for a real
+                # descendant. Requiring it re-establishes the boundary the
+                # trailing dot used to provide, and rejects a sibling module
+                # whose name merely starts with this one (`proj.textutil`).
+                and (remainder := qn[len(prefix) :]).startswith(cs.SEPARATOR_DOT)
+                # Direct children only: a nested `module.Class.method` is not
+                # the free function this import names.
+                and cs.SEPARATOR_DOT not in remainder[1:]
+                and _php_fold(remainder[1:]) == wanted_symbol
+            )
+        if len(found) != 1:
+            return None
+        return found[0]
+
+    def _is_php_function_import(self, call_name: str, module_qn: str | None) -> bool:
+        """Whether `call_name` arrived via `use function`, not a class `use`.
+
+        Returns False when `module_qn` is unknown rather than defaulting to
+        True: an unidentified module cannot demonstrate the import was a
+        function binding, and the fallback's whole purpose is to avoid
+        asserting a target it cannot justify. The trie fallback still applies,
+        so this can only decline to add an edge, never remove a correct one.
+        """
+        if module_qn is None:
+            return False
+        imported = self.import_processor.php_function_imports.get(
+            module_qn, frozenset()
+        )
+        if call_name in imported:
+            return True
+        # PHP function names are case-insensitive at the CALL SITE too, so
+        # `use function App\Text\format` followed by `FORMAT()` is valid and
+        # runs. Verified by executing it under PHP 8.5. An exact-case lookup
+        # here recognised the import but not the call, so the resolver
+        # returned None and the call fell to the trie -- the same wrong-edge
+        # path, reached through the alias rather than the target.
+        folded = _php_fold(call_name)
+        return any(_php_fold(name) == folded for name in imported)
+
+    def resolve_php_class_path(
+        self, path: PhpClassPath, module_qn: str
+    ) -> tuple[str, str] | None:
+        """The class a fully qualified PHP class path names (issue #2466).
+
+        A class is a candidate only where PHP declares it in the namespace the
+        path spells. A file with one statement-form namespace records it per
+        module, which also matches a class written in another case; a class
+        in a braced block is registered under that block (`mod.Vendor.Box`)
+        and the file records nothing, so its declaration says where it lives.
+        A namespaced path binds exactly or not at all. A global path binds
+        the caller's own class exactly and another file's by name only.
+        """
+        *namespace, symbol = path
+        if namespace and (
+            class_qn := self._php_target_for_namespace_import(
+                cs.SEPARATOR_DOT.join(path), kind=NodeType.CLASS
+            )
+        ):
+            return self.function_registry[class_qn], class_qn
+        wanted = tuple(_php_fold(part) for part in namespace)
+        candidates = [
+            qn
+            for qn in self._php_class_candidates(symbol)
+            if self._php_declared_namespace(qn) == wanted
+        ]
+        if namespace:
+            # Several files declaring one namespaced class is a conditional
+            # declaration this site cannot choose between.
+            if len(candidates) != 1:
+                return None
+            return self.function_registry[candidates[0]], candidates[0]
+        if own := next(
+            (qn for qn in candidates if self._parent_qn(qn) == module_qn), None
+        ):
+            return self.function_registry[own], own
+        if not candidates:
+            return None
+        best = self._best_trie_candidate(candidates, module_qn)
+        self.last_resolution = cs.EdgeResolution.HEURISTIC
+        return self.function_registry[best], best
+
+    def _php_class_candidates(self, symbol: str) -> list[str]:
+        # Every class whose name PHP would match to `symbol`, which compares
+        # class names ASCII case-insensitively: as written, declared in lower
+        # case, or declared with capitals (`new box()` builds `Box`). Each is
+        # named as declared, which is what the edge must target.
+        folded = _php_fold(symbol)
+        found = dict.fromkeys(
+            [
+                *self.function_registry.find_ending_with(symbol),
+                *self.function_registry.find_ending_with(folded),
+                *self._php_cased_definitions().classes.get(folded, ()),
+            ]
+        )
+        return [qn for qn in found if self.function_registry[qn] == NodeType.CLASS]
+
+    def _php_declared_namespace(self, class_qn: str) -> PhpClassPath | None:
+        # The ASCII-folded namespace PHP declares `class_qn` in; None when its
+        # file is not PHP or its declaration cannot be read this run, which
+        # never passes for the global namespace.
+        if self._module_language(class_qn) != cs.SupportedLanguage.PHP:
+            return None
+        module_qn = self._php_module_of(class_qn)
+        if module_qn is None:
+            return None
+        declared = self._php_class_namespaces.get(module_qn)
+        if declared is None:
+            root = self._cached_module_root(module_qn)
+            declared = (
+                {
+                    qn: tuple(_php_fold(part) for part in namespace)
+                    for qn, namespace in php_class_names.declared_class_namespaces(
+                        root, module_qn
+                    ).items()
+                }
+                if root is not None
+                else {}
+            )
+            self._php_class_namespaces[module_qn] = declared
+        return declared.get(class_qn)
+
+    def _php_module_of(self, qualified_name: str) -> str | None:
+        modules = self.type_inference.module_qn_to_file_path
+        probe = qualified_name
+        while cs.SEPARATOR_DOT in probe:
+            probe = self._parent_qn(probe)
+            if probe in modules:
+                return probe
+        return None
+
+    def resolve_php_method_on_class_path(
+        self, path: PhpClassPath, method_name: str, module_qn: str
+    ) -> tuple[str, str] | None:
+        """`method_name` on the class `path` names, declared or inherited."""
+        if (owner := self.resolve_php_class_path(path, module_qn)) is None:
+            return None
+        return self._php_method(owner[1], method_name)
+
+    def php_constructor(self, class_qn: str) -> tuple[str, str] | None:
+        """The `__construct` a `new` of `class_qn` runs: the class's own, else
+        the nearest one it inherits, which PHP runs in its place."""
+        return self._php_method(class_qn, cs.PHP_METHOD_CONSTRUCT)
+
+    def _php_method(self, class_qn: str, method_name: str) -> tuple[str, str] | None:
+        # PHP method names are ASCII case-insensitive, so a child's
+        # `__CONSTRUCT` overrides its parent's `__construct`: each class is
+        # searched in any casing before its ancestors are, and the edge names
+        # the method as declared.
+        wanted = _php_fold(method_name)
+        queue = deque([class_qn])
+        seen = {class_qn}
+        while queue:
+            owner = self._follow_reexports(queue.popleft())
+            if (
+                method_qn := self._php_declared_method(owner, method_name, wanted)
+            ) is not None:
+                return self.function_registry[method_qn], method_qn
+            for parent in self.class_inheritance.get(owner, []):
+                if parent not in seen:
+                    seen.add(parent)
+                    queue.append(parent)
+        return None
+
+    def _php_declared_method(
+        self, owner_qn: str, method_name: str, folded: str
+    ) -> str | None:
+        for spelling in (method_name, folded):
+            method_qn = f"{owner_qn}{cs.SEPARATOR_DOT}{spelling}"
+            if self.function_registry.get(method_qn) == NodeType.METHOD:
+                return method_qn
+        return self._php_cased_definitions().methods.get((owner_qn, folded))
+
+    def _php_cased_definitions(self) -> _PhpCasedIndex:
+        # PHP classes and methods declared with an upper-case letter, by
+        # folded name. A lookup by the written or the folded spelling misses
+        # them (`box` for `Box`, `__construct` for `__CONSTRUCT`), and the
+        # registry's prefix walk cannot list a method like `__CONSTRUCT`,
+        # since the trie skips every `__`-prefixed key as one of its markers.
+        if self._php_cased_index is None:
+            index = _PhpCasedIndex({}, {})
+            for qn, kind in self.function_registry.items():
+                if kind not in (NodeType.CLASS, NodeType.METHOD):
+                    continue
+                owner_qn, _, leaf = qn.rpartition(cs.SEPARATOR_DOT)
+                if (folded := _php_fold(leaf)) == leaf or (
+                    self._module_language(owner_qn) != cs.SupportedLanguage.PHP
+                ):
+                    continue
+                if kind == NodeType.METHOD:
+                    index.methods.setdefault((owner_qn, folded), qn)
+                else:
+                    index.classes.setdefault(folded, []).append(qn)
+            self._php_cased_index = index
+        return self._php_cased_index
+
+    def _php_import_key(self, call_name: str, import_map: dict[str, str]) -> str | None:
+        """The import-map key matching `call_name` under PHP case folding.
+
+        Returns None unless EXACTLY ONE key folds to the same name. Two keys
+        differing only in case cannot both be the intended target, and PHP
+        would reject the duplicate `use` at compile time anyway -- so
+        declining is correct rather than cautious, and the trie fallback still
+        applies.
+        """
+        folded = _php_fold(call_name)
+        matches = [key for key in import_map if _php_fold(key) == folded]
+        return matches[0] if len(matches) == 1 else None
+
+    @staticmethod
+    def _julia_caller_scopes(caller_qn: str, module_qn: str) -> list[str]:
+        # The caller's module scopes innermost first (the file module last).
+        if not caller_qn.startswith(f"{module_qn}{cs.SEPARATOR_DOT}"):
+            return [module_qn]
+        parts = caller_qn[len(module_qn) + 1 :].split(cs.SEPARATOR_DOT)
+        scopes = [module_qn]
+        prefix = module_qn
+        for part in parts[:-1]:
+            prefix = f"{prefix}{cs.SEPARATOR_DOT}{part}"
+            scopes.insert(0, prefix)
+        return scopes
+
+    def _try_resolve_direct_import(
+        self,
+        call_name: str,
+        import_map: dict[str, str],
+        language: cs.SupportedLanguage | None = None,
+        module_qn: str | None = None,
+    ) -> tuple[str, str] | None:
+        if call_name in import_map:
+            imported_qn = import_map[call_name]
+        elif (
+            language == cs.SupportedLanguage.PHP
+            and (folded_key := self._php_import_key(call_name, import_map)) is not None
+        ):
+            # PHP records `import_map` under the DECLARATION spelling, so a
+            # call written `FORMAT()` against `use function App\Text\format`
+            # misses this lookup entirely and never reaches the folded
+            # binding-kind gate below. Reported on #1484 after an earlier fix
+            # addressed only the gate: the exact-case map lookup in FRONT of
+            # it is where the miss actually happens.
+            imported_qn = import_map[folded_key]
+            call_name = folded_key
+        else:
+            return None
+        # Gated on the CALLER's language AND on the import being a
+        # `use function` binding.
+        #
+        # The language gate: the namespace map is keyed by module qn and holds
+        # only PHP modules, but the import targets it is matched against are
+        # dotted strings that any language can produce -- a JS
+        # `import { format } from ...` recorded as `App.Text.format` would
+        # resolve straight into a PHP function. Reproduced in review on #1484:
+        # a JavaScript caller bound to a PHP target, an edge across languages
+        # that no source expressed.
+        #
+        # The `use function` gate: PHP keeps classes and functions in SEPARATE
+        # symbol tables, so `use App\Text\format` imports a CLASS while
+        # `use function App\Text\format` imports a function. Without this, a
+        # class or constant import whose name happens to match a registered
+        # PHP function resolved to that function -- also reproduced in review,
+        # and it SURVIVED the language gate because the caller is PHP. The two
+        # are independent axes. `php_function_imports` already records which
+        # local names arrived via `use function`, so this needs no new parsing.
+        if (
+            language == cs.SupportedLanguage.PHP
+            and self._is_php_function_import(call_name, module_qn)
+            and imported_qn not in self.function_registry
+            and (php_qn := self._php_target_for_namespace_import(imported_qn))
+        ):
+            logger.debug(ls.CALL_DIRECT_IMPORT, call_name=call_name, qn=php_qn)
+            return self.function_registry[php_qn], php_qn
+        if imported_qn in self.function_registry:
+            logger.debug(ls.CALL_DIRECT_IMPORT, call_name=call_name, qn=imported_qn)
+            return self.function_registry[imported_qn], imported_qn
+        for target in self._module_import_targets(imported_qn, call_name, language):
+            if target in self.function_registry:
+                logger.debug(ls.CALL_DIRECT_IMPORT, call_name=call_name, qn=target)
+                return self.function_registry[target], target
+        return None
+
+    def _module_import_targets(
+        self,
+        imported_qn: str,
+        call_name: str,
+        language: cs.SupportedLanguage | None,
+    ) -> Iterator[str]:
+        """The definitions an import that names no definition stands for.
+
+        In the order the call should try them; the caller keeps the first
+        one that is registered.
+        """
+        if language == cs.SupportedLanguage.JULIA:
+            # A Julia selected import (`using .api: alpha`) binds the local
+            # name to the source MODULE; resolve the member exactly before
+            # the name trie, or a same-named function soaks the edge.
+            yield from self.import_processor.julia_member_qn_candidates(
+                imported_qn, call_name
+            )
+        # A whole-module require alias (`const f = require('./m'); f(x)`)
+        # maps to the MODULE qn; when that module's entire export is one
+        # function (`module.exports = function ... `), the call is a call to
+        # that function (issue #991, fastify's error-serializer).
+        direct = self.import_processor.commonjs_direct_exports.get(
+            self._js_module_key(imported_qn)
+        )
+        if direct is not None:
+            yield direct
+        # An ES-module default import maps to `<module>.default`, which no
+        # definition is registered under; the module's `export default` names
+        # the definition the call reaches (issue #2724).
+        if imported_qn.endswith(cs.IMPORT_DEFAULT_SUFFIX):
+            default = self.import_processor.esm_default_exports.get(
+                self._js_module_key(imported_qn[: -len(cs.IMPORT_DEFAULT_SUFFIX)])
+            )
+            if default is not None:
+                yield default
+
+    def _js_module_key(self, module_qn: str) -> str:
+        # `require("./worker")` and `import run from "./worker"` name the
+        # directory, while the module both export maps key on is
+        # `worker/index.ts`; `worker.ts` wins when both exist, as on disk.
+        found = js_ts_module_qn(module_qn, self.type_inference.module_qn_to_file_path)
+        return found or module_qn
+
+    def _try_resolve_qualified_call(
+        self,
+        call_name: str,
+        import_map: dict[str, str],
+        module_qn: str,
+        local_var_types: dict[str, str] | None,
+        language: cs.SupportedLanguage | None = None,
+    ) -> tuple[str, str] | None:
+        if language == cs.SupportedLanguage.CSHARP:
+            result, decided = self._resolve_csharp_qualified_call(
+                call_name, module_qn, local_var_types
+            )
+            if result is not None:
+                return result
+            if decided:
+                return None
+        if cs.SEPARATOR_DOUBLE_COLON in call_name:
+            separator = cs.SEPARATOR_DOUBLE_COLON
+        elif cs.CHAR_COLON in call_name:
+            separator = cs.CHAR_COLON
+        elif cs.SEPARATOR_DOT in call_name:
+            separator = cs.SEPARATOR_DOT
+        else:
+            return None
+
+        parts = call_name.split(separator)
+
+        if len(parts) == 2:
+            if result := self._resolve_two_part_call(
+                parts,
+                call_name,
+                separator,
+                import_map,
+                module_qn,
+                local_var_types,
+                language,
+            ):
+                return result
+
+        if len(parts) >= 3 and parts[0] == cs.KEYWORD_SELF:
+            return self._resolve_self_attribute_call(
+                parts, call_name, import_map, module_qn, local_var_types
+            )
+
+        return self._resolve_multi_part_call(
+            parts, call_name, import_map, module_qn, local_var_types
+        )
+
+    def _try_resolve_csharp_qualified_call(
+        self,
+        call_name: str,
+        module_qn: str,
+        local_var_types: dict[str, str] | None = None,
+    ) -> tuple[str, str] | None:
+        result, _ = self._resolve_csharp_qualified_call(
+            call_name, module_qn, local_var_types
+        )
+        return result
+
+    def _csharp_dotted_path_shadowed(
+        self, call_name: str, local_var_types: dict[str, str] | None
+    ) -> bool:
+        return bool(
+            local_var_types
+            and cs.SEPARATOR_DOT in call_name
+            and cs.SEPARATOR_DOUBLE_COLON not in call_name
+            and not call_name.startswith(f"global{cs.SEPARATOR_DOT}")
+            and call_name.split(cs.SEPARATOR_DOT, 1)[0] in local_var_types
+        )
+
+    def _resolve_csharp_qualified_call(
+        self,
+        call_name: str,
+        module_qn: str,
+        local_var_types: dict[str, str] | None = None,
+    ) -> tuple[tuple[str, str] | None, bool]:
+        if self._csharp_dotted_path_shadowed(call_name, local_var_types):
+            return None, False
+        path = call_name.replace(cs.SEPARATOR_DOUBLE_COLON, cs.SEPARATOR_DOT)
+        global_prefix = f"global{cs.SEPARATOR_DOT}"
+        is_global = path.startswith(global_prefix)
+        if path.startswith(global_prefix):
+            path = path[len(global_prefix) :]
+        parts = _split_csharp_qualified_path(path)
+        if len(parts) < 2 or any(not part for part in parts):
+            return None, False
+
+        type_inference = self.type_inference.csharp_type_inference
+        for cut in range(len(parts), 0, -1):
+            type_path = cs.SEPARATOR_DOT.join(parts[:cut])
+            if is_global:
+                type_path = f"global{cs.SEPARATOR_DOUBLE_COLON}{type_path}"
+            class_qn = type_inference._qualified_type_name_to_qn(type_path, module_qn)
+            if class_qn is None:
+                continue
+            if cut == len(parts):
+                return (cs.NodeLabel.CLASS, class_qn), True
+            # A namespace-qualified type owns the path even when the member is
+            # missing; an unqualified value receiver may still be a field chain.
+            return self._csharp_type_member(class_qn, parts[cut:]), True
+        if (
+            not is_global
+            and cs.SEPARATOR_DOUBLE_COLON not in call_name
+            and self._csharp_path_starts_with_imported_namespace(parts, module_qn)
+        ):
+            return None, True
+        return None, False
+
+    def _csharp_type_member(
+        self, class_qn: str, member_parts: list[str]
+    ) -> tuple[str, str] | None:
+        # The member a qualified path names on a resolved type: a registered
+        # method directly, else a single-segment name inherited from a base.
+        member_name = cs.SEPARATOR_DOT.join(member_parts).split(cs.CHAR_ANGLE_OPEN, 1)[
+            0
+        ]
+        method_qn = f"{class_qn}{cs.SEPARATOR_DOT}{member_name}"
+        if method_qn in self.function_registry:
+            return self.function_registry[method_qn], method_qn
+        if cs.SEPARATOR_DOT not in member_name:
+            return self._resolve_inherited_method(class_qn, member_name)
+        return None
+
+    def _csharp_path_starts_with_imported_namespace(
+        self, parts: list[str], module_qn: str
+    ) -> bool:
+        import_map = self.import_processor.import_mapping.get(module_qn, {})
+        namespaces = {
+            namespace
+            for module_namespaces in self.import_processor._csharp_module_namespaces.values()
+            for namespace in module_namespaces
+        }
+        for cut in range(len(parts), 0, -1):
+            prefix = cs.SEPARATOR_DOT.join(parts[:cut])
+            local_name, separator, remainder = prefix.partition(cs.SEPARATOR_DOT)
+            imported = import_map.get(local_name)
+            if imported is None:
+                continue
+            expanded = f"{imported}{separator}{remainder}" if separator else imported
+            if expanded in namespaces:
+                return True
+        return False
+
+    def _has_separator(self, call_name: str) -> bool:
+        return (
+            cs.SEPARATOR_DOT in call_name
+            or cs.SEPARATOR_DOUBLE_COLON in call_name
+            or cs.CHAR_COLON in call_name
+        )
+
+    def _get_separator(self, call_name: str) -> str:
+        if cs.SEPARATOR_DOUBLE_COLON in call_name:
+            return cs.SEPARATOR_DOUBLE_COLON
+        if cs.CHAR_COLON in call_name:
+            return cs.CHAR_COLON
+        return cs.SEPARATOR_DOT
+
+    def _try_resolve_wildcard_imports(
+        self,
+        call_name: str,
+        import_map: dict[str, str],
+        language: cs.SupportedLanguage | None = None,
+        module_qn: str | None = None,
+    ) -> tuple[str, str] | None:
+        map_id = id(import_map)
+        if map_id not in self._wildcard_cache:
+            self._wildcard_cache[map_id] = (
+                [(k, v) for k, v in import_map.items() if k[0] == "*"]
+                if import_map
+                else []
+            )
+        wildcards = self._wildcard_cache[map_id]
+        if not wildcards:
+            return None
+        if language == cs.SupportedLanguage.RUST:
+            return self._try_rust_globs(call_name, wildcards, module_qn)
+        for _, imported_qn in wildcards:
+            if result := self._try_wildcard_qns(call_name, imported_qn):
+                self.last_resolution = cs.EdgeResolution.HEURISTIC
+                return result
+        return None
+
+    def _try_rust_globs(
+        self,
+        call_name: str,
+        wildcards: list[tuple[str, str]],
+        module_qn: str | None,
+    ) -> tuple[str, str] | None:
+        # rustc resolves a glob at compile time, as it does a named `use`;
+        # only Python's `import *` can hang on a run-time `__all__` (issue
+        # #3172). A glob imports only what it can see: under `use hidden::*;`
+        # a private `hidden::drop` is not what `drop(v)` calls, the
+        # prelude's is, so a function the glob may not see is never certain
+        # (PR #3242 review). Two visible providers are an ambiguity rustc
+        # rejects, and one whose visibility is unknown may be the second, so
+        # neither case is claimed exact.
+        hits = self._rust_glob_hits(call_name, wildcards, module_qn)
+        if not hits:
+            return None
+        visible = [hit for hit, sees in hits.items() if sees]
+        certain = len(visible) == 1 and None not in hits.values()
+        self.last_resolution = (
+            cs.EdgeResolution.EXACT if certain else cs.EdgeResolution.HEURISTIC
+        )
+        return (visible or list(hits))[0]
+
+    def _rust_glob_hits(
+        self,
+        call_name: str,
+        wildcards: list[tuple[str, str]],
+        module_qn: str | None,
+    ) -> dict[tuple[str, str], bool | None]:
+        # Everything the globs supply under the name, a globbed module's own
+        # members before those it re-exports, each with whether some glob
+        # supplying it can see it (None: not known).
+        direct: list[tuple[tuple[str, str], str]] = []
+        through: list[tuple[tuple[str, str], str]] = []
+        for _, imported_qn in wildcards:
+            if hit := self._try_wildcard_qns(call_name, imported_qn):
+                direct.append((hit, imported_qn))
+            elif hit := self._rust_glob_reexport(call_name, imported_qn, module_qn):
+                through.append((hit, imported_qn))
+        hits: dict[tuple[str, str], bool | None] = {}
+        for hit, imported_qn in (*direct, *through):
+            if hits.get(hit) is not True:
+                hits[hit] = self._rust_glob_sees(hit, imported_qn, module_qn)
+        return hits
+
+    def _rust_glob_sees(
+        self, hit: tuple[str, str], imported_qn: str, module_qn: str | None
+    ) -> bool | None:
+        # Plain `pub` reaches every module; any other visibility reaches the
+        # subtree of the module it names, counted from the function's own
+        # module (`crate`: the whole crate, `super`: the parent's). The
+        # globbed module must see the function to hold or re-export it, and
+        # the caller's module to import it. Only a function's visibility is
+        # recorded: a glob reaching a tuple struct's constructor, private
+        # or not, is not known to import it.
+        node_type, qn = hit
+        if node_type != NodeType.FUNCTION:
+            return None
+        if (path := self.function_registry.rust_visibility(qn)) is None:
+            return True
+        root = self.import_processor.rust_visibility_root(
+            path, qn.rpartition(cs.SEPARATOR_DOT)[0]
+        )
+        if root is None:
+            return True
+        return (
+            module_qn is not None
+            and self._rust_module_sees(module_qn, root)
+            and self._rust_module_sees(imported_qn, root)
+        )
+
+    def _rust_glob_reexport(
+        self, call_name: str, imported_qn: str, module_qn: str | None
+    ) -> tuple[str, str] | None:
+        # A globbed module may hold the function only through its own
+        # `pub use self::inner::*;` or `pub use inner::helper;`. Types already
+        # followed those hops; a function missed them, fell to the
+        # project-wide name search and bound a same-named decoy (#3172). The
+        # glob is the caller's module's, so a private `use` in the globbed
+        # module, which binds its name there alone, is not followed.
+        if cs.SEPARATOR_DOUBLE_COLON in imported_qn:
+            return None
+        target = f"{imported_qn}{cs.SEPARATOR_DOT}{call_name}"
+        hit, _unknown = self._follow_rust_scope_item(
+            target, {target}, via_glob_from=module_qn
+        )
+        return hit if hit is not None and hit[0] == NodeType.FUNCTION else None
+
+    def _try_wildcard_qns(
+        self, call_name: str, imported_qn: str
+    ) -> tuple[str, str] | None:
+        potential_qns = []
+        if cs.SEPARATOR_DOUBLE_COLON not in imported_qn:
+            potential_qns.append(f"{imported_qn}.{call_name}")
+        potential_qns.append(f"{imported_qn}{cs.SEPARATOR_DOUBLE_COLON}{call_name}")
+
+        for wildcard_qn in potential_qns:
+            if wildcard_qn in self.function_registry:
+                logger.debug(ls.CALL_WILDCARD, call_name=call_name, qn=wildcard_qn)
+                return self.function_registry[wildcard_qn], wildcard_qn
+        return None
+
+    def _try_resolve_rust_inline_scope(
+        self, call_name: str, module_qn: str, caller_qn: str, call_point: int | None
+    ) -> tuple[tuple[str, str] | None] | None:
+        """Resolve a bare call through the caller's enclosing Rust scopes.
+
+        Probes the caller's OWN body uses first (kept in a separate map:
+        `mod run` and `fn run` occupy different Rust namespaces but share
+        one qn string, so the module-keyed map must never answer for the
+        function itself), then walks the enclosing inline modules down to
+        the file module, checking each scope's own items, the caller's
+        weak entries (its enclosing mod's use fanned out per function, in
+        case the mod's shared key was arbitrated to a twin), and the
+        scope's import map. An item declared by a block the call sits
+        inside outranks the body use and every one of those scopes, and
+        binds by SPAN: the block item and a same-named item at module
+        level both register flat in one module, so a name lookup would
+        answer with whichever of them took the natural qn (issue #1026).
+        Initializer-block uses are served earlier, by
+        the site-gated probe in _resolve_function_call. Returns a 1-tuple
+        so a deliberate drop (the scope imports the name from OUTSIDE the
+        indexed first-party graph) is distinguishable from "no scope
+        claims it".
+        """
+        if (
+            cs.SEPARATOR_DOT in call_name
+            or cs.SEPARATOR_DOUBLE_COLON in call_name
+            or not caller_qn.startswith(f"{module_qn}{cs.SEPARATOR_DOT}")
+        ):
+            return None
+        target = self.import_processor.rust_fn_scope_imports.get(caller_qn, {}).get(
+            call_name
+        )
+        if target is None:
+            local, target = self._rust_walk_enclosing_scopes(
+                call_name, module_qn, caller_qn, call_point
+            )
+            if local is not None:
+                return (local,)
+        if target is None:
+            return None
+        return (self._follow_rust_scope_target(target),)
+
+    def _rust_walk_enclosing_scopes(
+        self, call_name: str, module_qn: str, caller_qn: str, call_point: int | None
+    ) -> tuple[tuple[str, str] | None, str | None]:
+        """Walk the caller's inline mods outwards for an item or an import.
+
+        Returns (resolved item, import target): the first scope owning the
+        name as its own item answers outright, otherwise the innermost
+        binding found on the way out is handed back for following.
+        """
+        import_mapping = self.import_processor.import_mapping
+        weak = self.import_processor.rust_fn_scope_mod_imports.get(caller_qn, {}).get(
+            call_name
+        )
+        scope = caller_qn.rsplit(cs.SEPARATOR_DOT, 1)[0]
+        while len(scope) > len(module_qn):
+            # The scope segment may be an impl target whose method a
+            # bare path can never name (issue #1011). A block-local item
+            # that took the scope's flat qn answers to that name too, and
+            # is out of scope wherever its block is not (issue #1061).
+            if (
+                local := self._scope_candidate(
+                    scope, call_name, cs.SupportedLanguage.RUST
+                )
+            ) and not self._rust_block_item_hidden(local[1], module_qn, call_point):
+                return local, None
+            raw = import_mapping.get(scope, {}).get(call_name)
+            target = weak if weak is not None else raw
+            if target == cs.RUST_UNRESOLVABLE_QN:
+                # An inner unrepresentable #[path] import still OWNS the
+                # imported name and shadows any outer same-named item, so it
+                # is a deliberate drop: stop the walk and hand the sentinel
+                # back rather than letting an outer binding answer (#1082).
+                return None, target
+            if target is not None:
+                return None, target
+            scope = scope.rsplit(cs.SEPARATOR_DOT, 1)[0]
+        return None, None
+
+    def _rust_block_item_hidden(
+        self, qn: str, module_qn: str, call_point: int | None
+    ) -> bool:
+        """Is `qn` a Rust block-local item this call site sits outside of?
+
+        A site with no recorded position cannot be placed against the
+        block's span. Flow and taint passes resolve that way, so an
+        unplaceable site keeps the item reachable rather than losing the
+        edge outright.
+        """
+        if call_point is None or qn not in self.import_processor.rust_block_item_qns:
+            return False
+        return not any(
+            start <= call_point < end and qn in items.values()
+            for start, end, items in self.import_processor.rust_block_items.get(
+                module_qn, ()
+            )
+        )
+
+    def _rust_block_item_at(
+        self, module_qn: str, name: str, call_point: int | None
+    ) -> str | None:
+        """The item `name` binds to in the innermost block holding this site.
+
+        Innermost wins: nested blocks may each declare the name, and only
+        the tightest one is in scope where the call is written. Keyed by
+        FILE, not by caller: a fn declared inside the block is inside the
+        block, so its own body binds the block's items too.
+        """
+        return rs_utils.block_item_at(
+            self.import_processor.rust_block_items.get(module_qn, ()),
+            self.function_registry,
+            name,
+            call_point,
+        )
+
+    def _try_resolve_rust_module_qualified(
+        self, call_name: str, module_qn: str, caller_qn: str | None
+    ) -> tuple[tuple[str, str] | None, bool]:
+        """Bind `module::item` inside the named module, or drop.
+
+        Returns (result, decided). Undecided (False) means the path names
+        no first-party module here and the ordinary fallbacks apply: a
+        registered type's associated call, or an external path such as
+        std::mem::replace. Decided with None means the module is real but
+        holds no such item, so the edge is dropped rather than rebound by
+        bare name.
+
+        The first segment binds where Rust binds it: the caller's inner
+        scopes first (an inline mod's own child module or use shadows the
+        file's), then the file module's use (at most one binding per
+        scope is legal, E0255/E0428), then the file's own submodule tree
+        via the same relative-path machinery its use declarations resolve
+        through (entry files attach submodules beside themselves via the
+        declaring scan; other files nest them). A use binding the segment
+        to a path outside the indexed project decides a drop when the
+        path's head is a standard-library crate (external by
+        construction) and stops the probe undecided otherwise: the name
+        is spoken for either way, so the module tree must not claim it.
+        """
+        parts = call_name.split(cs.SEPARATOR_DOUBLE_COLON)
+        object_path, item = parts[:-1], parts[-1]
+        if not item or not all(object_path):
+            return None, False
+        head = object_path[0]
+        if head in (cs.RUST_CRATE_KEYWORD, cs.KEYWORD_SELF, cs.KEYWORD_SUPER):
+            return self._resolve_rust_prefixed_path(
+                object_path, item, module_qn, caller_qn
+            )
+        # A module the caller bound with `use path::{self}` is a module, full
+        # stop: decide through it before the type probe below, whose
+        # name-based resolution would otherwise answer with a same-named
+        # value and abandon the path (issue #1054).
+        if binding := self._rust_self_module_head(head, module_qn, caller_qn):
+            mapped, scope = binding
+            return self._decide_rust_module_item(mapped, object_path[1:], item, scope)
+        # A registered type as the first segment is an associated-function
+        # call, owned by the class-resolution paths.
+        if self._resolve_class_name(head, module_qn):
+            return None, False
+        import_mapping = self.import_processor.import_mapping
+        for scope in self._rust_enclosing_scopes(module_qn, caller_qn):
+            base = cs.SEPARATOR_DOT.join([scope, *object_path])
+            target = f"{base}{cs.SEPARATOR_DOT}{item}"
+            if (hit := self.function_registry.get(target)) is not None:
+                return (hit, target), True
+            if base in import_mapping:
+                # The scope's own child module holds the item only via
+                # re-exports; it still shadows every outer same-named
+                # module, so the decision is made HERE.
+                return self._decide_rust_base(base, item)
+            if mapped := import_mapping.get(scope, {}).get(head):
+                return self._decide_rust_module_item(
+                    mapped, object_path[1:], item, scope
+                )
+        if mapped := import_mapping.get(module_qn, {}).get(head):
+            return self._decide_rust_module_item(
+                mapped, object_path[1:], item, module_qn
+            )
+        base = self.import_processor._rust_resolve_relative(
+            module_qn, list(object_path), module_qn
+        )
+        return self._decide_rust_base(base, item)
+
+    def _rust_self_module_head(
+        self, head: str, module_qn: str, caller_qn: str | None
+    ) -> tuple[str, str] | None:
+        # A `use path::{self}` binding names a MODULE outright, so it answers
+        # a qualified `head::item` even when the shared import map's one slot
+        # went to a value of the same name, which Rust's separate namespaces
+        # allow (issue #1054). Innermost scope first, like every other Rust
+        # name lookup here.
+        self_modules = self.import_processor.rust_self_module_imports
+        for scope in (*self._rust_enclosing_scopes(module_qn, caller_qn), module_qn):
+            if mapped := self_modules.get(scope, {}).get(head):
+                return mapped, scope
+        return None
+
+    def _resolve_rust_prefixed_path(
+        self,
+        object_path: list[str],
+        item: str,
+        module_qn: str,
+        caller_qn: str | None,
+    ) -> tuple[tuple[str, str] | None, bool]:
+        # crate:: is chain-independent; self::/super:: count from the caller's
+        # enclosing MOD chain, which qn space cannot reconstruct -- an inline
+        # mod and an impl block are both a bare segment. The ingest pass walked
+        # the AST and recorded the answer, so read it (issue #1086). Without a
+        # record (a rehydrated definition, a body-local fn), an impl block
+        # still resolves from the file module exactly like a free function
+        # (issue #1093); only a genuine declared mod chain declines, letting
+        # the ordinary fallbacks keep their weaker but safe answer.
+        effective_module = module_qn
+        if object_path[0] != cs.RUST_CRATE_KEYWORD:
+            recorded = self.rust_function_modules.get(caller_qn) if caller_qn else None
+            if recorded is not None:
+                effective_module = recorded
+            elif self._rust_enclosing_mod_scopes(module_qn, caller_qn):
+                return None, False
+        base = self.import_processor._rewrite_rust_local_use_path(
+            cs.SEPARATOR_DOUBLE_COLON.join(object_path), effective_module
+        )
+        if base == cs.RUST_UNRESOLVABLE_QN:
+            # The path names a module backed by a file the qn scheme cannot
+            # key (an unrepresentable #[path]): it has no referent, so drop it
+            # rather than let a weaker fallback bind a name-derived shadow
+            # file that merely sits where the name points (issue #1082).
+            return None, True
+        if cs.SEPARATOR_DOUBLE_COLON in base:
+            return None, False
+        return self._decide_rust_base(base, item)
+
+    def _rust_enclosing_scopes(
+        self, module_qn: str, caller_qn: str | None
+    ) -> list[str]:
+        # The caller's qn scopes strictly between it and the file module,
+        # innermost first (inline mod chains; impl targets appear too,
+        # harmlessly, since mod-level use storage keys mirror them).
+        if not caller_qn or not caller_qn.startswith(f"{module_qn}{cs.SEPARATOR_DOT}"):
+            return []
+        scopes = []
+        scope = caller_qn.rsplit(cs.SEPARATOR_DOT, 1)[0]
+        while len(scope) > len(module_qn):
+            scopes.append(scope)
+            scope = scope.rsplit(cs.SEPARATOR_DOT, 1)[0]
+        return scopes
+
+    def _rust_enclosing_mod_scopes(
+        self, module_qn: str, caller_qn: str | None
+    ) -> list[str]:
+        """Enclosing scopes that are inline `mod` blocks, not impl targets.
+
+        `_rust_enclosing_scopes` deliberately keeps impl targets, whose use
+        storage keys mirror mod scopes. A `super::` path cares which is which:
+        an impl block adds no module level, so a method's `super::` counts
+        from the file module's parent, while an inline mod's does not.
+
+        Membership of the ingested inline-mod set is what decides it. Asking
+        the type registry instead only proves a scope is NOT a registered
+        type, which an impl target on a primitive or an unindexed foreign type
+        also is not (`impl Trait for u8`), so that test silently read those
+        impl blocks as modules and left `super::` one level short.
+        """
+        return [
+            scope
+            for scope in self._rust_enclosing_scopes(module_qn, caller_qn)
+            if scope in self.declared_module_qns
+        ]
+
+    def _rust_scoped_type(
+        self, name: str, module_qn: str, caller_qn: str | None
+    ) -> str | None:
+        """What a bare Rust type name binds to in the caller's inner scopes.
+
+        Innermost first, in the order `_rust_walk_enclosing_scopes` reads a
+        bare call: the caller's own body `use`, then each scope between it
+        and the file module, where a type the scope defines outranks the
+        scope's `use`. A registered qn is the first-party type; any other
+        string is a provably external path (or an unrepresentable module)
+        that speaks for the name, so no first-party type may answer. None
+        when no inner scope binds the name to a type: the file's own
+        bindings then decide, as they always did.
+        """
+        if not caller_qn:
+            return None
+        effective = self.rust_function_modules.get(caller_qn, module_qn)
+        fn_scope = self.import_processor.rust_fn_scope_imports.get(caller_qn, {})
+        target = fn_scope.get(name)
+        if target is not None:
+            return self._rust_scoped_use_type(target, effective, module_qn)
+        return self._rust_enclosing_scope_type(name, module_qn, caller_qn, effective)
+
+    def _rust_enclosing_scope_type(
+        self, name: str, module_qn: str, caller_qn: str, effective: str
+    ) -> str | None:
+        """Bind `name` in the scopes between the caller and its file module.
+
+        Innermost first, a type the scope defines outranks the scope's
+        `use`. The weak binding (an impure inline mod's own `use` fanned out
+        to the functions its block declares) has mod-level precedence: it
+        answers once the innermost scope defines no such type, read from
+        the caller's effective module rather than that scope.
+        """
+        imports = self.import_processor
+        weak = imports.rust_fn_scope_mod_imports.get(caller_qn, {}).get(name)
+        for scope in self._rust_enclosing_scopes(module_qn, caller_qn):
+            local = f"{scope}{cs.SEPARATOR_DOT}{name}"
+            if self.function_registry.get(local) in _RS_TYPE_NODE_TYPES:
+                return local
+            if weak is not None:
+                return self._rust_scoped_use_type(weak, effective, module_qn)
+            raw = imports.import_mapping.get(scope, {}).get(name)
+            if raw is not None:
+                return self._rust_scoped_use_type(raw, scope, module_qn)
+        return None
+
+    def _rust_scoped_use_type(
+        self, target: str, owner: str, module_qn: str
+    ) -> str | None:
+        """The type an inner scope's `use` target names, read from `owner`.
+
+        An unrepresentable module and a provably external path speak for
+        the name as they are; a first-party path counts only when it lands
+        on a type.
+        """
+        if target == cs.RUST_UNRESOLVABLE_QN:
+            return target
+        resolved = self._rust_local_qn(target, owner)
+        if resolved is None:
+            return target if self._rust_path_is_external(target, module_qn) else None
+        hit = self._follow_rust_scope_target(resolved)
+        return hit[1] if hit is not None and hit[0] in _RS_TYPE_NODE_TYPES else None
+
+    def _rust_path_is_external(self, path: str, module_qn: str) -> bool:
+        """Whether a raw Rust `use` path provably names an item outside the repo.
+
+        Its head must be a toolchain crate, or a dependency the importing
+        package's manifest fetches from outside the repo that is no crate
+        the repo itself holds, directly or through the file's import of the
+        head (`use std::io;` then `io::Result`). Any other raw head may
+        still be first-party in a layout the import half does not rewrite,
+        so it proves nothing.
+        """
+        if (
+            cs.SEPARATOR_DOT in path
+            or self._module_language(module_qn) != cs.SupportedLanguage.RUST
+        ):
+            return False
+        head = path.split(cs.SEPARATOR_DOUBLE_COLON, 1)[0]
+        if self._rust_crate_is_external(head, module_qn):
+            return True
+        mapped = self.import_processor.import_mapping.get(module_qn, {}).get(head)
+        return (
+            mapped is not None
+            and cs.SEPARATOR_DOT not in mapped
+            and self._rust_crate_is_external(
+                mapped.split(cs.SEPARATOR_DOUBLE_COLON, 1)[0], module_qn
+            )
+        )
+
+    def _rust_crate_is_external(self, crate: str, module_qn: str) -> bool:
+        return self.import_processor.rust_crate_is_external(crate, module_qn)
+
+    def _rust_file_use_is_external(self, name: str, module_qn: str) -> bool:
+        target = self.import_processor.import_mapping.get(module_qn, {}).get(name)
+        return target is not None and self._rust_path_is_external(target, module_qn)
+
+    def _decide_rust_module_item(
+        self, mapped: str, rest: list[str], item: str, owner: str
+    ) -> tuple[tuple[str, str] | None, bool]:
+        if mapped == cs.RUST_UNRESOLVABLE_QN:
+            # A name imported from an unrepresentable #[path] module has no
+            # referent: decided drop so no fallback binds a name-derived
+            # shadow file (issue #1082).
+            return None, True
+        resolved = self._rust_local_qn(mapped, owner)
+        if resolved is None:
+            head = mapped.split(cs.SEPARATOR_DOUBLE_COLON, 1)[0]
+            if head in cs.RS_STDLIB_CRATES or (
+                self.import_processor.rust_head_is_external_dep(head, owner)
+            ):
+                # A standard-library head, or one the importer's own
+                # manifest binds outside the repo (a registry version),
+                # is external by construction: the name is spoken for,
+                # so neither the module tree nor the trie may claim it
+                # for a same-named first-party sibling (issue #1033).
+                return None, True
+            # Any other unresolved head may still be first-party in a
+            # layout the import half does not cover (a nested workspace
+            # root, a path dependency without a workspace, a #[path]
+            # module): stay undecided so the ordinary fallbacks keep
+            # their edges.
+            return None, False
+        return self._decide_rust_base(cs.SEPARATOR_DOT.join([resolved, *rest]), item)
+
+    def _decide_rust_base(
+        self, base: str, item: str
+    ) -> tuple[tuple[str, str] | None, bool]:
+        target = f"{base}{cs.SEPARATOR_DOT}{item}"
+        result, unknown = self._follow_rust_scope_item(target, {target})
+        if result is not None:
+            return result, True
+        if unknown:
+            # A glob re-export whose base we cannot index may supply the
+            # item; never a decided drop.
+            return None, False
+        if (
+            base in self.type_inference.module_qn_to_file_path
+            or base in self.import_processor.import_mapping
+        ):
+            return None, True
+        return None, False
+
+    def _rust_local_qn(self, value: str, owner: str) -> str | None:
+        """A use-mapping value as a project qn, or None when external.
+
+        crate::/super::/self:: values were rewritten to dotted qns at
+        parse time, so a value still holding :: (or a single bare name)
+        is a Rust 2018 uniform path: it binds locally when its head
+        names a module in the owning scope (`use pool::connect;` beside
+        `mod pool;`), else it names an external crate.
+        """
+        if cs.SEPARATOR_DOUBLE_COLON not in value and cs.SEPARATOR_DOT in value:
+            return value
+        segments = value.split(cs.SEPARATOR_DOUBLE_COLON)
+        head_qn = self.import_processor._rust_resolve_relative(
+            owner, segments[:1], owner
+        )
+        if (
+            head_qn in self.type_inference.module_qn_to_file_path
+            or head_qn in self.import_processor.import_mapping
+        ):
+            return self.import_processor._rust_resolve_relative(owner, segments, owner)
+        return None
+
+    def _follow_rust_scope_target(self, target: str) -> tuple[str, str] | None:
+        return self._follow_rust_scope_item(target, {target})[0]
+
+    def _follow_rust_scope_item(
+        self, target: str, seen: set[str], via_glob_from: str | None = None
+    ) -> tuple[tuple[str, str] | None, bool]:
+        """Chase a candidate qn through re-export hops to a registered fn.
+
+        A module's `pub use` maps the name to the re-exporting module's
+        qn, not the defining one; hop through that module's own import
+        map before concluding the target is outside the graph. Named
+        hops win; failing those, each glob re-export (`pub use m::*;`)
+        is expanded when its base is indexable. The second element is
+        True when an unindexable glob base was met: the item may live
+        behind it, so the caller must not turn the miss into a decided
+        drop.
+
+        `via_glob_from` is the module whose glob reached this candidate. A
+        private `use` in the glob's base binds its name for the base and
+        the modules below it alone, and shadows the base's own globs for
+        that name, so a glob written anywhere else gets nothing under it.
+        """
+        while True:
+            if (target_type := self.function_registry.get(target)) is not None:
+                return (target_type, target), False
+            owner, _, item = target.rpartition(cs.SEPARATOR_DOT)
+            owner_map = self.import_processor.import_mapping.get(owner)
+            if not owner_map:
+                return None, False
+            hidden = self._rust_names_hidden_from_glob(owner, via_glob_from)
+            if (hop := owner_map.get(item)) is not None:
+                if item in hidden:
+                    return None, False
+                resolved = self._rust_local_qn(hop, owner)
+                if resolved is None or resolved in seen:
+                    return None, False
+                seen.add(resolved)
+                target = resolved
+                # A named `use` is a path the source spells out, which rustc
+                # already checked is visible where it is written.
+                via_glob_from = None
+                continue
+            return self._expand_rust_glob_hops(owner_map, owner, item, seen, hidden)
+
+    def _rust_names_hidden_from_glob(
+        self, owner: str, via_glob_from: str | None
+    ) -> Collection[str]:
+        # The names `owner` binds by a `use` whose visibility does not reach
+        # the module whose glob reached `owner`.
+        if via_glob_from is None:
+            return frozenset()
+        restricted = self.import_processor.rust_restricted_use_names.get(owner)
+        if not restricted:
+            return frozenset()
+        return frozenset(
+            name
+            for name, root in restricted.items()
+            if not self._rust_module_sees(via_glob_from, root)
+        )
+
+    def _rust_module_sees(self, module_qn: str, root: str) -> bool:
+        # An item visible within `root` is visible to it and every module
+        # below it. A crate entry file (lib.rs, main.rs) is the parent of
+        # the modules beside it, which its own qn does not prefix, so its
+        # directory stands in for it there; but another crate's entry beside
+        # it (main.rs beside lib.rs) and a binary under src/bin/ are crates
+        # of their own, which see none of it (#2599 review).
+        if module_qn == root or module_qn.startswith(f"{root}{cs.SEPARATOR_DOT}"):
+            return True
+        parent, _, stem = root.rpartition(cs.SEPARATOR_DOT)
+        if stem not in cs.RS_ENTRY_STEMS or not module_qn.startswith(
+            f"{parent}{cs.SEPARATOR_DOT}"
+        ):
+            return False
+        head = module_qn[len(parent) + 1 :].split(cs.SEPARATOR_DOT, 1)[0]
+        return head not in cs.RS_ENTRY_STEMS and head != cs.RS_BIN_DIR
+
+    def _expand_rust_glob_hops(
+        self,
+        owner_map: dict[str, str],
+        owner: str,
+        item: str,
+        seen: set[str],
+        hidden: Collection[str] = frozenset(),
+    ) -> tuple[tuple[str, str] | None, bool]:
+        unknown = False
+        for key, value in owner_map.items():
+            if not key.startswith(cs.RS_WILDCARD_PREFIX) or key in hidden:
+                continue
+            resolved = self._rust_local_qn(value, owner)
+            if resolved is None:
+                unknown = True
+                continue
+            candidate = f"{resolved}{cs.SEPARATOR_DOT}{item}"
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            result, sub_unknown = self._follow_rust_scope_item(
+                candidate, seen, via_glob_from=owner
+            )
+            if result is not None:
+                return result, False
+            unknown = unknown or sub_unknown
+        return None, unknown
+
+    def _rust_block_import_at(
+        self, module_qn: str, name: str, call_point: int | None
+    ) -> tuple[str, bool] | None:
+        """The innermost initializer-block use serving `name` at this site.
+
+        Returns (resolved target, defers_to_fn), or None when no block
+        serves it: the site lies outside every block span, a nested mod
+        boundary intervenes (its members never see the block's use), or
+        a containing nested block declares the name as its own direct
+        item (the local item wins; the ordinary scope probes find it
+        unless the enclosing fn's own body use shadows it there, issue
+        #1026).
+        defers_to_fn marks a site inside a nested fn, whose own body
+        uses outrank the block's while a use-less fn still inherits it
+        (rustc-verified).
+        """
+        if call_point is None:
+            return None
+        blocks = self.import_processor.rust_block_scope_imports.get(module_qn)
+        if not blocks:
+            return None
+        best_size: int | None = None
+        result: tuple[str, bool] | None = None
+        for block in blocks:
+            if not self._rust_block_serves_site(block, name, call_point):
+                continue
+            start, end, imports, _mod_holes, fn_holes, _item_scopes = block
+            size = end - start
+            if best_size is None or size < best_size:
+                best_size = size
+                result = (
+                    imports[name],
+                    any(s <= call_point < e for s, e in fn_holes),
+                )
+        return result
+
+    @staticmethod
+    def _rust_block_serves_site(
+        block: _RustBlockScope, name: str, call_point: int
+    ) -> bool:
+        start, end, imports, mod_holes, _fn_holes, item_scopes = block
+        if not (start <= call_point < end) or name not in imports:
+            return False
+        if any(s <= call_point < e for s, e in mod_holes):
+            return False
+        return not any(
+            s <= call_point < e and name in items for s, e, items in item_scopes
+        )
+
+    def _try_resolve_same_module(
+        self, call_name: str, module_qn: str, call_point: int | None = None
+    ) -> tuple[str, str] | None:
+        same_module_func_qn = f"{module_qn}.{call_name}"
+        if self._rust_block_item_hidden(same_module_func_qn, module_qn, call_point):
+            # A Rust block-local item that took the module's own flat qn.
+            # It is in scope for its block alone (issue #1061).
+            return None
+        if self._name_hidden_in_body(same_module_func_qn):
+            # A JS/TS function expression flattened to the module's qn; its
+            # name is in scope inside its own body alone (issue #2402).
+            return None
+        if same_module_func_qn in self.function_registry:
+            if self._only_object_members(same_module_func_qn):
+                # An object literal's function value flattened to the
+                # module's qn; the module never binds its key (issue #2435).
+                return None
+            logger.debug(
+                ls.CALL_SAME_MODULE, call_name=call_name, qn=same_module_func_qn
+            )
+            return self.function_registry[same_module_func_qn], same_module_func_qn
+        return None
+
+    def _nameable_candidates(
+        self, candidates: list[str], module_qn: str, call_point: int | None = None
+    ) -> list[str]:
+        # The simple-name fallback matches on the last name segment alone, so
+        # it can offer a definition written in a language the caller's cannot
+        # call into (a Python `asyncio.sleep` binding to a `sleep` closure in
+        # a generated TypeScript client, issue #945). That one is impossible,
+        # so drop it; a candidate whose language cannot be determined is kept,
+        # so the fallback still answers wherever this evidence is missing.
+        caller_language = self._module_language(module_qn)
+        reachable = [
+            qn
+            for qn in candidates
+            if self._languages_can_call(caller_language, self._module_language(qn))
+            # A Rust block-local item is nameable inside its own block
+            # alone, and the site-gated probe answered there already
+            # (issue #1061); by simple name it is never a candidate.
+            and not self._rust_block_item_hidden(qn, module_qn, call_point)
+            and self._rust_crate_reaches(module_qn, qn)
+        ]
+        # A definition scoped inside another function's body is named from
+        # elsewhere only when it escapes (a factory returns it, CommonJS
+        # exports it), which is real but rarer than the plain module-level
+        # definition it competes with. So prefer the unscoped candidates and
+        # fall back to the scoped ones only when they are all there is.
+        unscoped = [
+            qn
+            for qn in reachable
+            if self.function_registry.get(self._parent_qn(qn))
+            not in _SCOPING_PARENT_TYPES
+        ]
+        return unscoped or reachable
+
+    @staticmethod
+    def _parent_qn(qualified_name: str) -> str:
+        return qualified_name.rsplit(cs.SEPARATOR_DOT, 1)[0]
+
+    @staticmethod
+    def _languages_can_call(
+        caller: cs.SupportedLanguage | None, candidate: cs.SupportedLanguage | None
+    ) -> bool:
+        if caller is None or candidate is None or caller == candidate:
+            return True
+        # A candidate written in a sibling language of the caller's family is
+        # a legitimate target for the simple-name fallback.
+        return any(
+            caller in family and candidate in family for family in cs.LANGUAGE_FAMILIES
+        )
+
+    def sql_routine_targets(self, call_name: str) -> list[str]:
+        """The SQL routines a PostgreSQL invocation of `call_name` can run.
+
+        `call_name` is already normalized (`normalize_sql_reference`). SQL has
+        no imports, so every routine indexed from a .sql file is in scope and
+        nothing written in another language is: the database cannot run it. A
+        schema-qualified name (`billing.fee`) reaches only the routine defined
+        under that schema; an unqualified one reaches each schema's routine of
+        that name, because the runtime search_path picks among them. The
+        string-call side applies the same rule to `callSp('billing.fee')`.
+        Overloads come back as their duplicate variants (`tax`, `tax@2`):
+        the call site does not spell the argument types that pick one.
+        """
+        qualified = cs.SEPARATOR_DOT in call_name
+        registry = self.function_registry
+        # dict as an ordered set: the simple-name index already holds a
+        # variant that the dotted-suffix scan cannot see (`fee@2` does not
+        # end in `.billing.fee`), so both routes feed one deduplicated list.
+        targets: dict[str, None] = {}
+        for qn in registry.find_ending_with(call_name):
+            for variant in registry.variants(qn):
+                if variant in targets or registry.get(variant) != NodeType.FUNCTION:
+                    continue
+                module_qn = self._sql_module_of(variant)
+                if module_qn is None:
+                    continue
+                # The suffix match also accepts a qualifier that is really the
+                # FILE name (`fee` defined in billing.sql), which is no schema.
+                own_name = qn_markers.natural_qn(variant)[len(module_qn) + 1 :]
+                if qualified and own_name != call_name:
+                    continue
+                targets[variant] = None
+        return list(targets)
+
+    def _sql_module_of(self, qualified_name: str) -> str | None:
+        # The longest prefix naming an indexed module is the file the routine
+        # was defined in; what follows it is the routine's own (possibly
+        # schema-qualified) name. Incremental runs seed this map from the
+        # graph, so an unchanged file's module is found too.
+        modules = self.type_inference.module_qn_to_file_path
+        probe = qualified_name
+        while cs.SEPARATOR_DOT in probe:
+            probe = self._parent_qn(probe)
+            if (path := modules.get(probe)) is not None:
+                if get_language_for_extension(path.suffix) == cs.SupportedLanguage.SQL:
+                    return probe
+                return None
+        return None
+
+    def _definition_language(
+        self, definition_qn: str, module_qn: str
+    ) -> cs.SupportedLanguage | None:
+        # The language of the file declaring `definition_qn`, a definition at
+        # the top of `module_qn`. _module_language probes the definition's own
+        # qn first, which can name another module: `gen.py`'s `render` is
+        # `pkg.gen.render`, the module qn of `gen/render.go` too.
+        if (
+            rehydrated := self.rehydrated_definition_paths.get(definition_qn)
+        ) is not None:
+            return _file_language(PurePath(rehydrated).suffix)
+        modules = self.type_inference.module_qn_to_file_path
+        if (path := modules.get(module_qn)) is not None:
+            return _file_language(path.suffix)
+        return self._module_language(module_qn)
+
+    def _module_language(self, qualified_name: str) -> cs.SupportedLanguage | None:
+        # The language of the module a qn lives in, found by walking off its
+        # trailing segments until one names an ingested module (a caller's own
+        # module qn hits on the first probe). Cached per qn: the fallback asks
+        # for the same candidates repeatedly.
+        if qualified_name in self._module_language_cache:
+            return self._module_language_cache[qualified_name]
+        modules = self.type_inference.module_qn_to_file_path
+        probe = qualified_name
+        language: cs.SupportedLanguage | None = None
+        while probe:
+            if (path := modules.get(probe)) is not None:
+                language = _file_language(path.suffix)
+                break
+            # An incremental run only re-parses changed files, so an
+            # unchanged module is absent above; its definitions carry the
+            # file path recorded on their graph nodes instead.
+            if (rehydrated := self.rehydrated_definition_paths.get(probe)) is not None:
+                language = _file_language(PurePath(rehydrated).suffix)
+                break
+            if cs.SEPARATOR_DOT not in probe:
+                break
+            probe = self._parent_qn(probe)
+        self._module_language_cache[qualified_name] = language
+        return language
+
+    def _trie_candidates(
+        self, call_name: str, module_qn: str, call_point: int | None = None
+    ) -> list[str]:
+        return self._nameable_candidates(
+            self.function_registry.find_ending_with(_trie_search_name(call_name)),
+            module_qn,
+            call_point,
+        )
+
+    def _try_resolve_via_trie(
+        self,
+        call_name: str,
+        module_qn: str,
+        language: cs.SupportedLanguage | None = None,
+        call_point: int | None = None,
+        constructing: bool = False,
+    ) -> tuple[str, str] | None:
+        search_name = _trie_search_name(call_name)
+        possible_matches = self._trie_candidates(call_name, module_qn, call_point)
+        if search_name == call_name:
+            # A bare name never reaches an object literal's function value;
+            # a member call (`opts.retry.delay()`) still does (issue #2435).
+            possible_matches = [
+                qn for qn in possible_matches if not self._only_object_members(qn)
+            ]
+        if constructing:
+            # `new X(...)` names a TYPE: a method or function that merely
+            # shares the name is never its target, however close by import
+            # distance it sits. A C# static factory `Some.LogEventProperty()`
+            # beside `class LogEventProperty` outranked the class once the
+            # class qn stopped repeating its namespace (issue #1629).
+            possible_matches = [
+                qn
+                for qn in possible_matches
+                if self.function_registry[qn] == cs.NodeLabel.CLASS.value
+            ]
+        if search_name == call_name:
+            # A bare name never reaches a function expression whose own name
+            # only its body sees (issue #2402). A member access keeps the
+            # match: `req.host` reads the getter express defines as
+            # `defineGetter(req, 'host', function host () {...})`.
+            possible_matches = [
+                qn for qn in possible_matches if not self._name_hidden_in_body(qn)
+            ]
+        if language == cs.SupportedLanguage.RUST and search_name == call_name:
+            # A bare Rust path NEVER names a method (inherent methods need
+            # self./Self::/Type::), so a same-named method must not soak
+            # up the edge when the real target is external, prelude, or a
+            # shadowing closure the graph cannot see (issue #1011).
+            possible_matches = [
+                qn
+                for qn in possible_matches
+                if self.function_registry[qn] != cs.NodeLabel.METHOD.value
+            ]
+        elif (
+            search_name == call_name
+            and (language or self._module_language(module_qn))
+            == cs.SupportedLanguage.PYTHON
+        ):
+            # A bare Python name is looked up in local, enclosing, global and
+            # builtin scope; a method answers to its bare name only inside
+            # its own class body, which lives in the caller's module. So a
+            # local `run` handed on as a callback, or a variable named like
+            # some property, never names another module's method (#2360).
+            # Another module's function is no closer: only an import binds
+            # it, so with none naming the call (and no star import) the name
+            # is a builtin or a local, not that function (issue #2929).
+            places = self._python_binding_places(call_name, module_qn)
+            possible_matches = [
+                qn
+                for qn in possible_matches
+                if self._in_python_module(qn, module_qn)
+                or (
+                    self.function_registry[qn] != cs.NodeLabel.METHOD.value
+                    and any(_place_may_bind(qn, call_name, place) for place in places)
+                )
+            ]
+        if not possible_matches:
+            logger.debug(ls.CALL_UNRESOLVED, call_name=call_name)
+            return None
+        if language == cs.SupportedLanguage.CSHARP and len(possible_matches) > 1:
+            possible_matches = self._csharp_prefer_imported(
+                possible_matches, module_qn, call_name
+            )
+
+        best_candidate_qn = self._best_trie_candidate(possible_matches, module_qn)
+        logger.debug(ls.CALL_TRIE_FALLBACK, call_name=call_name, qn=best_candidate_qn)
+        self.last_resolution = cs.EdgeResolution.HEURISTIC
+        return self.function_registry[best_candidate_qn], best_candidate_qn
+
+    def _in_python_module(self, qn: str, module_qn: str) -> bool:
+        # Defined in the module itself, not in a module under it: a package's
+        # `__init__` qn prefixes every module of the package, and a module
+        # under a plain directory (`lib/tools/output.py`, no `__init__.py`)
+        # sits deeper than the first segment, so every prefix is checked.
+        own_module = f"{module_qn}{cs.SEPARATOR_DOT}"
+        if not qn.startswith(own_module):
+            return False
+        rest = qn[len(own_module) :].split(cs.SEPARATOR_DOT)
+        modules = self.type_inference.module_qn_to_file_path
+        return not any(
+            f"{own_module}{cs.SEPARATOR_DOT.join(rest[:depth])}" in modules
+            for depth in range(1, len(rest))
+        )
+
+    def _python_binding_places(self, call_name: str, module_qn: str) -> list[str]:
+        # Every qn the caller's name may stand for, hop by hop through the
+        # modules that pass it on: `from api import *` names `api.helper`,
+        # which api's own `from impl import helper` turns into `impl.helper`.
+        # Judging only the first hop dropped a call whose function sits
+        # outside the module the caller imports from (bot review on PR #2968).
+        imports = self.import_processor.import_mapping
+        places: dict[str, None] = {}
+        queue = deque(_python_import_sources(imports.get(module_qn, {}), call_name))
+        while queue:
+            place = queue.popleft()
+            if place in places:
+                continue
+            places[place] = None
+            if place not in self.function_registry:
+                owner, _, name = place.rpartition(cs.SEPARATOR_DOT)
+                queue.extend(_python_import_sources(imports.get(owner, {}), name))
+        return list(places)
+
+    def _best_trie_candidate(self, possible_matches: list[str], module_qn: str) -> str:
+        if len(possible_matches) == 1:
+            return possible_matches[0]
+        caller_parts = module_qn.split(cs.SEPARATOR_DOT)
+        caller_len = len(caller_parts)
+        caller_parent_prefix = (
+            cs.SEPARATOR_DOT.join(caller_parts[:-1]) + cs.SEPARATOR_DOT
+            if caller_len > 1
+            else ""
+        )
+        return min(
+            possible_matches,
+            key=lambda qn: (
+                # An @abstractmethod stub never runs when a concrete override
+                # exists, so prefer concrete candidates over abstract ones
+                # even when the abstract stub is closer by import distance.
+                self.function_registry.is_abstract(qn),
+                self._import_distance_fast(
+                    qn, caller_parts, caller_len, caller_parent_prefix
+                ),
+                qn,
+            ),
+        )
+
+    def _csharp_prefer_imported(
+        self, candidates: list[str], module_qn: str, call_name: str
+    ) -> list[str]:
+        # Same-named C# types in two namespaces tied on import distance and
+        # broke on qn order, so `using Zeta;` + `new Widget()` bound
+        # `Other.Widget` (issue #2001). C# name lookup searches the caller's
+        # own namespace, innermost first, before any `using`, so a candidate
+        # there wins outright (bot review); otherwise the candidates whose
+        # owning type sits DIRECTLY in a namespace (or, for `using static`,
+        # a type) the file imports: C# does not import nested namespaces.
+        containers, import_keys, bare_members = self._csharp_import_keys(
+            candidates, call_name
+        )
+        enclosing = self._csharp_enclosing_namespaces(module_qn)
+        # A namespace holds types, not members: the caller's namespace makes
+        # `App.Widget` nameable, never `App.Widget.S` callable bare. Only a
+        # `using static` does that, which the import preference below checks
+        # (bot review).
+        local = [
+            qn
+            for qn in candidates
+            if containers.get(qn) in enclosing and qn not in bare_members
+        ]
+        if local:
+            innermost = max(len(containers[qn]) for qn in local)
+            return [qn for qn in local if len(containers[qn]) == innermost]
+        # Only a directive whose local name is its target's own last segment
+        # makes names available unqualified (`using Zeta;`, `using static
+        # Zeta.Widget;`); an alias (`using Alias = Other;`) does not.
+        imported = {
+            target
+            for local_name, target in self.import_processor.import_mapping.get(
+                module_qn, {}
+            ).items()
+            if local_name == target.rpartition(cs.SEPARATOR_DOT)[2]
+        }
+        preferred = [qn for qn in candidates if import_keys.get(qn) in imported]
+        return preferred or candidates
+
+    def _csharp_import_keys(
+        self, candidates: list[str], call_name: str
+    ) -> tuple[dict[str, str], dict[str, str], set[str]]:
+        """(candidate -> namespace holding its type, candidate -> what an
+        import must name to make it available, the bare-called members).
+
+        A type, or a member reached through its type (`Widget.S()`), is
+        imported by a namespace directive naming the type's namespace; a BARE
+        member (`S()`) only by a `using static` naming its declaring type
+        (bot review).
+        """
+        declared = self.type_inference.csharp_class_namespaced
+        bare = cs.SEPARATOR_DOT not in call_name
+        containers: dict[str, str] = {}
+        import_keys: dict[str, str] = {}
+        bare_members: set[str] = set()
+        for qn in candidates:
+            owner = qn
+            while owner and owner not in declared:
+                owner = owner.rpartition(cs.SEPARATOR_DOT)[0]
+            if not owner:
+                continue
+            containers[qn] = declared[owner].rpartition(cs.SEPARATOR_DOT)[0]
+            if bare and owner != qn:
+                bare_members.add(qn)
+            import_keys[qn] = declared[owner] if qn in bare_members else containers[qn]
+        return containers, import_keys, bare_members
+
+    def _csharp_enclosing_namespaces(self, module_qn: str) -> set[str]:
+        """Every namespace enclosing the file's call sites, innermost included.
+
+        Only known when the file declares ONE nested chain; with sibling
+        namespaces (`App` and `Other` in one file) neither is local to every
+        call site, so no local precedence applies rather than a guessed one
+        (bot review).
+        """
+        declared_here = sorted(
+            self.import_processor._csharp_module_namespaces.get(module_qn, {}),
+            key=len,
+        )
+        if not declared_here or not all(
+            declared_here[-1] == ns
+            or declared_here[-1].startswith(f"{ns}{cs.SEPARATOR_DOT}")
+            for ns in declared_here
+        ):
+            return set()
+        parts = declared_here[-1].split(cs.SEPARATOR_DOT)
+        return {cs.SEPARATOR_DOT.join(parts[:cut]) for cut in range(1, len(parts) + 1)}
+
+    def _resolve_two_part_call(
+        self,
+        parts: list[str],
+        call_name: str,
+        separator: str,
+        import_map: dict[str, str],
+        module_qn: str,
+        local_var_types: dict[str, str] | None,
+        language: cs.SupportedLanguage | None = None,
+    ) -> tuple[str, str] | None:
+        object_name, method_name = parts
+        # `Type::f()` with `Type` imported from an external crate calls that
+        # crate's function; the import probe below would resolve the raw
+        # path by its last segment to a same-named first-party type, and the
+        # type probe after it by simple name (issue #2622).
+        if separator == cs.SEPARATOR_DOUBLE_COLON and (
+            (target := import_map.get(object_name)) is not None
+            and self._rust_path_is_external(target, module_qn)
+        ):
+            return None
+
+        if result := self._try_resolve_via_local_type(
+            object_name,
+            method_name,
+            separator,
+            call_name,
+            import_map,
+            module_qn,
+            local_var_types,
+            language,
+        ):
+            return result
+
+        if result := self._try_resolve_via_import(
+            object_name, method_name, separator, call_name, import_map, language
+        ):
+            return result
+
+        # A Lua table defined in this module (`Account.deposit(acc, 1)`,
+        # `Account:new()`) names its member exactly, so it must answer before
+        # the same-module free-function guess below: a `local function
+        # deposit` is not `Account`'s member (issue #2481).
+        if language == cs.SupportedLanguage.LUA and (
+            result := self._try_resolve_lua_same_module_member(call_name, module_qn)
+        ):
+            return result
+
+        # A same-module associated-function call `Type::assoc()` (`Ping::new()`):
+        # the object is a type defined in this module, not an import. Resolve it to
+        # its class node and look up the method there. Gated to `::` so a `.`-dotted
+        # receiver of unknown type still falls through to the trie fallback.
+        if separator == cs.SEPARATOR_DOUBLE_COLON and (
+            result := self._try_resolve_static_type_method(
+                object_name, method_name, call_name, module_qn
+            )
+        ):
+            return result
+
+        # A JS/TS dotted call binds to a same-module free function ONLY through
+        # a module-ish receiver (`exports.render()`, `this.render()` in the
+        # CommonJS/prototype pattern). An ordinary identifier receiver
+        # (`view.render()`) is an instance call: binding it to the free
+        # function is a false edge that also kills the real prototype method
+        # (express's View.render); let it fall to the unique-member gate.
+        if (
+            language in cs.JS_TS_LANGUAGES
+            and separator == cs.SEPARATOR_DOT
+            and object_name not in cs.JS_MODULE_RECEIVERS
+        ):
+            return None
+        # Rust has no such receiver: `Type::f()` names an associated item of
+        # Type and `recv.f()` a method, never the caller module's free `f`
+        # (`String::new()` bound the file's own `fn new`, issue #2543).
+        if language == cs.SupportedLanguage.RUST:
+            return None
+        resolved = self._try_resolve_module_method(method_name, call_name, module_qn)
+        if resolved is not None:
+            self.last_resolution = cs.EdgeResolution.HEURISTIC
+        return resolved
+
+    def _try_resolve_static_type_method(
+        self, object_name: str, method_name: str, call_name: str, module_qn: str
+    ) -> tuple[str, str] | None:
+        if not (
+            class_qn := self._rust_glob_imported_type(object_name, module_qn)
+            or self._resolve_class_name(object_name, module_qn)
+        ):
+            return None
+        method_qn = f"{class_qn}{cs.SEPARATOR_DOT}{method_name}"
+        if method_qn in self.function_registry:
+            logger.debug(
+                ls.CALL_TYPE_INFERRED,
+                call_name=call_name,
+                method_qn=method_qn,
+                obj=object_name,
+                var_type=object_name,
+            )
+            return self.function_registry[method_qn], method_qn
+        return self._resolve_inherited_method(class_qn, method_name)
+
+    def _try_resolve_via_local_type(
+        self,
+        object_name: str,
+        method_name: str,
+        separator: str,
+        call_name: str,
+        import_map: dict[str, str],
+        module_qn: str,
+        local_var_types: dict[str, str] | None,
+        language: cs.SupportedLanguage | None = None,
+    ) -> tuple[str, str] | None:
+        if not local_var_types or object_name not in local_var_types:
+            return None
+
+        var_type = local_var_types[object_name]
+
+        if class_qn := self._resolve_class_qn_from_type(
+            var_type, import_map, module_qn
+        ):
+            if result := self._try_method_on_class(
+                class_qn,
+                method_name,
+                separator,
+                call_name,
+                object_name,
+                var_type,
+                language,
+            ):
+                return result
+            if language == cs.SupportedLanguage.DART and (
+                extension := self._dart_extension_member(
+                    class_qn, method_name, module_qn
+                )
+            ):
+                return extension
+
+        if var_type in cs.JS_BUILTIN_TYPES:
+            return (
+                cs.NodeLabel.FUNCTION,
+                f"{cs.BUILTIN_PREFIX}{cs.SEPARATOR_DOT}{var_type}{cs.SEPARATOR_PROTOTYPE}{method_name}",
+            )
+        return None
+
+    def _try_method_on_class(
+        self,
+        class_qn: str,
+        method_name: str,
+        separator: str,
+        call_name: str,
+        object_name: str,
+        var_type: str,
+        language: cs.SupportedLanguage | None = None,
+    ) -> tuple[str, str] | None:
+        # A Lua instance reaches its class's members under either spelling:
+        # `acc:deposit()` is `Account:deposit`, `s.area(s)` and `s:twice()`
+        # may name a member defined with the other separator.
+        method_qns = (
+            lua_utils.member_spellings(class_qn, method_name, separator)
+            if language == cs.SupportedLanguage.LUA
+            else (f"{class_qn}{separator}{method_name}",)
+        )
+        for method_qn in method_qns:
+            if method_qn in self.function_registry:
+                logger.debug(
+                    ls.CALL_TYPE_INFERRED,
+                    call_name=call_name,
+                    method_qn=method_qn,
+                    obj=object_name,
+                    var_type=var_type,
+                )
+                return self.function_registry[method_qn], method_qn
+
+        if inherited := self._resolve_inherited_method(class_qn, method_name):
+            logger.debug(
+                ls.CALL_TYPE_INFERRED_INHERITED,
+                call_name=call_name,
+                method_qn=inherited[1],
+                obj=object_name,
+                var_type=var_type,
+            )
+            return inherited
+        return None
+
+    def _try_resolve_via_import(
+        self,
+        object_name: str,
+        method_name: str,
+        separator: str,
+        call_name: str,
+        import_map: dict[str, str],
+        language: cs.SupportedLanguage | None = None,
+    ) -> tuple[str, str] | None:
+        if object_name not in import_map:
+            return None
+
+        if language == cs.SupportedLanguage.LUA:
+            return self._try_resolve_lua_module_member(
+                import_map[object_name], object_name, method_name, separator, call_name
+            )
+
+        target = import_map[object_name]
+        if (
+            language == cs.SupportedLanguage.RUST
+            and cs.SEPARATOR_DOUBLE_COLON not in target
+        ):
+            # `use crate::cmd::Get;` names the module that re-exports `Get`.
+            # Unfollowed, `Get::new()` missed here and the simple-name
+            # search bound it to whichever `Get` it reached first, as an
+            # exact edge (issue #2542).
+            target = self._follow_reexports(target)
+        class_qn = self._resolve_imported_class_qn(
+            target, object_name, method_name, separator
+        )
+
+        registry_separator = (
+            separator if separator == cs.CHAR_COLON else cs.SEPARATOR_DOT
+        )
+        method_qn = f"{class_qn}{registry_separator}{method_name}"
+
+        if method_qn in self.function_registry:
+            logger.debug(
+                ls.CALL_IMPORT_STATIC, call_name=call_name, method_qn=method_qn
+            )
+            return self.function_registry[method_qn], method_qn
+        return self._try_resolve_package_member(class_qn, method_name)
+
+    def _try_resolve_lua_module_member(
+        self,
+        imported_qn: str,
+        alias: str,
+        member: str,
+        separator: str,
+        call_name: str,
+    ) -> tuple[str, str] | None:
+        # `require` binds the table a module returns. The module usually names
+        # it after the alias (`local Storage = {}` in storage/Storage.lua);
+        # otherwise (`local M = {}`) the package-member search finds the one
+        # table holding the member. Both spellings throughout: `util:method()`
+        # reaches `M:method`, `util.add()` reaches `M.add` (issue #2481).
+        for owner_qn in (f"{imported_qn}{cs.SEPARATOR_DOT}{alias}", imported_qn):
+            if result := self._lua_table_member(owner_qn, member, separator, call_name):
+                return result
+        return self._try_resolve_package_member(
+            imported_qn, member, cs.SupportedLanguage.LUA
+        )
+
+    def _try_resolve_lua_same_module_member(
+        self, call_name: str, module_qn: str
+    ) -> tuple[str, str] | None:
+        if (split := lua_utils.split_member_call(call_name)) is None:
+            return None
+        table_path, separator, member = split
+        return self._lua_table_member(
+            f"{module_qn}{cs.SEPARATOR_DOT}{table_path}", member, separator, call_name
+        )
+
+    def _lua_table_member(
+        self, owner_qn: str, member: str, separator: str, call_name: str
+    ) -> tuple[str, str] | None:
+        for qn in lua_utils.member_spellings(owner_qn, member, separator):
+            if qn in self.function_registry:
+                logger.debug(ls.CALL_LUA_TABLE_MEMBER, call_name=call_name, qn=qn)
+                return self.function_registry[qn], qn
+        return None
+
+    def _try_resolve_package_member(
+        self,
+        package_qn: str,
+        member_name: str,
+        language: cs.SupportedLanguage | None = None,
+    ) -> tuple[str, str] | None:
+        # A Go package spans multiple files and cgr qualifies its members by
+        # FILE (pkg.file.Func), so an import-mapped package qn plus member name
+        # misses the registry by one segment. Search the package's file modules
+        # for the member; Go names are unique per package, so at most one
+        # function matches (min() keeps a same-named type-method collision
+        # deterministic). The module ROOT package maps to the bare project name
+        # (no dot), so accept it alongside project-dot-prefixed package qns.
+        project_name = self.import_processor.project_name
+        if package_qn != project_name and not package_qn.startswith(
+            f"{project_name}{cs.SEPARATOR_DOT}"
+        ):
+            return None
+        member_depth = package_qn.count(cs.SEPARATOR_DOT) + 2
+        members = self.function_registry.find_with_prefix(package_qn)
+        candidates = [
+            qn
+            for qn, _ in members
+            if qn.count(cs.SEPARATOR_DOT) == member_depth
+            and qn.rsplit(cs.SEPARATOR_DOT, 1)[-1] == member_name
+        ]
+        if language == cs.SupportedLanguage.LUA:
+            # A Lua module's returned table holds `M.add` one segment below
+            # the file, like a Go file's function, but its colon-method
+            # `M:method` is that one segment itself (issue #2481).
+            candidates += [
+                qn
+                for qn, _ in members
+                if qn.count(cs.SEPARATOR_DOT) == member_depth - 1
+                and qn.rsplit(cs.SEPARATOR_DOT, 1)[-1].partition(
+                    cs.LUA_METHOD_SEPARATOR
+                )[2]
+                == member_name
+            ]
+        if not candidates:
+            return None
+        member_qn = min(candidates)
+        if len(candidates) > 1:
+            self.last_resolution = cs.EdgeResolution.HEURISTIC
+        logger.debug(ls.CALL_PACKAGE_MEMBER, member=member_name, qn=member_qn)
+        return self.function_registry[member_qn], member_qn
+
+    def _resolve_imported_class_qn(
+        self,
+        class_qn: str,
+        object_name: str,
+        method_name: str,
+        separator: str,
+    ) -> str:
+        if cs.SEPARATOR_DOUBLE_COLON in class_qn:
+            class_qn = self._resolve_rust_class_qn(class_qn)
+
+        potential_class_qn = f"{class_qn}.{object_name}"
+        test_method_qn = f"{potential_class_qn}{separator}{method_name}"
+        if test_method_qn in self.function_registry:
+            return potential_class_qn
+        return class_qn
+
+    def _resolve_rust_class_qn(
+        self, class_qn: str, module_qn: str | None = None
+    ) -> str:
+        # A path into an external crate names that crate's type, which the
+        # graph does not hold; a same-named first-party type is not it
+        # (issue #2622). Kept raw, it resolves to no class, so the receiver
+        # reads as external instead of binding the lookalike's methods.
+        if module_qn is not None:
+            if self._rust_path_is_external(class_qn, module_qn):
+                return class_qn
+            if (
+                spelled := self._rust_module_path_type(class_qn, module_qn)
+            ) is not None:
+                return spelled
+        rust_parts = class_qn.split(cs.SEPARATOR_DOUBLE_COLON)
+        class_name = rust_parts[-1]
+
+        # A Rust receiver type may be a struct (Class), an enum (`Frame`), or a
+        # type alias, all of which carry impl methods; match any of them, else an
+        # enum-typed receiver fails to resolve and its type reads as external,
+        # wrongly suppressing the trie fallback.
+        matching_qns = self.function_registry.find_ending_with(class_name)
+        return next(
+            (
+                qn
+                for qn in matching_qns
+                if self.function_registry.get(qn) in _RS_TYPE_NODE_TYPES
+                and (module_qn is None or self._rust_crate_reaches(module_qn, qn))
+            ),
+            class_qn,
+        )
+
+    def _rust_module_path_type(self, path: str, module_qn: str) -> str | None:
+        """The registered type a module path written in `module_qn` names.
+
+        `crate::`, `self::`, `super::` and a workspace crate head rewrite the
+        way a `use` does, a sibling module head resolves beside the module,
+        and a head the file imports (`use crate::a;` then `a::Builder`)
+        expands through its import. Matching the leaf by name instead let a
+        receiver declared as `crate::a::Builder` bind whichever `Builder`
+        came first (PR #2791 review). None when the path leads to no type.
+        """
+        imports = self.import_processor
+        target: str | None = imports._rewrite_rust_local_use_path(path, module_qn)
+        if target is not None and cs.SEPARATOR_DOUBLE_COLON in target:
+            target = self._rust_local_qn(path, module_qn)
+        if target is None:
+            head, _, rest = path.partition(cs.SEPARATOR_DOUBLE_COLON)
+            mapped = imports.import_mapping.get(module_qn, {}).get(head)
+            base = self._rust_local_qn(mapped, module_qn) if mapped else None
+            if base is None:
+                return None
+            target = cs.SEPARATOR_DOT.join(
+                [base, *rest.split(cs.SEPARATOR_DOUBLE_COLON)]
+            )
+        if target == cs.RUST_UNRESOLVABLE_QN:
+            return None
+        hit = self._follow_rust_scope_target(target)
+        return hit[1] if hit is not None and hit[0] in _RS_TYPE_NODE_TYPES else None
+
+    def _try_resolve_module_method(
+        self, method_name: str, call_name: str, module_qn: str
+    ) -> tuple[str, str] | None:
+        method_qn = f"{module_qn}.{method_name}"
+        if method_qn in self.function_registry:
+            logger.debug(
+                ls.CALL_OBJECT_METHOD, call_name=call_name, method_qn=method_qn
+            )
+            return self.function_registry[method_qn], method_qn
+        return None
+
+    def _resolve_self_attribute_call(
+        self,
+        parts: list[str],
+        call_name: str,
+        import_map: dict[str, str],
+        module_qn: str,
+        local_var_types: dict[str, str] | None,
+    ) -> tuple[str, str] | None:
+        attribute_ref = cs.SEPARATOR_DOT.join(parts[:-1])
+        method_name = parts[-1]
+
+        if local_var_types and attribute_ref in local_var_types:
+            var_type = local_var_types[attribute_ref]
+            if class_qn := self._resolve_class_qn_from_type(
+                var_type, import_map, module_qn
+            ):
+                method_qn = f"{class_qn}.{method_name}"
+                if method_qn in self.function_registry:
+                    logger.debug(
+                        ls.CALL_INSTANCE_ATTR,
+                        call_name=call_name,
+                        method_qn=method_qn,
+                        attr_ref=attribute_ref,
+                        var_type=var_type,
+                    )
+                    return self.function_registry[method_qn], method_qn
+
+                if inherited_method := self._resolve_inherited_method(
+                    class_qn, method_name
+                ):
+                    logger.debug(
+                        ls.CALL_INSTANCE_ATTR_INHERITED,
+                        call_name=call_name,
+                        method_qn=inherited_method[1],
+                        attr_ref=attribute_ref,
+                        var_type=var_type,
+                    )
+                    return inherited_method
+
+        return None
+
+    def _resolve_multi_part_call(
+        self,
+        parts: list[str],
+        call_name: str,
+        import_map: dict[str, str],
+        module_qn: str,
+        local_var_types: dict[str, str] | None,
+    ) -> tuple[str, str] | None:
+        class_name = parts[0]
+        method_name = cs.SEPARATOR_DOT.join(parts[1:])
+
+        if class_name in import_map:
+            class_qn = import_map[class_name]
+            method_qn = f"{class_qn}.{method_name}"
+            if method_qn in self.function_registry:
+                logger.debug(
+                    ls.CALL_IMPORT_QUALIFIED,
+                    call_name=call_name,
+                    method_qn=method_qn,
+                )
+                return self.function_registry[method_qn], method_qn
+            # `import pkg.util` is recorded as `pkg -> proj.pkg.util`, so a
+            # call spelled `pkg.util.helper` repeats the module's tail; the
+            # import names the module exactly, so the call is exact too and
+            # must not fall to the name-only trie (issue #1526).
+            if module_qn_hit := self._import_tail_qualified(class_qn, parts, call_name):
+                return module_qn_hit
+
+        if local_var_types and class_name in local_var_types:
+            var_type = local_var_types[class_name]
+            if class_qn := self._resolve_class_qn_from_type(
+                var_type, import_map, module_qn
+            ):
+                method_qn = f"{class_qn}.{method_name}"
+                if method_qn in self.function_registry:
+                    logger.debug(
+                        ls.CALL_INSTANCE_QUALIFIED,
+                        call_name=call_name,
+                        method_qn=method_qn,
+                        class_name=class_name,
+                        var_type=var_type,
+                    )
+                    return self.function_registry[method_qn], method_qn
+
+                if inherited_method := self._resolve_inherited_method(
+                    class_qn, method_name
+                ):
+                    logger.debug(
+                        ls.CALL_INSTANCE_INHERITED,
+                        call_name=call_name,
+                        method_qn=inherited_method[1],
+                        class_name=class_name,
+                        var_type=var_type,
+                    )
+                    return inherited_method
+
+        return self._resolve_field_hop_method(
+            parts, call_name, import_map, module_qn, local_var_types
+        )
+
+    def _import_tail_qualified(
+        self, class_qn: str, parts: list[str], call_name: str
+    ) -> tuple[str, str] | None:
+        """`parts` re-spells the tail of the imported module `class_qn`."""
+        for cut in range(len(parts) - 1, 1, -1):
+            tail = cs.SEPARATOR_DOT.join(parts[:cut])
+            if class_qn != tail and not class_qn.endswith(cs.SEPARATOR_DOT + tail):
+                continue
+            method_qn = f"{class_qn}.{cs.SEPARATOR_DOT.join(parts[cut:])}"
+            if method_qn in self.function_registry:
+                logger.debug(
+                    ls.CALL_IMPORT_QUALIFIED, call_name=call_name, method_qn=method_qn
+                )
+                return self.function_registry[method_qn], method_qn
+        return None
+
+    def _resolve_field_hop_method(
+        self,
+        parts: list[str],
+        call_name: str,
+        import_map: dict[str, str],
+        module_qn: str,
+        local_var_types: dict[str, str] | None,
+    ) -> tuple[str, str] | None:
+        # A paren-free field-hop receiver called inline (gin's `c.writermem.reset`):
+        # `c` is a typed local (Context), each middle segment is a struct FIELD whose
+        # recorded type advances the receiver (writermem -> responseWriter), and the
+        # final segment is a method on the last field's type. Resolves ONLY when every
+        # middle segment is a known field and the method exists (never a name-only
+        # fallback), so it can revive a dropped edge but never mis-bind. Distinct
+        # from the stored-local field-hop (`root := e.field.get(); root.m()`) which is
+        # already typed via _enrich_go_call_locals; this is the no-local direct form.
+        if len(parts) < 3 or not local_var_types:
+            return None
+        current_type = local_var_types.get(parts[0])
+        if not current_type:
+            return None
+        class_qn = self._resolve_class_qn_from_type(current_type, import_map, module_qn)
+        for field in parts[1:-1]:
+            if not class_qn:
+                return None
+            field_type = self.type_inference.class_field_types.get(class_qn, {}).get(
+                field
+            )
+            if not field_type:
+                return None
+            class_qn = self._field_type_class_qn(field_type, class_qn, module_qn)
+        if not class_qn:
+            return None
+        method_name = parts[-1]
+        method_qn = f"{class_qn}.{method_name}"
+        if method_qn in self.function_registry:
+            logger.debug(
+                ls.CALL_INSTANCE_QUALIFIED,
+                call_name=call_name,
+                method_qn=method_qn,
+                class_name=parts[0],
+                var_type=current_type,
+            )
+            return self.function_registry[method_qn], method_qn
+        return self._resolve_inherited_method(class_qn, method_name)
+
+    def operator_dunder_targets(
+        self,
+        operand_text: str,
+        dunder: str,
+        module_qn: str,
+        local_var_types: dict[str, str] | None,
+    ) -> set[tuple[str, str]]:
+        # Operator syntax dispatches to a dunder on the operand's type. Resolve only
+        # when the operand type is known; never via the name-only trie fallback, so a
+        # builtin container does not borrow a first-party dunder. A Protocol-typed
+        # operand dispatches to the dunder on each structural implementer (which may
+        # define the dunder even when the Protocol stub does not, e.g. __len__).
+        if not local_var_types or not (var_type := local_var_types.get(operand_text)):
+            return set()
+        import_map = self.import_processor.import_mapping.get(module_qn, {})
+        class_qn = self._resolve_class_qn_from_type(var_type, import_map, module_qn)
+        if not class_qn:
+            return set()
+        if class_qn in self._protocol_classes():
+            # Naming convention (XxxProtocol -> Xxx) is robust when it applies;
+            # structural conformance covers protocols whose implementer is named
+            # differently. Union both so neither gap drops a concrete target.
+            classes = set(self._protocol_structural_implementers(class_qn))
+            if named_impl := self._protocol_impl_map().get(class_qn):
+                classes.add(named_impl)
+        else:
+            classes = {class_qn}
+        targets: set[tuple[str, str]] = set()
+        for candidate in classes:
+            if resolved := self._try_resolve_method(candidate, dunder):
+                targets.add(resolved)
+        return targets
+
+    def _protocol_structural_implementers(self, protocol_qn: str) -> set[str]:
+        # Classes that define every method declared on the Protocol (own or
+        # inherited). Used to dispatch operator dunders to the concrete type when the
+        # Protocol/implementer names don't follow the XxxProtocol convention.
+        if protocol_qn in self._struct_impl_cache:
+            return self._struct_impl_cache[protocol_qn]
+        protocol_methods = self._protocol_method_names(protocol_qn)
+        result: set[str] = set()
+        if protocol_methods:
+            result = self._classes_defining_all(protocol_methods)
+        self._struct_impl_cache[protocol_qn] = result
+        return result
+
+    def _protocol_method_names(self, protocol_qn: str) -> set[str]:
+        """The names of the methods a Protocol and its Protocol bases declare.
+
+        An inherited method is required as much as an own one, and the
+        `@overload` stubs of one method are one name, though the registry
+        keeps each under its own `@<line>` marker.
+        """
+        sep = cs.SEPARATOR_DOT
+        protocols = self._protocol_classes()
+        names: set[str] = set()
+        pending = [protocol_qn]
+        seen: set[str] = set()
+        while pending:
+            current = pending.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            names.update(
+                qn_markers.strip_dup_marker(qn.rsplit(sep, 1)[-1])
+                for qn, node_type in self.function_registry.find_with_prefix(current)
+                if node_type == NodeType.METHOD and qn.rsplit(sep, 1)[0] == current
+            )
+            pending.extend(
+                base
+                for base in self.class_inheritance.get(current, ())
+                if base in protocols
+            )
+        return names
+
+    def _classes_defining_all(self, protocol_methods: set[str]) -> set[str]:
+        result: set[str] = set()
+        protocols = self._protocol_classes()
+        for candidate in self.class_inheritance:
+            if candidate in protocols:
+                continue
+            if all(
+                self._try_resolve_method(candidate, method)
+                for method in protocol_methods
+            ):
+                result.add(candidate)
+        return result
+
+    def resolve_scala_selection(
+        self,
+        receiver_type: str,
+        member: str,
+        module_qn: str,
+        class_context: str | None,
+        position: int,
+    ) -> tuple[str, str] | None:
+        """The method a parameterless Scala selection `receiver.member` runs.
+
+        A `val` read and a parameterless call are spelled alike (`c.size`), so
+        only a receiver whose class is KNOWN decides: `this`, a local typed by
+        its binding, or an object named outright. `receiver_type` is the type
+        name written for it, or `this`. The member must be a method of that
+        class or an ancestor; no name-wide fallback answers for it.
+        """
+        class_qn = (
+            class_context
+            if receiver_type == cs.SCALA_THIS
+            else self.scala_class_qn(receiver_type, module_qn, position)
+        )
+        if class_qn is None:
+            return None
+        result = self._try_resolve_method(class_qn, member)
+        if result is None or result[0] != NodeType.METHOD:
+            return None
+        return result
+
+    def scala_class_qn(
+        self, written: str, module_qn: str, position: int | None = None
+    ) -> str | None:
+        """The registered class a type name written in a Scala file names."""
+        class_qn = self.import_processor.scala_type_qn(module_qn, written, position)
+        if class_qn is None or self.function_registry.get(class_qn) != NodeType.CLASS:
+            return None
+        return class_qn
+
+    def resolve_scala_callee(
+        self, call_name: str, module_qn: str, position: int, constructing: bool
+    ) -> tuple[bool, tuple[str, str] | None]:
+        """A Scala callee named through the imports in scope where it is called.
+
+        Decided (True) for a `new C(...)` the compiler's lookup reaches, and
+        for any name a package block around the call imports: that block's
+        import is the only binding visible there, so the file-level map, which
+        a sibling block may share a name with, must not answer. Undecided
+        otherwise.
+        """
+        if constructing and (
+            class_qn := self.scala_class_qn(call_name, module_qn, position)
+        ):
+            return True, (cs.NodeLabel.CLASS, class_qn)
+        head, _, rest = call_name.partition(cs.SEPARATOR_DOT)
+        imported = self.import_processor.scala_block_import(module_qn, head, position)
+        if imported is None:
+            return False, None
+        target = f"{imported}{cs.SEPARATOR_DOT}{rest}" if rest else imported
+        kind = self.function_registry.get(target)
+        if kind is None or (constructing and kind != NodeType.CLASS):
+            return True, None
+        return True, (kind, target)
+
+    def resolve_builtin_call(self, call_name: str) -> tuple[str, str] | None:
+        if call_name in cs.JS_BUILTIN_PATTERNS:
+            return (cs.NodeLabel.FUNCTION, f"{cs.BUILTIN_PREFIX}.{call_name}")
+
+        for suffix, method in cs.JS_FUNCTION_PROTOTYPE_SUFFIXES.items():
+            if call_name.endswith(suffix):
+                return (
+                    cs.NodeLabel.FUNCTION,
+                    f"{cs.BUILTIN_PREFIX}{cs.SEPARATOR_DOT}Function{cs.SEPARATOR_PROTOTYPE}{method}",
+                )
+
+        if cs.SEPARATOR_PROTOTYPE in call_name and (
+            call_name.endswith(cs.JS_SUFFIX_CALL)
+            or call_name.endswith(cs.JS_SUFFIX_APPLY)
+        ):
+            base_call = call_name.rsplit(cs.SEPARATOR_DOT, 1)[0]
+            return (cs.NodeLabel.FUNCTION, base_call)
+
+        return None
+
+    def cpp_member_operator(
+        self, call_name: str, operand_type_qn: str
+    ) -> tuple[str, str] | None:
+        # Operand-type-directed operator binding: the overload is either a
+        # member of the operand's own class or a free overload beside it. A
+        # typed operand with NEITHER is a builtin operation (enum/int
+        # comparison) with no first-party callee; nlohmann's
+        # `token == token_type::x` must not rebind to an unrelated class's
+        # operator== and fan out to all its overload variants.
+        # _try_resolve_method covers both the direct member and one
+        # INHERITED from a base (Derived : Base with Base::operator==).
+        return self._try_resolve_method(operand_type_qn, call_name)
+
+    def cpp_free_operator_for_type(
+        self, call_name: str, operand_type_qn: str, position: int, arity: int
+    ) -> tuple[str, str] | None:
+        # ADL: a free overload may live in ANY enclosing namespace of the
+        # operand's type, not only its immediate parent scope. Sharing the
+        # name is not enough: `1 + v` with V converting to int is built-in
+        # `+` even beside an unrelated `operator+(W, W)`, so an overload set
+        # counts only when one of its declarations takes the operand's class
+        # at the operand's position (issue #2554 review).
+        parts = operand_type_qn.split(cs.SEPARATOR_DOT)
+        for depth in range(len(parts) - 1, 0, -1):
+            scope = cs.SEPARATOR_DOT.join(parts[:depth])
+            free_qn = f"{scope}{cs.SEPARATOR_DOT}{call_name}"
+            if free_qn in self.function_registry and any(
+                self._cpp_operator_accepts(signature, operand_type_qn, position, arity)
+                for signature in self._cpp_free_operator_signatures(free_qn)
+            ):
+                return (self.function_registry[free_qn], free_qn)
+        return None
+
+    def _cpp_operator_accepts(
+        self,
+        signature: CppOperatorSignature,
+        operand_type_qn: str,
+        position: int,
+        arity: int,
+    ) -> bool:
+        # The parameter at the operand's position takes its class by value
+        # or reference (a base class too), or is a template parameter that
+        # deduces to it; a pointer parameter never takes a class value.
+        if len(signature.parameters) != arity:
+            return False
+        param = signature.parameters[position]
+        if param.indirection or not param.type_name:
+            return False
+        if param.type_name in signature.template_params:
+            return True
+        import_map = self.import_processor.import_mapping.get(signature.module_qn, {})
+        param_qn = self._resolve_class_qn_from_type(
+            param.type_name, import_map, signature.module_qn
+        )
+        return bool(param_qn) and param_qn in self._mro(operand_type_qn)
+
+    def _cpp_free_operator_signatures(
+        self, free_qn: str
+    ) -> tuple[CppOperatorSignature, ...]:
+        # Parameter types are not stored on C++ Function nodes, so they are
+        # read from the declaring module's AST: one walk per module collects
+        # every free operator it declares, a prototype included. The AST
+        # rather than the definition pass's span records, so an incremental
+        # run that did not re-parse the module reads the same signatures.
+        module_qn = free_qn
+        module_paths = self.type_inference.module_qn_to_file_path
+        while module_qn and module_qn not in module_paths:
+            module_qn = module_qn.rpartition(cs.SEPARATOR_DOT)[0]
+        if not module_qn:
+            return ()
+        if (by_qn := self._cpp_free_operators.get(module_qn)) is None:
+            by_qn = self._cpp_free_operators[module_qn] = (
+                self._collect_cpp_free_operators(module_qn)
+            )
+        return by_qn.get(free_qn, ())
+
+    def _collect_cpp_free_operators(
+        self, module_qn: str
+    ) -> dict[str, tuple[CppOperatorSignature, ...]]:
+        found: dict[str, list[CppOperatorSignature]] = {}
+        root = self._cached_module_root(module_qn)
+        if root is None:
+            return {}
+        engine = self.type_inference.cpp_type_inference
+        stack = [root]
+        while stack:
+            node = stack.pop()
+            if node.type == cs.TS_CPP_COMPOUND_STATEMENT:
+                continue
+            stack.extend(node.children)
+            if (
+                node.type not in cs.CPP_FREE_FUNCTION_DECLARATION_TYPES
+                or node.parent is None
+                or node.parent.type == cs.CppNodeType.FIELD_DECLARATION_LIST
+                or not (name := cpp_utils.extract_function_name(node))
+                or not name.startswith(cs.OPERATOR_PREFIX)
+                or (params := c_family_parameter_list(node)) is None
+            ):
+                continue
+            found.setdefault(
+                cpp_utils.build_qualified_name(node, module_qn, name), []
+            ).append(
+                CppOperatorSignature(
+                    module_qn,
+                    engine.parameter_types(params),
+                    engine.collect_template_param_names(node),
+                )
+            )
+        return {qn: tuple(signatures) for qn, signatures in found.items()}
+
+    def cpp_operand_class_qn(
+        self,
+        operand_name: str | None,
+        local_var_types: dict[str, str] | None,
+        module_qn: str,
+    ) -> str | None:
+        # A bare-identifier operand with a locally inferred type resolves
+        # to a REGISTERED first-party type qn, or nothing: only a known
+        # class type can select an operator overload (issue #2554).
+        if not operand_name or not local_var_types:
+            return None
+        var_type = local_var_types.get(operand_name)
+        if not var_type:
+            return None
+        import_map = self.import_processor.import_mapping.get(module_qn, {})
+        resolved = self._resolve_class_qn_from_type(var_type, import_map, module_qn)
+        if resolved and resolved in self.function_registry:
+            return resolved
+        return None
+
+    def resolve_cpp_operator_call(
+        self, call_name: str, module_qn: str
+    ) -> tuple[str, str] | None:
+        if not call_name.startswith(cs.OPERATOR_PREFIX):
+            return None
+
+        # A user-defined overload always beats the builtin: the old table
+        # of synthetic `builtin.cpp.operator_*` qns shadowed real overloads
+        # and produced edges to nodes that never exist (dropped by the
+        # database). A primitive builtin operator is not a first-party
+        # callee, so with no registered overload there is no edge at all.
+        if possible_matches := self.function_registry.find_ending_with(call_name):
+            same_module_ops = [
+                qn
+                for qn in possible_matches
+                if qn.startswith(module_qn) and call_name in qn
+            ]
+            candidates = same_module_ops or possible_matches
+            candidates.sort(key=lambda qn: (len(qn), qn))
+            best = candidates[0]
+            return (self.function_registry[best], best)
+
+        return None
+
+    def _infer_chained_object_type(
+        self,
+        object_expr: str,
+        module_qn: str,
+        local_var_types: dict[str, str] | None,
+        class_context: str | None = None,
+        caller_qn: str | None = None,
+        language: cs.SupportedLanguage | None = None,
+        call_point: int | None = None,
+    ) -> str | None:
+        # Type of a chained receiver expression like `c.Root()` using the shared
+        # method_return_types map: the base is a typed local (`c` -> Command), and
+        # each `.method()` hop advances the type by that method's return type
+        # (Root() -> Command). Language-agnostic; returns the bare type name of the
+        # final hop, or None if any hop is untyped/unknown (then the chain stays
+        # unresolved). No early-out on an empty method_return_types map: a
+        # constructor-temporary base (`Reader<T>(...).m()`) types itself from the
+        # class registry alone.
+        parts = _split_receiver_chain(object_expr)
+        if parts is None:
+            return None
+        base = parts[0]
+        if not base:
+            return None
+        if cs.CHAR_PAREN_OPEN in base:
+            # A Rust chain rooted in an associated-function call
+            # (`Ping::new(msg).into_frame()`): type the base from the assoc fn's
+            # recorded return type. A bare-identifier factory call
+            # (`parser(ia, cb).parse()`, C++): type it from the factory's recorded
+            # return type. Other paren bases stay unresolved.
+            current_type = self._infer_rust_assoc_base_type(
+                base, module_qn, call_point, _rust_caller(language, caller_qn)
+            ) or self._infer_call_base_type(
+                base,
+                module_qn,
+                local_var_types,
+                class_context,
+                caller_qn,
+                language,
+                call_point,
+            )
+        elif (
+            folded := self._fold_import_prefix_hop(
+                parts, module_qn, local_var_types, call_point, language
+            )
+        ) is not None:
+            # `p.Box(1).height` under `import '...' as p;`: the base names an
+            # IMPORT, not a local, so the local lookup below would end the
+            # chain before the construction hop is seen (issue #2033). Fold
+            # the prefix into the next hop and type that hop instead.
+            current_type, parts = folded
+        elif (
+            folded := self._fold_js_call_hop(
+                parts,
+                module_qn,
+                local_var_types,
+                class_context,
+                caller_qn,
+                language,
+                call_point,
+            )
+        ) is not None:
+            current_type, parts = folded
+        elif local_var_types:
+            current_type = local_var_types.get(base)
+        else:
+            return None
+        for part in parts[1:]:
+            if not current_type or cs.CHAR_PAREN_OPEN not in part:
+                return None
+            method = part.split(cs.CHAR_PAREN_OPEN, 1)[0]
+            if language == cs.SupportedLanguage.DART:
+                current_type = self._dart_member_return_type(
+                    self.resolve_dart_written_type(current_type, module_qn),
+                    method,
+                    module_qn,
+                )
+                continue
+            current_type = self._member_hop_type(
+                current_type, method, module_qn, language, caller_qn
+            )
+        return current_type
+
+    def _member_hop_type(
+        self,
+        receiver_type: str,
+        method: str,
+        module_qn: str,
+        language: cs.SupportedLanguage | None,
+        caller_qn: str | None,
+    ) -> str | None:
+        # What `receiver.method()` hands the next hop. A receiver that is a
+        # JS/TS class itself (`C.self()` from a static `return this`) reaches
+        # only its static members, its ancestors' included.
+        if (class_value := _class_value_of(receiver_type)) is not None:
+            found = self._js_static_member(class_value, method)
+            if found is None:
+                return None
+            return self._hop_return_type(found[0], language, True, class_value)
+        class_qn = self._chain_class_qn(
+            receiver_type, module_qn, _rust_caller(language, caller_qn)
+        )
+        return self._hop_return_type(
+            f"{class_qn}{cs.SEPARATOR_DOT}{method}", language, False, class_qn
+        )
+
+    def _hop_return_type(
+        self,
+        callable_qn: str,
+        language: cs.SupportedLanguage | None,
+        static: bool = False,
+        receiver: str | None = None,
+    ) -> str | None:
+        # The type a call to `callable_qn` hands the next hop. Most languages
+        # record it as they ingest; a JS/TS return is read off the callee's
+        # declaration on demand (issue #2468), and a `this` return names the
+        # class it is called through (`receiver`). A hop's receiver is an
+        # instance, so it reaches the instance member unless told otherwise.
+        recorded = self.type_inference.method_return_types.get(callable_qn)
+        if recorded is None and language in cs.JS_TS_LANGUAGES:
+            return _bind_receiver(self._js_return_class(callable_qn, static), receiver)
+        return recorded
+
+    def _js_static_member(self, class_qn: str, method: str) -> tuple[str, int] | None:
+        """`(member qn, line)` of the static `method` the class reaches: its
+        own, else the nearest ancestor's. The walk stops at the first class
+        declaring a static of that name, field or accessor included, which
+        hides every parent's; one with no method body answers nothing.
+        Instance members are a different namespace and never answer."""
+        for owner in self._mro(class_qn):
+            declared, line = self.type_inference.js_static_member(owner, method)
+            if declared:
+                return (
+                    (f"{owner}{cs.SEPARATOR_DOT}{method}", line)
+                    if line is not None
+                    else None
+                )
+        return None
+
+    def _js_static_member_target(
+        self, class_qn: str, method: str
+    ) -> tuple[str, str] | None:
+        # A static and an instance member of one name register as `m` and
+        # `m@<line>`, the first in the source taking the plain name; the
+        # static one's line says which it is.
+        found = self._js_static_member(class_qn, method)
+        if found is None:
+            return None
+        member_qn, line = found
+        marked = {
+            marker: variant
+            for variant in self.function_registry.variants(member_qn)
+            if (marker := qn_markers.marker_line(variant)) is not None
+        }
+        if line in marked:
+            variant = marked[line]
+        elif member_qn in self.function_registry and all(
+            marker > line for marker in marked
+        ):
+            variant = member_qn
+        else:
+            return None
+        return self.function_registry[variant], variant
+
+    def _callee_return_type(
+        self, callee_qn: str, language: cs.SupportedLanguage | None
+    ) -> str | None:
+        # Read right after the callee resolved. A JS/TS callee bound only by
+        # name is a guess, and typing the rest of the chain from its return
+        # would build every later hop on that guess.
+        if (
+            language in cs.JS_TS_LANGUAGES
+            and self.last_resolution != cs.EdgeResolution.EXACT
+        ):
+            return None
+        return self._hop_return_type(callee_qn, language)
+
+    def _js_return_class(self, callable_qn: str, static: bool) -> str | None:
+        # Only a class registered under the qn the declaring module resolved
+        # counts: a name that module could not place is not looked up again
+        # from the caller, where a same-named class may answer.
+        key = (callable_qn, static)
+        if key in self._js_return_class_cache:
+            return self._js_return_class_cache[key]
+        returned = self.type_inference.js_callable_return_type(callable_qn, static)
+        if returned in _JS_RECEIVER_MARKERS:
+            self._js_return_class_cache[key] = returned
+            return returned
+        class_qn = (
+            self._follow_reexports(returned)
+            if returned and cs.SEPARATOR_DOT in returned
+            else None
+        )
+        if class_qn is not None and self.function_registry.get(class_qn) != (
+            NodeType.CLASS
+        ):
+            class_qn = None
+        self._js_return_class_cache[key] = class_qn
+        return class_qn
+
+    def _fold_js_call_hop(
+        self,
+        parts: list[str],
+        module_qn: str,
+        local_var_types: dict[str, str] | None,
+        class_context: str | None,
+        caller_qn: str | None,
+        language: cs.SupportedLanguage | None,
+        call_point: int | None,
+    ) -> tuple[str, list[str]] | None:
+        # `TBox.create().with(1)`, `this.with(1).bump()`: the base is no typed
+        # local, but its first hop binds the way that call written alone
+        # does. Its return types the rest of the chain (issue #2468).
+        if language not in cs.JS_TS_LANGUAGES or len(parts) < 2:
+            return None
+        base, hop = parts[0], parts[1]
+        if (
+            cs.CHAR_PAREN_OPEN in base
+            or cs.CHAR_PAREN_OPEN not in hop
+            or (local_var_types and base in local_var_types)
+        ):
+            return None
+        # What `this` / `super` name is settled before anything resolves: an
+        # object literal's or a plain function's own `this` is no class, so
+        # neither the resolver nor the class-anchored fallback below may
+        # answer for it with the class around it.
+        is_this = base in _JS_THIS_RECEIVERS
+        this_static = (
+            self._js_this_names_class(module_qn, call_point) if is_this else False
+        )
+        if this_static is None:
+            return None
+        method = hop.split(cs.CHAR_PAREN_OPEN, 1)[0]
+        # `D.make()` names a class, so it reaches the static `make` D has or
+        # inherits along its `extends` chain, and a `this` that `make`
+        # returns is D. `this` / `super` stand for the enclosing class; any
+        # other base is a value, reaching an instance member.
+        named = (
+            None
+            if is_this
+            else self._named_class(base, module_qn, language, call_point)
+        )
+        callee_qn = self._first_hop_callee(
+            base,
+            method,
+            named,
+            _CallSite(
+                f"{base}{cs.SEPARATOR_DOT}{method}",
+                module_qn,
+                local_var_types,
+                class_context,
+                caller_qn,
+                language,
+                call_point,
+                False,
+            ),
+        )
+        if callee_qn is None:
+            return None
+        receiver = class_context if is_this else named
+        static = this_static or named is not None
+        returned = self._hop_return_type(callee_qn, language, static, receiver)
+        return (returned, parts[1:]) if returned else None
+
+    def _first_hop_callee(
+        self, base: str, method: str, named: str | None, call: _CallSite
+    ) -> str | None:
+        if named is not None:
+            found = self._js_static_member(named, method)
+            return found[0] if found else None
+        return self._exact_first_hop(base, method, call)
+
+    def _named_class(
+        self,
+        name: str,
+        module_qn: str,
+        language: cs.SupportedLanguage,
+        call_point: int | None,
+    ) -> str | None:
+        # The class a base name is at the call: declared in this module or
+        # imported, and not rebound by a parameter or local around the call.
+        # A same-named class elsewhere in the project is never it.
+        root = self._cached_module_root(module_qn)
+        site = (
+            root.named_descendant_for_byte_range(call_point, call_point)
+            if root is not None and call_point is not None
+            else None
+        )
+        if site is None or safe_decode_text(site) != name:
+            return None
+        class_qn = self.type_inference.js_type_inference.visible_class(
+            site, name, module_qn, language
+        )
+        if class_qn is None:
+            return None
+        class_qn = self._follow_reexports(class_qn)
+        return (
+            class_qn if self.function_registry.get(class_qn) == NodeType.CLASS else None
+        )
+
+    def _exact_first_hop(self, base: str, method: str, call: _CallSite) -> str | None:
+        # The callee of the chain's first hop, bound exactly or not at all: a
+        # callee bound only by name is a guess, and typing the rest of the
+        # chain from its return would build every later hop on that guess.
+        chain_verdict = self.last_resolution
+        resolved = self.resolve_function_call(
+            call.call_name,
+            call.module_qn,
+            call.local_var_types,
+            call.class_context,
+            call.caller_qn,
+            call.language,
+            call.call_point,
+        )
+        hop_exact = self.last_resolution == cs.EdgeResolution.EXACT
+        # The hop's verdict is read here and goes no further. `this.make` in
+        # an arrow misses by name, which is a heuristic verdict, and the
+        # class-anchored hop below types it exactly; left behind, that miss
+        # labelled the exact `this.make().done()` heuristic (issue #3276).
+        self.last_resolution = chain_verdict
+        if resolved is not None:
+            return resolved[1] if hop_exact else None
+        # `this.m()` in an arrow: name resolution climbs from the arrow to its
+        # method, not the class, so the call processor anchors such a call on
+        # the enclosing class instead (#971). The hop is typed the same way.
+        if base != cs.TS_THIS or not call.class_context:
+            return None
+        own_qn = f"{call.class_context}{cs.SEPARATOR_DOT}{method}"
+        if own_qn in self.function_registry:
+            return own_qn
+        inherited = self._resolve_inherited_method(call.class_context, method)
+        return inherited[1] if inherited else None
+
+    def _js_this_names_class(
+        self, module_qn: str, call_point: int | None
+    ) -> bool | None:
+        # `this` / `super` at the call: the class inside a static member, an
+        # instance inside an instance member, and neither (None) inside a
+        # plain function or an object literal's method.
+        root = self._cached_module_root(module_qn)
+        if root is None or call_point is None:
+            return None
+        return js_ts_utils.this_names_class_at(root, call_point)
+
+    def _dart_member_return_type(
+        self, class_qn: str, member: str, module_qn: str
+    ) -> str | None:
+        """The class a Dart hop `.member()` on a `class_qn` receiver returns.
+
+        The member is the class's own, else an inherited one, else an
+        extension's (Dart's lookup order). Its return type is recorded under
+        the DECLARING qn, so a hop through an inherited or extension member
+        ended the chain (`o.move(1).sum()` on a subclass of Point, issue
+        #2482). It is also written in the DECLARING library, so it resolves
+        there: read in the caller's file instead, a bare `Result` bound to
+        whichever `Result` the CALLER sees (Greptile, PR #2804).
+        """
+        return_types = self.type_inference.method_return_types
+        own_qn = f"{class_qn}{cs.SEPARATOR_DOT}{member}"
+        if own_qn in return_types or own_qn in self.function_registry:
+            # An own member shadows every inherited and extension one, even
+            # when it records no return type.
+            member_qn = own_qn
+        elif found := self._resolve_inherited_method(
+            class_qn, member
+        ) or self._dart_extension_member(class_qn, member, module_qn):
+            member_qn = found[1]
+        else:
+            return None
+        returned = return_types.get(member_qn)
+        if not returned:
+            return None
+        # Dart has no nested types: a member sits in a top-level class, mixin,
+        # enum or extension, so its library is two segments up.
+        declaring_module = member_qn.rsplit(cs.SEPARATOR_DOT, 2)[0]
+        return self.resolve_dart_written_type(returned, declaring_module)
+
+    def resolve_dart_written_type(self, written: str, module_qn: str) -> str:
+        """A Dart type as written in `module_qn` -> its qn, else as written.
+
+        Dart scopes a type name to the library it is written in (Greptile,
+        PR #2804): `p.Point` names Point through `module_qn`'s OWN `import
+        ... as p` (read as a qualified name it matched nothing), and a bare
+        `Result` is the library's own declaration, else the ONE its imports
+        expose, before any project-wide guess. A name that is already a
+        registered qn (an earlier hop's result) is kept.
+        """
+        if written in self.function_registry:
+            return written
+        prefix, dot, name = written.partition(cs.SEPARATOR_DOT)
+        if dot:
+            hit = self._unique_prefixed_definition(
+                self._dart_prefix_targets(prefix, module_qn), name
+            )
+            if hit is not None:
+                return hit[1]
+        else:
+            own = f"{module_qn}{cs.SEPARATOR_DOT}{written}"
+            if own in self.function_registry:
+                return own
+            imported = [
+                qn
+                for library in self._dart_visible_libraries(module_qn) - {module_qn}
+                if (qn := f"{library}{cs.SEPARATOR_DOT}{written}")
+                in self.function_registry
+            ]
+            if len(imported) == 1:
+                return imported[0]
+        return self._chain_class_qn(written, module_qn)
+
+    def _dart_extension_member(
+        self, class_qn: str, member: str, module_qn: str
+    ) -> tuple[str, str] | None:
+        """The extension member a Dart receiver of `class_qn` reaches, if any.
+
+        Dart consults extensions only after the receiver's own and inherited
+        members miss, applies only those the caller's library can see, and
+        among them the one on the most specific type wins: one `on` the
+        receiver's class beats one `on` an ancestor. Two at the same level are
+        ambiguous (a compile error in Dart) and bind nothing.
+        """
+        on_types = self.type_inference.dart_extension_on_types
+        if not on_types:
+            return None
+        # The `on` type is resolved from the extension's own library, where it
+        # was written (`on p.Point` through ITS `as p` import); an extension
+        # is always a top-level declaration.
+        candidates = [
+            (
+                member_qn,
+                ext_qn,
+                self.resolve_dart_written_type(on_types[ext_qn], ext_module),
+                ext_module,
+            )
+            for member_qn in self.function_registry.find_ending_with(member)
+            if (ext_qn := member_qn.rpartition(cs.SEPARATOR_DOT)[0]) in on_types
+            and (ext_module := ext_qn.rpartition(cs.SEPARATOR_DOT)[0])
+        ]
+        if not candidates:
+            return None
+        levels = self._class_and_ancestor_levels(class_qn)
+        receiver_types = set().union(*levels)
+        # Applicability, then visibility, then specificity. Only an extension
+        # `on` the receiver's class or an ancestor competes at all: filtering
+        # by visibility first let a visible extension on an UNRELATED type
+        # push out the applicable one (Greptile, PR #2804).
+        applicable = [
+            candidate for candidate in candidates if candidate[2] in receiver_types
+        ]
+        if not applicable:
+            return None
+        # Among those, an unimported one `on Derived` must not beat an
+        # imported one `on Base` (Greptile, PR #2804). A `package:` import is
+        # kept verbatim and proves nothing, so when no applicable candidate is
+        # provably visible they all stay in play rather than the call being
+        # dropped. A provable one also wins a same-level tie against an
+        # unprovable one: were both visible, Dart would reject the call as
+        # ambiguous, so in code that compiles the unprovable one is not.
+        visible_libraries = self._dart_visible_libraries(module_qn)
+        pool = [
+            candidate for candidate in applicable if candidate[3] in visible_libraries
+        ] or applicable
+        for level in levels:
+            matches = [
+                member_qn for member_qn, _ext, on_qn, _module in pool if on_qn in level
+            ]
+            if len(matches) == 1:
+                return self.function_registry[matches[0]], matches[0]
+            if matches:
+                return None
+        return None
+
+    def _class_and_ancestor_levels(self, class_qn: str) -> list[set[str]]:
+        # The class, then each breadth-first generation of its ancestors.
+        levels: list[set[str]] = [{class_qn}]
+        seen = {class_qn}
+        frontier = [class_qn]
+        while frontier:
+            parents = {
+                self._follow_reexports(parent)
+                for child in frontier
+                for parent in self.class_inheritance.get(child, [])
+            } - seen
+            if not parents:
+                break
+            levels.append(parents)
+            seen |= parents
+            frontier = list(parents)
+        return levels
+
+    def _dart_visible_libraries(self, module_qn: str) -> set[str]:
+        """The libraries whose top-level names `module_qn` can see: itself,
+        every library it imports (prefixed or not), and whatever those hand
+        on through `export` / `part`, transitively. A library a dependency
+        merely IMPORTS stays hidden (issue #2482)."""
+        processor = self.import_processor
+        imported = set(processor.import_mapping.get(module_qn, {}).values())
+        for libraries in processor.dart_import_aliases.get(module_qn, {}).values():
+            imported.update(libraries)
+        return self._dart_with_exposed({module_qn, *imported}, list(imported))
+
+    def _dart_bare_visible_libraries(self, module_qn: str, name: str) -> set[str]:
+        """The libraries whose `name` `module_qn` can write bare: those its
+        plain `import` and `part` directives bring in, unless a `show` /
+        `hide` clause keeps `name` out, and whatever those hand on through
+        `export` / `part`. An `as p` import names them `p.Name` instead, and
+        an `export` hands names to importers without bringing them in
+        (issue #3286)."""
+        roots = [
+            directive.library
+            for directive in self.import_processor.dart_bare_imports.get(module_qn, ())
+            if directive.admits(name)
+        ]
+        return self._dart_with_exposed(set(roots), roots, name)
+
+    def _dart_with_exposed(
+        self, visible: set[str], frontier: list[str], name: str | None = None
+    ) -> set[str]:
+        """`visible` plus whatever the `frontier` libraries hand on through
+        `export` / `part`, transitively; for a `name`, only through exports
+        whose `show` / `hide` clauses hand that name on."""
+        exposed_by = self.import_processor.dart_exposed_libraries
+        while frontier:
+            library = frontier.pop()
+            for exposed in exposed_by.get(library, ()):
+                if exposed in visible or (
+                    name is not None and not self._dart_hands_on(library, exposed, name)
+                ):
+                    continue
+                visible.add(exposed)
+                frontier.append(exposed)
+        return visible
+
+    def _dart_hands_on(self, library: str, exposed: str, name: str) -> bool:
+        # `export 'b.dart' hide Cart;` hands on b's names but `Cart` (Greptile,
+        # PR #3292). A part has no clauses, and one export admitting the name
+        # is enough when the library exports the same file twice.
+        exports = [
+            export
+            for export in self.import_processor.dart_exports.get(library, ())
+            if export.library == exposed
+        ]
+        return not exports or any(export.admits(name) for export in exports)
+
+    def _drop_named_constructor(self, name: str, target: str) -> str:
+        """`Box.named` -> `Box` when the dotted name is not a definition but
+        its head is: the tail is a named constructor, not part of the type
+        (issue #2033). Any other name is returned unchanged."""
+        if cs.SEPARATOR_DOT not in name:
+            return name
+        head = name.split(cs.SEPARATOR_DOT, 1)[0]
+        full_qn = f"{target}{cs.SEPARATOR_DOT}{name}"
+        head_qn = f"{target}{cs.SEPARATOR_DOT}{head}"
+        if (
+            self.function_registry.get(full_qn) is None
+            and self.function_registry.get(head_qn) is not None
+        ):
+            return head
+        return name
+
+    def _names_own_constructible(self, name: str, module_qn: str) -> bool:
+        """Does `name` resolve, from this module, to something constructible?
+
+        `new X.named(1).m` splits to base `X` + hop `named()`, so the base is
+        the CLASS and the hop its named constructor (issue #2033). Asked
+        before the import map, since a class in this module is not an import.
+        """
+        own = self._resolve_class_qn_from_type(
+            name,
+            self.import_processor.import_mapping.get(module_qn, {}),
+            module_qn,
+        )
+        return bool(own) and self.function_registry.get(own) in (
+            _CONSTRUCTIBLE_NODE_TYPES
+        )
+
+    def _dart_call_on_shadow(
+        self,
+        call_name: str,
+        module_qn: str,
+        local_var_types: dict[str, str] | None,
+        call_point: int | None,
+    ) -> bool:
+        """Is `call_name`'s first segment an import prefix a binding at this
+        site shadows, with no type to resolve the call through instead?"""
+        if cs.SEPARATOR_DOT not in call_name:
+            return False
+        prefix = call_name.split(cs.SEPARATOR_DOT, 1)[0]
+        typed = local_var_types.get(prefix) if local_var_types else None
+        if typed and typed != cs.DART_DYNAMIC_TYPE:
+            return False
+        return bool(
+            self._dart_prefix_targets(prefix, module_qn)
+        ) and self._dart_prefix_is_shadowed(prefix, module_qn, call_point)
+
+    def _dart_prefix_is_shadowed(
+        self, prefix: str, module_qn: str, call_point: int | None
+    ) -> bool:
+        """Does a local or parameter named `prefix` bind it at this site?
+
+        The resolver's `local_var_types` only holds names it could infer a
+        TYPE for, so `var p = 1` is absent from it and an inferred-type check
+        cannot see the shadow. The import processor records the syntactic
+        binding spans instead, which are independent of inference.
+
+        A site with no recorded position cannot be placed against a span, so
+        it is treated as unshadowed: flow and taint passes resolve without a
+        position, and losing the fold there would drop real edges.
+        """
+        if call_point is None:
+            return False
+        spans = self.import_processor.dart_prefix_shadows.get(module_qn, {})
+        return any(lo <= call_point < hi for lo, hi in spans.get(prefix, ()))
+
+    def _fold_import_prefix_hop(
+        self,
+        parts: list[str],
+        module_qn: str,
+        local_var_types: dict[str, str] | None = None,
+        call_point: int | None = None,
+        language: cs.SupportedLanguage | None = None,
+    ) -> tuple[str, list[str]] | None:
+        # An import prefix followed by a CONSTRUCTION hop (`p`, `Box()`, ...)
+        # collapses to that class: the prefix carries no type of its own, and
+        # the class is what the rest of the chain hangs off. Returns the
+        # constructed type and the remaining chain with the prefix removed, or
+        # None when the base is not a prefix or the next hop is not a
+        # construction the registry knows.
+        if len(parts) < 2:
+            return None
+        # The bare `p.Box.named(1)` (no `new`) has no construction node, so
+        # the class and its named constructor arrive as two hops; rejoined,
+        # they take the path `new p.Box.named(1)` takes (issue #2084).
+        if (
+            language == cs.SupportedLanguage.DART
+            and len(parts) >= 3
+            and cs.CHAR_PAREN_OPEN not in parts[1]
+            and cs.CHAR_PAREN_OPEN in parts[2]
+        ):
+            parts = [parts[0], f"{parts[1]}{cs.SEPARATOR_DOT}{parts[2]}", *parts[3:]]
+        prefix, hop = parts[0], parts[1]
+        if cs.CHAR_PAREN_OPEN in prefix or cs.CHAR_PAREN_OPEN not in hop:
+            return None
+        # A binding of that name at this site shadows the import, whether or
+        # not a type could be inferred for it (issue #2033).
+        if self._dart_prefix_is_shadowed(prefix, module_qn, call_point):
+            return None
+        # `new X.named(1).m` splits to base `X` + hop `named()`: the base is
+        # the CLASS itself and the hop is its named constructor, so the
+        # receiver's type is the base (issue #2033). Checked before the
+        # import map, since a class in this module is not an import.
+        # Dart only: elsewhere `Foo.create()` is a static FACTORY whose
+        # recorded return type the chain must keep, and folding it to `Foo`
+        # dropped that hop (bot review).
+        if (
+            language == cs.SupportedLanguage.DART
+            and not (local_var_types and prefix in local_var_types)
+            and self._names_own_constructible(prefix, module_qn)
+        ):
+            return prefix, parts[1:]
+        # A local or parameter of that name SHADOWS the import prefix, so the
+        # base is that variable and the chain is not a prefixed construction
+        # at all. Without this a `dynamic p` parameter still resolved
+        # `p.Box(1).height` through `import ... as p`, emitting an edge where
+        # the resolver had emitted none.
+        if local_var_types and prefix in local_var_types:
+            return None
+        name = hop.split(cs.CHAR_PAREN_OPEN, 1)[0]
+        hit = self._unique_prefixed_definition(
+            self._dart_prefix_targets(prefix, module_qn), name
+        )
+        if hit is None:
+            return None
+        target, qn, kind = hit
+        # The hop must be a CONSTRUCTION, so the imported module must define
+        # that name as a CLASS. Accepting any registry entry bound a
+        # `mod.factory()` whose factory is a FUNCTION to a same-named class in
+        # an unrelated module: a confidently wrong edge where the resolver
+        # previously emitted none.
+        if kind in _CONSTRUCTIBLE_NODE_TYPES:
+            # The QUALIFIED name, not the bare one: `qn` is the exact class
+            # the prefix names, and returning `name` sent the rest of the
+            # chain back through a suffix lookup that another module's
+            # same-named class could win (Copilot, PR #2040).
+            return qn, parts[1:]
+        # A function hop types the chain by its RECORDED return type instead;
+        # with none recorded the chain stays unresolved rather than guessing.
+        # The type is a BARE name, qualified in the factory's OWN module: in
+        # the caller another import's same-named class could win (Copilot,
+        # PR #2040).
+        returned = self.type_inference.method_return_types.get(qn)
+        return (self._chain_class_qn(returned, target), parts[1:]) if returned else None
+
+    def _dart_prefix_targets(self, prefix: str, module_qn: str) -> list[str]:
+        # An explicit `as` alias wins over the file-derived key: with
+        # `import 'helper.dart'; import 'other.dart' as helper;` the name
+        # `helper` in the source is other.dart, while import_mapping still
+        # holds helper.dart under that key so both IMPORTS edges survive
+        # (Greptile, PR #2040).
+        aliases = self.import_processor.dart_import_aliases.get(module_qn, {})
+        import_map = self.import_processor.import_mapping.get(module_qn, {})
+        return aliases.get(prefix) or (
+            [import_map[prefix]] if import_map.get(prefix) else []
+        )
+
+    def _unique_prefixed_definition(
+        self, targets: list[str], name: str
+    ) -> tuple[str, str, NodeType] | None:
+        # Imports sharing a prefix are searched together, and `p.Box` names
+        # the ONE library defining `Box`; a name several of them define is
+        # an ambiguous import, so neither is guessed (CodeRabbit, PR #2040).
+        if not targets or not name:
+            return None
+        hits = [
+            (target, qn, kind)
+            for target in targets
+            if (
+                kind := self.function_registry.get(
+                    qn := self._prefixed_qn(target, name)
+                )
+            )
+            is not None
+        ]
+        return hits[0] if len(hits) == 1 else None
+
+    def _prefixed_qn(self, target: str, name: str) -> str:
+        # `p.Box.named()` reaches the fold as prefix `p` and hop `Box.named`:
+        # the parser cannot tell a named CONSTRUCTOR from a class, because
+        # both are a trailing identifier (issue #2033). The import map can: if
+        # the full dotted name is not a definition but its head is, the tail
+        # is a constructor and the receiver's type is the head.
+        member = self._drop_named_constructor(name, target)
+        return f"{target}{cs.SEPARATOR_DOT}{member}"
+
+    def _field_type_class_qn(
+        self, field_type: str, owner_qn: str, caller_module_qn: str
+    ) -> str:
+        # A field's type is written in the file declaring its class, so it
+        # names what THAT file imports: `car.rs`'s `use crate::motor::Engine`
+        # types `Car.engine` whatever the caller imports (issue #3286). The
+        # caller's module is the fallback for an owner no module is known for.
+        owner_module = module_qn_for_entity(
+            owner_qn, self.type_inference.module_qn_to_file_path
+        )
+        language = self._module_language(owner_module) if owner_module else None
+        if owner_module and language == cs.SupportedLanguage.DART:
+            # What the declaring library sees is the whole answer: a name it
+            # cannot see uniquely (a package's, or two libraries') is no
+            # same-named class found anywhere else in the project.
+            return self._dart_visible_type(field_type, owner_module) or ""
+        # A Rust struct inside an inline `mod` reads that mod's `use` before
+        # the file's, so the owner stands where a caller would.
+        return self._chain_class_qn(
+            field_type,
+            owner_module or caller_module_qn,
+            _rust_caller(language, owner_qn),
+        )
+
+    def _dart_visible_type(self, type_name: str, module_qn: str) -> str | None:
+        # A part file is a piece of its library and has no imports of its
+        # own: it writes names in the library's scope, so `shop_model.dart`
+        # sees what `shop.dart` imports.
+        library = self.import_processor.dart_part_of.get(module_qn, module_qn)
+        # The library's own declaration shadows every imported one, and a
+        # class in any of its parts is one of the library's own.
+        for unit in self._dart_library_units(library):
+            if own := self._dart_declared_type(unit, type_name):
+                return own
+        # A Dart import brings in a LIBRARY, never a name, so the import map
+        # has no key for `Cart`: the type is the one the libraries visible
+        # from `library` declare, when exactly one of them does.
+        found = {
+            qn
+            for visible in self._dart_bare_visible_libraries(library, type_name)
+            if (qn := self._dart_declared_type(visible, type_name))
+        }
+        return next(iter(found)) if len(found) == 1 else None
+
+    def _dart_library_units(self, library: str) -> list[str]:
+        """`library`'s defining file and every part its `part` directives
+        name: one Dart library, so one scope, whichever file declares a
+        name (#3286)."""
+        part_of = self.import_processor.dart_part_of
+        exposed = self.import_processor.dart_exposed_libraries.get(library, ())
+        return [library, *(unit for unit in exposed if part_of.get(unit) == library)]
+
+    def _dart_declared_type(self, library: str, type_name: str) -> str | None:
+        qn = f"{library}{cs.SEPARATOR_DOT}{type_name}"
+        return (
+            qn if self.function_registry.get(qn) in _CONSTRUCTIBLE_NODE_TYPES else None
+        )
+
+    def _chain_class_qn(
+        self, type_name: str, module_qn: str, rust_caller: str | None = None
+    ) -> str:
+        # Resolve a bare type name from a chained-call hop to its class qn, honoring
+        # imports (a Rust `use` target is a raw `::`-path, not a registry qn), so a
+        # method-return-type lookup keyed by the class qn hits. A Rust caller's own
+        # body or inline-mod `use` binds the name ahead of the file's (#2622).
+        if rust_caller and (
+            scoped := self._rust_scoped_type(type_name, module_qn, rust_caller)
+        ):
+            return scoped
+        import_map = self.import_processor.import_mapping.get(module_qn, {})
+        return (
+            self._resolve_class_qn_from_type(type_name, import_map, module_qn)
+            or type_name
+        )
+
+    def _infer_js_construction_base_type(
+        self,
+        base: str,
+        module_qn: str,
+        language: cs.SupportedLanguage | None,
+        call_point: int | None,
+    ) -> str | None:
+        # `new Box().bump()`, `(new Box()).bump()`: the base is neither a
+        # local, an import nor a factory with a recorded return, so the chain
+        # stayed untyped and the call bound nothing beside INSTANTIATES Box
+        # (issue #2465). It types the way `const b = new Box()` types `b`, so
+        # both spellings of one construction reach the same class. The
+        # receiver starts where the call does; without that site in the
+        # file's tree, a `Box` the caller binds itself cannot be ruled out.
+        if language not in cs.JS_TS_LANGUAGES or call_point is None:
+            return None
+        root = self._cached_module_root(module_qn)
+        if root is None:
+            return None
+        construction = js_ts_utils.construction_at(root, call_point, base)
+        if construction is None:
+            return None
+        var_type = (
+            self.type_inference.js_type_inference._infer_js_variable_type_from_value(
+                construction, module_qn, language
+            )
+        )
+        if not var_type:
+            return None
+        import_map = self.import_processor.import_mapping.get(module_qn, {})
+        return self._resolve_class_qn_from_type(var_type, import_map, module_qn) or None
+
+    def _infer_call_base_type(
+        self,
+        base: str,
+        module_qn: str,
+        local_var_types: dict[str, str] | None,
+        class_context: str | None,
+        caller_qn: str | None,
+        language: cs.SupportedLanguage | None = None,
+        call_point: int | None = None,
+    ) -> str | None:
+        # `parser(ia, cb).parse()`: the receiver is a bare-identifier factory call.
+        # Resolve the callee to its function/method qn and return its recorded
+        # return type. When none resolves, a C++ callee may instead be a
+        # CONSTRUCTOR TEMPORARY (`Reader<decltype(ia)>(...)`, nlohmann's
+        # from_cbor): the callee names the receiver's class itself. The callee is
+        # cut at `<` or `(`, whichever comes first, since template args can carry
+        # their own parens. A JS/TS construction (`new Box()`) has no callee to
+        # resolve: it is the instance it builds.
+        if (
+            constructed := self._infer_js_construction_base_type(
+                base, module_qn, language, call_point
+            )
+        ) is not None:
+            return constructed
+        cut = len(base)
+        for bracket in (cs.CHAR_ANGLE_OPEN, cs.CHAR_PAREN_OPEN):
+            idx = base.find(bracket)
+            if idx != -1 and idx < cut:
+                cut = idx
+        callee = base[:cut]
+        if not callee:
+            return None
+        if cs.SEPARATOR_DOUBLE_COLON in callee:
+            # A `::`-qualified non-C++ callee is the Rust assoc path's job,
+            # handled by the caller; C++ namespace paths normalize to dots.
+            if language != cs.SupportedLanguage.CPP:
+                return None
+            callee = callee.replace(cs.SEPARATOR_DOUBLE_COLON, cs.SEPARATOR_DOT)
+        resolved = self.resolve_function_call(
+            callee,
+            module_qn,
+            local_var_types,
+            class_context,
+            caller_qn,
+            language,
+            call_point,
+        )
+        if resolved is not None:
+            return_type = self._callee_return_type(resolved[1], language)
+            if return_type:
+                return self._resolve_type_to_class_qn(return_type, module_qn)
+        if language in (cs.SupportedLanguage.CPP, cs.SupportedLanguage.DART):
+            # Constructor temporary: `X(...)` resolved to a ctor (never a
+            # recorded return) or to nothing at all; if X names a registered
+            # class, that class IS the receiver type (C++ `Reader<T>(...)`,
+            # Dart `_Usage(...).generate()`).
+            return self._resolve_type_to_class_qn(callee, module_qn)
+        return None
+
+    def _resolve_type_to_class_qn(self, type_path: str, module_qn: str) -> str | None:
+        # Resolve a recorded return-type path to a registered CLASS qn. A factory
+        # return type names a class, but the plain class-name resolver can return a
+        # same-named factory METHOD (nlohmann's basic_json has both a `parser` class
+        # and a `parser()` factory), so filter to class-labeled nodes. Try the
+        # import-aware resolver first (same-file bare types, imports), then a
+        # class-only suffix match on the qualified path, then on the bare name.
+        candidate = self._chain_class_qn(type_path, module_qn)
+        if candidate and self.function_registry.get(candidate) == cs.NodeLabel.CLASS:
+            return candidate
+        matches = [
+            qn
+            for qn in self.function_registry.find_ending_with(type_path)
+            if self.function_registry.get(qn) == cs.NodeLabel.CLASS
+            and self._rust_crate_reaches(module_qn, qn)
+        ]
+        if not matches and cs.SEPARATOR_DOT in type_path:
+            simple = type_path.rsplit(cs.SEPARATOR_DOT, 1)[-1]
+            matches = [
+                qn
+                for qn in self.function_registry.find_ending_with(simple)
+                if self.function_registry.get(qn) == cs.NodeLabel.CLASS
+                and self._rust_crate_reaches(module_qn, qn)
+            ]
+        if not matches:
+            return None
+        matches.sort(key=lambda qn: (len(qn), qn))
+        return matches[0]
+
+    def _infer_rust_assoc_base_type(
+        self,
+        base: str,
+        module_qn: str,
+        call_point: int | None = None,
+        rust_caller: str | None = None,
+    ) -> str | None:
+        # `Ping::new(msg)` -> the return type recorded for `Ping::new` (Ping).
+        # The callee is the text before the first paren; only a `::`-rooted
+        # associated call (`Type::assoc`) is handled.
+        callee = base.split(cs.CHAR_PAREN_OPEN, 1)[0]
+        if cs.SEPARATOR_DOUBLE_COLON not in callee:
+            return None
+        segments = callee.split(cs.SEPARATOR_DOUBLE_COLON)
+        if len(segments) < 2:
+            return None
+        # Keep the full path prefix (`crate::parse::Parse`) so a qualified
+        # associated call resolves; only the trailing segment is the method.
+        type_name = cs.SEPARATOR_DOUBLE_COLON.join(segments[:-1])
+        method = segments[-1]
+        # A bare type name at a site inside an initializer block resolves
+        # through the block's own use, not the file's (the receiver must
+        # bind through the same scope its callee did).
+        if cs.SEPARATOR_DOUBLE_COLON not in type_name and (
+            block_hit := self._rust_block_import_at(module_qn, type_name, call_point)
+        ):
+            class_qn = (
+                self._resolve_class_qn_from_type(
+                    type_name, {type_name: block_hit[0]}, module_qn
+                )
+                or type_name
+            )
+        else:
+            class_qn = self._chain_class_qn(type_name, module_qn, rust_caller)
+        ret = self.type_inference.method_return_types.get(
+            f"{class_qn}{cs.SEPARATOR_DOT}{method}"
+        )
+        if (
+            ret is not None
+            and ret != type_name
+            and ret == class_qn.rsplit(cs.SEPARATOR_DOT, 1)[-1]
+        ):
+            # `Fetch::new()` for `pub use inner::Get as Fetch;` returns `Get`,
+            # the type the caller spelled `Fetch`. `Get` itself need not be in
+            # scope here, and a bare-name search for it lands on whichever
+            # same-named type comes first (issue #2542).
+            return class_qn
+        # The recorded return type is the bare source name; downstream
+        # hops remap it through the FILE's imports, so at a block-gated
+        # site qualify it through the block's binding here instead.
+        if (
+            ret is not None
+            and cs.SEPARATOR_DOT not in ret
+            and cs.SEPARATOR_DOUBLE_COLON not in ret
+            and (ret_hit := self._rust_block_import_at(module_qn, ret, call_point))
+        ):
+            return (
+                self._resolve_class_qn_from_type(ret, {ret: ret_hit[0]}, module_qn)
+                or ret
+            )
+        return ret
+
+    def _is_method_chain(
+        self, call_name: str, language: cs.SupportedLanguage | None = None
+    ) -> bool:
+        if cs.CHAR_PAREN_OPEN not in call_name or cs.CHAR_PAREN_CLOSE not in call_name:
+            return False
+        parts = call_name.split(cs.SEPARATOR_DOT)
+        # Rust: split between hops only. The `.` in a float argument cut
+        # `Circle::new(2.0).area` into `Circle::new(2` and `0)`, so no hop held
+        # both parens and `area` fell to a by-name guess (issue #2698).
+        if language == cs.SupportedLanguage.RUST:
+            parts = _split_receiver_chain(call_name) or parts
+        method_calls = sum(
+            cs.CHAR_PAREN_OPEN in part and cs.CHAR_PAREN_CLOSE in part for part in parts
+        )
+        return method_calls >= 1 and len(parts) >= 2
+
+    def _qualify_chained_object_type(
+        self, object_type: str, module_qn: str, rust_caller: str | None = None
+    ) -> str:
+        full_object_type = object_type
+        if cs.SEPARATOR_DOT not in object_type:
+            # Honor imports (Rust `use` targets are raw `::`-paths) so an
+            # imported chained type (`Get::new(k).into_frame()`) resolves.
+            if resolved_class := self._chain_class_qn(
+                object_type, module_qn, rust_caller
+            ):
+                full_object_type = resolved_class
+        return full_object_type
+
+    def _resolve_chained_call(
+        self,
+        call_name: str,
+        module_qn: str,
+        local_var_types: dict[str, str] | None = None,
+        class_context: str | None = None,
+        caller_qn: str | None = None,
+        language: cs.SupportedLanguage | None = None,
+        call_point: int | None = None,
+    ) -> tuple[str, str] | None:
+        match = _CHAINED_METHOD_PATTERN.search(call_name)
+        if not match:
+            return None
+
+        final_method = match[1]
+
+        object_expr = call_name[: match.start()]
+
+        object_type = (
+            self.type_inference.python_type_inference._infer_expression_return_type(
+                object_expr, module_qn, local_var_types
+            )
+            or self._infer_chained_object_type(
+                object_expr,
+                module_qn,
+                local_var_types,
+                class_context,
+                caller_qn,
+                language,
+                call_point,
+            )
+        )
+        if object_type and (class_value := _class_value_of(object_type)):
+            # The class itself, not an instance: only a static member binds.
+            return self._js_static_member_target(class_value, final_method)
+        if object_type:
+            full_object_type = self._qualify_chained_object_type(
+                object_type, module_qn, _rust_caller(language, caller_qn)
+            )
+
+            method_qn = f"{full_object_type}.{final_method}"
+
+            if method_qn in self.function_registry:
+                logger.debug(
+                    ls.CALL_CHAINED,
+                    call_name=call_name,
+                    method_qn=method_qn,
+                    obj_expr=object_expr,
+                    obj_type=object_type,
+                )
+                return self.function_registry[method_qn], method_qn
+
+            if inherited_method := self._resolve_inherited_method(
+                full_object_type, final_method
+            ):
+                logger.debug(
+                    ls.CALL_CHAINED_INHERITED,
+                    call_name=call_name,
+                    method_qn=inherited_method[1],
+                    obj_expr=object_expr,
+                    obj_type=object_type,
+                )
+                return inherited_method
+
+            if language == cs.SupportedLanguage.DART and (
+                extension := self._dart_extension_member(
+                    full_object_type, final_method, module_qn
+                )
+            ):
+                return extension
+
+        # C/C++ only, and ONLY when the receiver type was never inferred: its return
+        # type is unrecordable (`auto`/trailing/decltype, e.g. fmt's
+        # get_container(out).append). Before chained typing existed the bare method
+        # name resolved via the trie, so fall back to it here rather than dropping an
+        # edge that used to land. When the type WAS inferred but lacks the method, we
+        # must NOT rebind to an unrelated same-named method; drop instead. C shares
+        # the field_expression call shape but has no method dispatch, so it always
+        # lands here = its exact prior behaviour. Go/Rust deliberately drop.
+        if not object_type and language in (
+            cs.SupportedLanguage.CPP,
+            cs.SupportedLanguage.C,
+        ):
+            return self._resolve_function_call(
+                final_method,
+                module_qn,
+                local_var_types,
+                class_context,
+                caller_qn,
+                language,
+            )
+
+        return None
+
+    def _resolve_super_call(
+        self, call_name: str, class_context: str | None = None
+    ) -> tuple[str, str] | None:
+        match call_name:
+            case _ if call_name == cs.KEYWORD_SUPER:
+                method_name = cs.KEYWORD_CONSTRUCTOR
+            case _ if cs.SEPARATOR_DOT in call_name:
+                method_name = call_name.split(cs.SEPARATOR_DOT, 1)[1]
+            case _:
+                return None
+
+        current_class_qn = class_context
+        if not current_class_qn:
+            logger.debug(ls.CALL_SUPER_NO_CONTEXT, call_name=call_name)
+            return None
+
+        if current_class_qn not in self.class_inheritance:
+            logger.debug(ls.CALL_SUPER_NO_INHERITANCE, class_qn=current_class_qn)
+            return None
+
+        parent_classes = self.class_inheritance[current_class_qn]
+        if not parent_classes:
+            logger.debug(ls.CALL_SUPER_NO_PARENTS, class_qn=current_class_qn)
+            return None
+
+        if result := self._resolve_inherited_method(
+            current_class_qn, method_name, own_members=False
+        ):
+            callee_type, parent_method_qn = result
+            logger.debug(
+                ls.CALL_SUPER_RESOLVED,
+                call_name=call_name,
+                method_qn=parent_method_qn,
+            )
+            return callee_type, parent_method_qn
+
+        logger.debug(
+            ls.CALL_SUPER_UNRESOLVED,
+            call_name=call_name,
+            class_qn=current_class_qn,
+        )
+        return None
+
+    def _resolve_self_sibling_method(
+        self, call_name: str, class_context: str
+    ) -> tuple[str, str] | None:
+        # self.method() in a mixin may call a method defined on a SIBLING mixin
+        # (neither is the other's base); both are combined into a concrete class.
+        # Resolve through the concrete subclasses' MRO and accept the target only
+        # when it is unambiguous, so an unrelated same-named method cannot win.
+        parts = call_name.split(cs.SEPARATOR_DOT)
+        if len(parts) != 2 or parts[0] != cs.KEYWORD_SELF:
+            return None
+        method_name = parts[1]
+        candidates: set[str] = set()
+        for subclass_qn in self._concrete_subclasses(class_context):
+            candidates |= self._mro_method_qns(subclass_qn, method_name)
+        if not candidates:
+            return None
+        # An @abstractmethod stub never runs when a concrete sibling implements the
+        # method, so prefer concrete candidates; resolve only when unambiguous.
+        chosen = {
+            qn for qn in candidates if not self.function_registry.is_abstract(qn)
+        } or candidates
+        if len(chosen) != 1:
+            return None
+        method_qn = next(iter(chosen))
+        logger.debug(
+            ls.CALL_INSTANCE_ATTR_INHERITED,
+            call_name=call_name,
+            method_qn=method_qn,
+            attr_ref=cs.KEYWORD_SELF,
+            var_type=class_context,
+        )
+        return self.function_registry[method_qn], method_qn
+
+    def _member_alias(self, class_qn: str, member: str) -> tuple[str, str] | None:
+        # The alias is no node of its own, so a call through it binds to the
+        # first method it may hold; the call pass fans out to the others
+        # (member_alias_fanout).
+        for target_qn in self.function_registry.member_alias_targets(
+            f"{class_qn}{cs.SEPARATOR_DOT}{member}"
+        ):
+            if (kind := self.function_registry.get(target_qn)) is not None:
+                return kind, target_qn
+        return None
+
+    def _resolve_self_member_alias(
+        self,
+        call_name: str,
+        class_context: str,
+        local_var_types: dict[str, str] | None,
+    ) -> tuple[bool, tuple[str, str] | None]:
+        # The receiver is the enclosing class, so walk its MRO to the first
+        # class whose body binds the name. A real def there leaves the call to
+        # the usual resolution. A value (`run = None`) found first hides
+        # whatever a base binds, so the call reaches nothing of the base's,
+        # nor the same-named function a later name-based stage would find.
+        receiver, _, member = call_name.partition(cs.SEPARATOR_DOT)
+        if (
+            receiver not in (cs.PY_KEYWORD_SELF, cs.PY_KEYWORD_CLS)
+            or not member
+            or cs.SEPARATOR_DOT in member
+            # A method that rebinds the receiver (`self = Other()`) has typed
+            # it; the usual resolution follows that type.
+            or (local_var_types and receiver in local_var_types)
+        ):
+            return False, None
+        order = self._binding_aware_mro(class_context, member) or [
+            self._follow_reexports(class_qn) for class_qn in self._mro(class_context)
+        ]
+        hidden = False
+        for owner in order:
+            if alias := self._member_alias(owner, member):
+                return True, None if hidden else alias
+            if f"{owner}{cs.SEPARATOR_DOT}{member}" in self.function_registry:
+                return hidden, None
+            if self.function_registry.binds_non_method(owner, member):
+                hidden = True
+        return hidden, None
+
+    def member_alias_fanout(self, callee_qn: str, member: str) -> list[str]:
+        """Every method a call written as `.member` may run, given `callee_qn`.
+
+        A call resolved through a class-body alias lands on one method the
+        alias names; a conditional alias (`__call__ = _a if X else _b`)
+        names several and picks one at class creation, so each is a
+        candidate. A call that bound to the member's own `def` gets the
+        alias's methods instead when a later alias replaced that `def`. Any
+        other callee is returned alone.
+        """
+        owner, _, leaf = callee_qn.rpartition(cs.SEPARATOR_DOT)
+        if not owner:
+            return [callee_qn]
+        targets = [
+            qn
+            for qn in self.function_registry.member_alias_targets(
+                f"{owner}{cs.SEPARATOR_DOT}{member}"
+            )
+            if qn in self.function_registry
+        ]
+        if callee_qn in targets or (targets and leaf == member):
+            return targets
+        return [callee_qn]
+
+    def instance_call_targets(
+        self,
+        callee: str,
+        is_call_result: bool,
+        module_qn: str,
+        local_var_types: dict[str, str] | None,
+    ) -> set[tuple[str, str]]:
+        """What `callee(...)` runs when `callee` is an instance: its `__call__`.
+
+        A typed name or attribute is resolved like any operator operand; a
+        call result (`Dispatcher()(1)`) is typed by its return. Calling the
+        class itself constructs it and never gets here, because the class
+        name is no typed local.
+        """
+        if not is_call_result:
+            return self.operator_dunder_targets(
+                callee, cs.PY_DUNDER_CALL, module_qn, local_var_types
+            )
+        returned = (
+            self.type_inference.python_type_inference._infer_expression_return_type(
+                callee, module_qn, local_var_types
+            )
+        )
+        if not returned:
+            return set()
+        import_map = self.import_processor.import_mapping.get(module_qn, {})
+        class_qn = self._resolve_class_qn_from_type(returned, import_map, module_qn)
+        if not class_qn or self.function_registry.get(class_qn) != NodeType.CLASS:
+            return set()
+        hit = self._try_resolve_method(class_qn, cs.PY_DUNDER_CALL)
+        return {hit} if hit else set()
+
+    def _mro_method_qns(self, class_qn: str, method_name: str) -> set[str]:
+        results: set[str] = set()
+        visited: set[str] = set()
+        queue: deque[str] = deque([class_qn])
+        while queue:
+            current = self._follow_reexports(queue.popleft())
+            if current in visited:
+                continue
+            visited.add(current)
+            method_qn = f"{current}.{method_name}"
+            if method_qn in self.function_registry:
+                results.add(method_qn)
+            queue.extend(self.class_inheritance.get(current, ()))
+        return results
+
+    def _subclass_map(self) -> dict[str, set[str]]:
+        if self._subclass_map_cache is None:
+            mapping: dict[str, set[str]] = defaultdict(set)
+            for subclass_qn, bases in self.class_inheritance.items():
+                for base in bases:
+                    mapping[self._follow_reexports(base)].add(subclass_qn)
+            self._subclass_map_cache = mapping
+        return self._subclass_map_cache
+
+    def _concrete_subclasses(self, class_qn: str) -> set[str]:
+        subclass_map = self._subclass_map()
+        found: set[str] = set()
+        stack = list(subclass_map.get(class_qn, ()))
+        while stack:
+            current = stack.pop()
+            if current in found:
+                continue
+            found.add(current)
+            stack.extend(subclass_map.get(current, ()))
+        return found
+
+    def _binding_aware_mro(self, class_qn: str, member: str) -> list[str] | None:
+        """class_qn's C3 MRO when a class body in it binds `member` by assignment.
+
+        A value (`run = None`) or an alias (`run = _impl`) is recorded only
+        for a Python class body, and Python looks either up in C3 order:
+        `class C(A, B)` with `A(Base)` reaches Base's `run` before B's. Every
+        other lookup keeps the breadth-first walk it always had (None).
+        """
+        registry = self.function_registry
+        holders = registry.non_method_holders(member) | registry.alias_holders(member)
+        if not holders:
+            return None
+        order = self._c3_mro(class_qn)
+        return None if holders.isdisjoint(order) else order
+
+    def _c3_mro(self, class_qn: str) -> list[str]:
+        # Python's linearisation (C3). A hierarchy it rejects (a cycle, or
+        # bases in an order no class could have) cannot have been defined,
+        # so the breadth-first order stands in for it.
+        memo: dict[str, list[str] | None] = {}
+
+        def linearise(cls: str, active: frozenset[str]) -> list[str] | None:
+            if cls in memo:
+                return memo[cls]
+            if cls in active:
+                return None
+            bases = [
+                self._follow_reexports(base)
+                for base in self.class_inheritance.get(cls, [])
+            ]
+            sequences: list[list[str]] = []
+            for base in bases:
+                if (base_order := linearise(base, active | {cls})) is None:
+                    return None
+                sequences.append(list(base_order))
+            sequences.append(bases)
+            if (order := self._c3_merge(cls, sequences)) is not None:
+                memo[cls] = order
+            return order
+
+        return linearise(class_qn, frozenset()) or [
+            self._follow_reexports(qn) for qn in self._mro(class_qn)
+        ]
+
+    @staticmethod
+    def _c3_merge(class_qn: str, sequences: list[list[str]]) -> list[str] | None:
+        order = [class_qn]
+        while sequences := [seq for seq in sequences if seq]:
+            head = next(
+                (
+                    seq[0]
+                    for seq in sequences
+                    if not any(seq[0] in other[1:] for other in sequences)
+                ),
+                None,
+            )
+            if head is None:
+                return None
+            order.append(head)
+            sequences = [seq[1:] if seq[0] == head else seq for seq in sequences]
+        return order
+
+    def _resolve_inherited_method(
+        self, class_qn: str, method_name: str, own_members: bool = True
+    ) -> tuple[str, str] | None:
+        # Every caller has already looked for a def of the name on class_qn
+        # itself. A class-body alias there (`run = _plain`, issue #2620) is
+        # still the class's own member, and a value there (`run = None`) hides
+        # every base's `run`, the way attribute lookup stops at the first
+        # class that binds the name. `super()` starts above the class, so it
+        # skips both.
+        if own_members:
+            if alias := self._member_alias(class_qn, method_name):
+                return alias
+            if self.function_registry.binds_non_method(class_qn, method_name):
+                return None
+        if found := self._go_variant_method(class_qn, method_name):
+            return found
+        if class_qn not in self.class_inheritance:
+            return None
+        # Which class binds the name first decides whether a value hides
+        # it, and that order is the C3 MRO, not this walk's breadth-first
+        # order: `class C(A, B)` reaches a `run` that A inherits before B's
+        # `run = None` or `run = _impl`.
+        if (order := self._binding_aware_mro(class_qn, method_name)) is not None:
+            return self._resolve_inherited_along_mro(order, method_name)
+        return self._resolve_inherited_breadth_first(class_qn, method_name)
+
+    def _go_variant_method(
+        self, class_qn: str, method_name: str
+    ) -> tuple[str, str] | None:
+        # A Go interface each build declares again has the methods of every
+        # build's declaration, its own and embedded; the call binds to the
+        # caller's builds at emission (`go_variant_callees`).
+        for variant in self.go_declaration_variants.get(class_qn, ()):
+            if variant == class_qn:
+                continue
+            variant_qn = f"{variant}{cs.SEPARATOR_DOT}{method_name}"
+            if variant_qn in self.function_registry:
+                return self.function_registry[variant_qn], variant_qn
+            if found := self._resolve_inherited_breadth_first(variant, method_name):
+                return found
+        return None
+
+    def _resolve_inherited_along_mro(
+        self, order: list[str], method_name: str
+    ) -> tuple[str, str] | None:
+        for owner in order[1:]:
+            if alias := self._member_alias(owner, method_name):
+                return alias
+            owner_method_qn = f"{owner}{cs.SEPARATOR_DOT}{method_name}"
+            if owner_method_qn in self.function_registry:
+                return self.function_registry[owner_method_qn], owner_method_qn
+            if self.function_registry.binds_non_method(owner, method_name):
+                return None
+        return None
+
+    def _resolve_inherited_breadth_first(
+        self, class_qn: str, method_name: str
+    ) -> tuple[str, str] | None:
+        bfs_queue = deque(
+            self._with_go_variants(self.class_inheritance.get(class_qn, []))
+        )
+        visited = set(bfs_queue)
+
+        while bfs_queue:
+            # Base classes are recorded by the name the subclass imported, which
+            # may be a package re-export (class_ingest.ClassIngestMixin) rather than
+            # the real definition (class_ingest.mixin.ClassIngestMixin); follow the
+            # re-export so the inherited method qn matches the registry.
+            parent_class_qn = self._follow_reexports(bfs_queue.popleft())
+            parent_method_qn = f"{parent_class_qn}.{method_name}"
+
+            if alias := self._member_alias(parent_class_qn, method_name):
+                return alias
+            if parent_method_qn in self.function_registry:
+                return (
+                    self.function_registry[parent_method_qn],
+                    parent_method_qn,
+                )
+
+            if parent_class_qn in self.class_inheritance:
+                for grandparent_qn in self._with_go_variants(
+                    self.class_inheritance[parent_class_qn]
+                ):
+                    if grandparent_qn not in visited:
+                        visited.add(grandparent_qn)
+                        bfs_queue.append(grandparent_qn)
+
+        return None
+
+    def _calculate_import_distance(
+        self, candidate_qn: str, caller_module_qn: str
+    ) -> int:
+        caller_parts = caller_module_qn.split(cs.SEPARATOR_DOT)
+        candidate_parts = candidate_qn.split(cs.SEPARATOR_DOT)
+
+        common_prefix = 0
+        for i in range(min(len(caller_parts), len(candidate_parts))):
+            if caller_parts[i] == candidate_parts[i]:
+                common_prefix += 1
+            else:
+                break
+
+        base_distance = max(len(caller_parts), len(candidate_parts)) - common_prefix
+
+        if candidate_qn.startswith(
+            cs.SEPARATOR_DOT.join(caller_parts[:-1]) + cs.SEPARATOR_DOT
+        ):
+            base_distance -= 1
+
+        return base_distance
+
+    def _import_distance_fast(
+        self,
+        candidate_qn: str,
+        caller_parts: list[str],
+        caller_len: int,
+        caller_parent_prefix: str,
+    ) -> int:
+        if candidate_qn in _QN_SPLIT_CACHE:
+            candidate_parts, candidate_len = _QN_SPLIT_CACHE[candidate_qn]
+        else:
+            candidate_parts = candidate_qn.split(cs.SEPARATOR_DOT)
+            candidate_len = len(candidate_parts)
+            _QN_SPLIT_CACHE[candidate_qn] = (candidate_parts, candidate_len)
+        common_prefix = 0
+        for i in range(min(caller_len, candidate_len)):
+            if caller_parts[i] == candidate_parts[i]:
+                common_prefix += 1
+            else:
+                break
+        base_distance = max(caller_len, candidate_len) - common_prefix
+        if caller_parent_prefix and candidate_qn.startswith(caller_parent_prefix):
+            base_distance -= 1
+        return base_distance
+
+    def _dealias_type(self, type_name: str) -> str:
+        # Follow C++ typedef/using aliases (`typedef Mutex MutexAlias;`) to the
+        # underlying class name so an alias'd receiver resolves like the class it
+        # names. Bounded against an alias cycle; a no-op when the name is not an
+        # alias (and always, for languages with no aliases collected).
+        seen: set[str] = set()
+        while type_name in self.type_aliases and type_name not in seen:
+            seen.add(type_name)
+            type_name = self.type_aliases[type_name]
+        return type_name
+
+    def _resolve_class_name(self, class_name: str, module_qn: str) -> str | None:
+        # A Rust name the file imports from an external crate is that
+        # crate's type. The lookup below skips an unregistered import target
+        # and searches first-party types by simple name, which bound
+        # `use regex_syntax::Parser;` to whichever `Parser` the repo holds
+        # (issue #2622).
+        if self._rust_file_use_is_external(class_name, module_qn):
+            return None
+        # Call resolution runs in Pass 3, after every definition pass, so a
+        # class qn missing from the registry can never be a real node;
+        # require registration so an import-map module entry (a C++ header
+        # stem shadowing its class name) cannot mask the real class.
+        if (package_type := self._go_package_type(class_name, module_qn)) is not None:
+            return package_type
+        resolved = resolve_class_name(
+            self._dealias_type(class_name),
+            module_qn,
+            self.import_processor,
+            self.function_registry,
+            require_registered=True,
+        )
+        if resolved is None or self._rust_crate_reaches(module_qn, resolved):
+            return resolved
+        # Only the last step, the search by simple name, can land in a crate
+        # the caller cannot depend on; search again among those it can.
+        return self._rust_reachable_type(class_name, module_qn)
+
+    def _rust_reachable_type(self, name: str, module_qn: str) -> str | None:
+        matches = [
+            qn
+            for qn in self.function_registry.find_ending_with(name)
+            if self.function_registry.get(qn) in _RS_TYPE_NODE_TYPES
+            and self._rust_crate_reaches(module_qn, qn)
+        ]
+        own = [qn for qn in matches if qn.startswith(f"{module_qn}{cs.SEPARATOR_DOT}")]
+        if own:
+            return min(own, key=len)
+        return matches[0] if matches else None
+
+    def _rust_crate_reaches(self, module_qn: str, target_qn: str) -> bool:
+        # Rust to Rust only: every other language's candidates, and a module
+        # of unknown language, keep their behaviour.
+        if (
+            self._module_language(module_qn) != cs.SupportedLanguage.RUST
+            or self._module_language(target_qn) != cs.SupportedLanguage.RUST
+        ):
+            return True
+        return self.import_processor.rust_crate_reaches(module_qn, target_qn)
+
+    def resolve_java_method_call(
+        self,
+        call_node: Node,
+        module_qn: str,
+        local_var_types: dict[str, str] | None,
+        caller_qn: str | None = None,
+    ) -> tuple[str, str] | None:
+        java_engine = self.type_inference.java_type_inference
+
+        result = self._redirect_protocol_method(
+            java_engine.resolve_java_method_call(
+                call_node, local_var_types, module_qn, caller_qn
+            )
+        )
+
+        if result:
+            call_text = (
+                call_node.text.decode(cs.ENCODING_UTF8)
+                if call_node.text
+                else cs.TEXT_UNKNOWN
+            )
+            logger.debug(
+                ls.CALL_JAVA_RESOLVED, call_text=call_text, method_qn=result[1]
+            )
+
+        return result
+
+    def resolve_csharp_method_call(
+        self,
+        call_node: Node,
+        module_qn: str,
+        local_var_types: dict[str, str] | None,
+        caller_qn: str | None = None,
+    ) -> tuple[str, str] | None:
+        return self.type_inference.csharp_type_inference.resolve_csharp_method_call(
+            call_node, local_var_types, module_qn, caller_qn
+        )
+
+    def resolve_go_call_site(
+        self,
+        call_node: Node,
+        module_qn: str,
+    ) -> tuple[str, str] | None:
+        return self.type_inference.go_type_inference.resolve_go_call_site(
+            call_node, module_qn
+        )
+
+    def resolve_java_call_site(
+        self,
+        call_node: Node,
+        module_qn: str,
+    ) -> tuple[str, str] | None:
+        return self.type_inference.java_type_inference.resolve_java_call_site(
+            call_node, module_qn
+        )
+
+    def resolve_python_call_site(
+        self,
+        call_node: Node,
+        module_qn: str,
+    ) -> tuple[str, str] | None:
+        # The Jedi semantic path (issue #1183), mirroring the Go shape: an
+        # exact first-party callee through re-exports/decorators, or the
+        # external sentinel proving the call leaves the repo. Any miss falls
+        # back to the heuristics.
+        ti = self.type_inference
+        if not (ti.python_call_sites or ti.python_external_sites):
+            return None
+        name_node = self._python_callee_name_node(call_node)
+        if name_node is None:
+            return None
+        name = name_node.text.decode(cs.ENCODING_UTF8) if name_node.text else ""
+        if not name:
+            return None
+        key = call_site_key(
+            name_node,
+            name,
+            module_qn,
+            ti.module_qn_to_file_path,
+            ti.repo_path,
+        )
+        if key is None:
+            return None
+        fact = ti.python_call_sites.get(key)
+        if fact is not None:
+            return declared_location(
+                fact.target_file,
+                fact.target_line,
+                fact.target_col,
+                ti.function_locations,
+                ti.module_qn_to_file_path,
+                ti.repo_path,
+                self._py_rel_to_module,
+            )
+        if key in ti.python_external_sites:
+            return PY_EXTERNAL_TARGET
+        return None
+
+    @staticmethod
+    def _python_callee_name_node(call_node: Node) -> Node | None:
+        # The callee NAME token: a bare identifier for `f()`, the `attribute`
+        # child for `obj.m()` / `pkg.f()`; anything else (subscripts, calls of
+        # call results) has no single name token and stays heuristic.
+        func = call_node.child_by_field_name(cs.TS_FIELD_FUNCTION)
+        if func is None:
+            return None
+        if func.type == cs.TS_PY_IDENTIFIER:
+            return func
+        if func.type == cs.TS_PY_ATTRIBUTE:
+            return func.child_by_field_name(cs.TS_PY_FIELD_ATTRIBUTE)
+        return None
+
+
+def _qn_within(qn: str, module: str) -> bool:
+    # `qn` sits under `module`, which may be written with or without the
+    # project prefix.
+    return bool(module) and (
+        qn.startswith(f"{module}{cs.SEPARATOR_DOT}")
+        or f"{cs.SEPARATOR_DOT}{module}{cs.SEPARATOR_DOT}" in f"{cs.SEPARATOR_DOT}{qn}"
+    )
+
+
+def _qn_under(qn: str, target: str) -> bool:
+    # `qn` is `target` written with the project prefix.
+    return qn.endswith(f"{cs.SEPARATOR_DOT}{target}")
+
+
+def _python_import_sources(import_map: Mapping[str, str], name: str) -> list[str]:
+    # What a module's imports bind `name` to: a named or aliased import's
+    # target, else the same name in each module it star-imports.
+    if (target := import_map.get(name)) is not None:
+        return [target]
+    return [
+        f"{source}{cs.SEPARATOR_DOT}{name}"
+        for key, source in import_map.items()
+        if key.startswith(cs.IMPORTED_NAME_WILDCARD)
+    ]
+
+
+def _place_may_bind(qn: str, call_name: str, place: str) -> bool:
+    # A place binds its own definition, or a function under its module that
+    # the module may hand out at run time (`log = _make_logger()`). An
+    # external package's `get` leaves a project `get` out. A re-export keeps
+    # its function's name, so under an alias (`from lib import _wrap as
+    # shout`) a `lib.shout` only shares the local name and is a sibling the
+    # import never names.
+    owner, _, name = place.rpartition(cs.SEPARATOR_DOT)
+    return (
+        qn == place
+        or _qn_under(qn, place)
+        or (name == call_name and _qn_within(qn, owner))
+    )

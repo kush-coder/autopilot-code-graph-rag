@@ -1,0 +1,276 @@
+from __future__ import annotations
+
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+from ... import constants as cs
+from ...language_spec import has_other_language_sibling, own_extension_module_qn
+from ...utils.path_utils import (
+    base_module_qn,
+    declaration_extension,
+    has_implementation_sibling,
+    walk_eligible_files,
+)
+from ..cpp.utils import convert_operator_symbol_to_name
+from . import constants as fc
+
+if TYPE_CHECKING:
+    from clang.cindex import Cursor
+
+# Every member function a class body can declare, member templates included.
+_MEMBER_KIND_NAMES = fc.METHOD_KIND_NAMES | fc.FUNCTION_KIND_NAMES
+
+
+def _eligible_rel_files(
+    repo_path: Path,
+    exclude_paths: frozenset[str] | None = None,
+    unignore_paths: frozenset[str] | None = None,
+) -> list[str]:
+    # Delegates to the one shared walk so this path cannot drift from
+    # GraphUpdater._collect_eligible_files. The module-qn disambiguation below
+    # depends on walk ORDER (the file processed LATER in a basename collision
+    # gets its extension appended), so a divergence in ordering -- not just in
+    # which files are eligible -- silently reassigns qualified names across the
+    # graph (issues #1025, #1099).
+    return [
+        rel
+        for _dirpath, _fname, rel in walk_eligible_files(
+            repo_path, exclude_paths, unignore_paths
+        )
+    ]
+
+
+def build_module_qn_map(
+    repo_path: Path,
+    project_name: str,
+    exclude_paths: frozenset[str] | None = None,
+    unignore_paths: frozenset[str] | None = None,
+) -> dict[str, str]:
+    # Mirror DefinitionProcessor._disambiguate_module_qn: a base qn is claimed
+    # by the first file (in walk order); a later file colliding on that base qn
+    # gets its extension appended (foo.cpp -> proj.foo, foo.h -> proj.foo.h).
+    #
+    # The one tie NOT broken by walk order is a TypeScript declaration beside
+    # its implementation (#1720): the declaration yields, decided on the
+    # filesystem. This walk covers every eligible file rather than only C++
+    # ones, so a `.d.ts` is in this map and would otherwise claim `proj.foo`
+    # here while the indexer gave it to `foo.ts` -- one module under two names,
+    # which is the #1025 failure the mirror exists to prevent.
+    #
+    # Nor is a stem shared across language families: every file on it takes
+    # its extension, decided on the filesystem the same way (issue #2586).
+    claimed: dict[str, str] = {}
+    result: dict[str, str] = {}
+    for rel in _eligible_rel_files(repo_path, exclude_paths, unignore_paths):
+        base = base_module_qn(Path(rel), project_name)
+        if has_other_language_sibling(
+            repo_path / rel, repo_path, exclude_paths, unignore_paths
+        ):
+            base = own_extension_module_qn(base, Path(rel).name)
+        elif (declaration := declaration_extension(Path(rel).name)) and (
+            has_implementation_sibling(
+                repo_path / rel, repo_path, exclude_paths, unignore_paths
+            )
+        ):
+            base = f"{base}{cs.SEPARATOR_DOT}{declaration.lstrip(cs.SEPARATOR_DOT)}"
+        existing = claimed.get(base)
+        if existing is None or existing == rel:
+            final = base
+        else:
+            suffix = Path(rel).suffix.lstrip(cs.SEPARATOR_DOT)
+            final = f"{base}{cs.SEPARATOR_DOT}{suffix}"
+        claimed.setdefault(final, rel)
+        result[rel] = final
+    return result
+
+
+class CppQnResolver:
+    """Synthesizes cgr-correct qualified names for libclang cursors.
+
+    The qns must be byte-identical to what the tree-sitter C++ path produces
+    (parsers/cpp/utils.build_qualified_name + the deferred out-of-class method
+    resolver), because the whole graph keys on them.
+    """
+
+    def __init__(
+        self,
+        repo_path: Path,
+        project_name: str,
+        exclude_paths: frozenset[str] | None = None,
+        unignore_paths: frozenset[str] | None = None,
+    ) -> None:
+        self.repo_path = repo_path.resolve()
+        self.project_name = project_name
+        self._module_qn = build_module_qn_map(
+            self.repo_path, project_name, exclude_paths, unignore_paths
+        )
+        # {plain method qn: {its declaration's (line, column): qn}}. The file
+        # is left out: a class body lies in one file, and a path spelled
+        # differently in another translation unit must not miss the entry.
+        self._overloads: dict[str, dict[tuple[int, int], str]] = {}
+
+    def rel_path(self, absolute_file: str) -> str | None:
+        try:
+            return Path(absolute_file).resolve().relative_to(self.repo_path).as_posix()
+        except ValueError:
+            return None
+
+    def module_qn(self, absolute_file: str) -> str | None:
+        rel = self.rel_path(absolute_file)
+        if rel is None:
+            return None
+        return self._module_qn.get(rel)
+
+    def module_qn_for_rel(self, rel: str) -> str | None:
+        # Map lookup only, for callers that already paid rel_path's filesystem
+        # resolution and must not pay it twice.
+        return self._module_qn.get(rel)
+
+    def _namespace_chain(self, cursor: Cursor) -> list[str]:
+        parts: list[str] = []
+        parent = cursor.semantic_parent
+        while parent is not None and parent.kind.name == fc.KIND_NAMESPACE:
+            if parent.spelling:  # skip anonymous namespaces (no name segment)
+                parts.append(parent.spelling)
+            parent = parent.semantic_parent
+        parts.reverse()
+        return parts
+
+    def member_name(self, cursor: Cursor) -> str:
+        # Mirror cpp.utils.extract_operator_name / extract_destructor_name:
+        # destructors keep their `~Name` spelling, operators map their symbol
+        # through CPP_OPERATOR_SYMBOL_MAP; everything else is its plain name.
+        spelling = cursor.spelling
+        if cursor.kind.name == fc.KIND_DESTRUCTOR:
+            return spelling
+        if self._is_operator_spelling(spelling):
+            symbol = spelling[len(cs.CPP_OPERATOR_TEXT_PREFIX) :].strip()
+            return convert_operator_symbol_to_name(symbol)
+        return spelling
+
+    @staticmethod
+    def _is_operator_spelling(spelling: str) -> bool:
+        prefix = cs.CPP_OPERATOR_TEXT_PREFIX
+        if not spelling.startswith(prefix):
+            return False
+        rest = spelling[len(prefix) :]
+        # `operator+`, `operator[]`, `operator int` are operators/conversions;
+        # an identifier like `operatorState` is not (next char is alnum/_).
+        return not rest or not (rest[0].isalnum() or rest[0] == cs.CHAR_UNDERSCORE)
+
+    def class_qn(self, cursor: Cursor) -> str | None:
+        if cursor.location.file is None:
+            return None
+        module_qn = self.module_qn(cursor.location.file.name)
+        if module_qn is None:
+            return None
+        parts = [module_qn, *self._namespace_chain(cursor), cursor.spelling]
+        return cs.SEPARATOR_DOT.join(parts)
+
+    def function_qn(self, cursor: Cursor) -> str | None:
+        if cursor.location.file is None:
+            return None
+        module_qn = self.module_qn(cursor.location.file.name)
+        if module_qn is None:
+            return None
+        parts = [module_qn, *self._namespace_chain(cursor), self.member_name(cursor)]
+        return cs.SEPARATOR_DOT.join(parts)
+
+    def type_qn(self, cursor: Cursor) -> str | None:
+        # A class-scoped `using`/`typedef` is anchored to its enclosing class
+        # (e.g. proj.Box.Handle); a namespace/file-scoped one mirrors a free
+        # function's qn (module + namespace chain + name).
+        parent = cursor.semantic_parent
+        if parent is not None and parent.kind.name in fc.CLASS_KIND_NAMES:
+            class_qn = self.class_qn(parent)
+            if class_qn is None:
+                return None
+            return cs.SEPARATOR_DOT.join([class_qn, cursor.spelling])
+        if cursor.location.file is None:
+            return None
+        module_qn = self.module_qn(cursor.location.file.name)
+        if module_qn is None:
+            return None
+        parts = [module_qn, *self._namespace_chain(cursor), cursor.spelling]
+        return cs.SEPARATOR_DOT.join(parts)
+
+    def method_qn(self, cursor: Cursor) -> str | None:
+        # A method's qn is anchored to its CLASS's declaring file (the header),
+        # via semantic_parent, NOT the out-of-line definition file. This mirrors
+        # cgr's deferred out-of-class method resolver.
+        parent = cursor.semantic_parent
+        if parent is None:
+            return None
+        class_qn = self.class_qn(parent)
+        if class_qn is None:
+            return None
+        return cs.SEPARATOR_DOT.join([class_qn, self.member_name(cursor)])
+
+    def overload_qn(self, cursor: Cursor, method_qn: str) -> str:
+        """The qn of the overload `cursor` is, in the tree-sitter path's scheme.
+
+        Every overload of a member shares `method_qn`, so one node stood for
+        all of them (issue #2455). The tree-sitter path keeps the plain name
+        for the first overload its class body declares and gives each other
+        one `@<line>` of that declaration. The name is worked out from where
+        the declaration sits among its class's members, never from what the
+        walk has reached: an inline body can call an overload declared below
+        it, and libclang resolves that call before the walk gets there.
+        Only a member the class declares is named, so a call to an implicit
+        one (a defaulted constructor) keeps the plain name it always had.
+        """
+        if method_qn not in self._overloads and self._name_overloads(
+            cursor.semantic_parent
+        ):
+            # Its class declares no such member (an implicit one): plain, and
+            # remembered, so the next call to it does not scan the class again.
+            self._overloads.setdefault(method_qn, {})
+        start = cursor.canonical.extent.start
+        names = self._overloads.get(method_qn, {})
+        return names.get((start.line, start.column), method_qn)
+
+    def _name_overloads(self, owner: Cursor | None) -> bool:
+        """Name every member `owner` declares; False when it declares none.
+
+        A member of an instantiated template has an owner with no children
+        (`Box<int>`); its template's own members are named when the walk
+        reaches the template, which a use of it always follows, so nothing
+        is recorded for it here.
+        """
+        if owner is None:
+            return False
+        positions: dict[str, set[tuple[int, int]]] = {}
+        for member in owner.get_children():
+            if member.kind.name not in _MEMBER_KIND_NAMES:
+                continue
+            if (member_qn := self.method_qn(member)) is None:
+                continue
+            start = member.canonical.extent.start
+            positions.setdefault(member_qn, set()).add((start.line, start.column))
+        for member_qn, declared in positions.items():
+            self._overloads.setdefault(
+                member_qn, _overload_names(member_qn, sorted(declared))
+            )
+        return bool(positions)
+
+
+def _overload_names(
+    method_qn: str, declared: list[tuple[int, int]]
+) -> dict[tuple[int, int], str]:
+    """Names for one member's overloads, in declaration order.
+
+    The tree-sitter registry's rule: the first keeps the plain name, the
+    rest take `@<line>`, and `_<column>` (0-based, as tree-sitter counts)
+    when an earlier overload already holds that line.
+    """
+    names: dict[tuple[int, int], str] = {}
+    for index, (line, column) in enumerate(declared):
+        qualified_name = method_qn
+        if index:
+            qualified_name = f"{method_qn}{cs.DUP_QN_MARKER}{line}"
+            if qualified_name in names.values():
+                qualified_name = (
+                    f"{qualified_name}{cs.DUP_QN_COLUMN_MARKER}{column - 1}"
+                )
+        names[(line, column)] = qualified_name
+    return names

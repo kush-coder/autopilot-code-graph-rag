@@ -1,0 +1,399 @@
+# Java tree-sitter node types, modifiers, and JVM layout constants.
+
+from .ast_nodes import (
+    TS_CLASS_DECLARATION,
+    TS_ENUM_DECLARATION,
+    TS_INTERFACE_DECLARATION,
+)
+from .core import ENTITY_FUNCTION, ENTITY_METHOD
+
+# Tree-sitter Java node types for language_spec
+TS_JAVA_METHOD_INVOCATION = "method_invocation"
+TS_JAVA_ANNOTATION_TYPE_DECLARATION = "annotation_type_declaration"
+TS_JAVA_INTERFACE_BODY = "interface_body"
+
+# Java interface `extends A, B` clause (tree-sitter-java); holds a type_list.
+TS_JAVA_EXTENDS_INTERFACES = "extends_interfaces"
+
+TS_JAVA_CAST_EXPRESSION = "cast_expression"
+
+# `Type::m`, `expr::m`, `this::m`, `super::m`, `Type::new` (issue #2546). The
+# grammar gives the node no fields: the receiver is its first child and the
+# referenced name its last, the `new` keyword token for a constructor reference.
+TS_JAVA_METHOD_REFERENCE = "method_reference"
+TS_JAVA_NEW_KEYWORD = "new"
+
+# Java tree-sitter node types
+TS_FORMAL_PARAMETER = "formal_parameter"
+TS_SPREAD_PARAMETER = "spread_parameter"
+# A method's parameter list; a lambda's may be `inferred_parameters` instead.
+TS_JAVA_FORMAL_PARAMETERS = "formal_parameters"
+TS_LOCAL_VARIABLE_DECLARATION = "local_variable_declaration"
+TS_FIELD_DECLARATION = "field_declaration"
+# An interface field. The grammar names it after what it implicitly is
+# (`public static final`), so the keywords are usually absent from source.
+TS_JAVA_CONSTANT_DECLARATION = "constant_declaration"
+TS_ASSIGNMENT_EXPRESSION = "assignment_expression"
+
+TS_OBJECT_CREATION_EXPRESSION = "object_creation_expression"
+TS_METHOD_INVOCATION = "method_invocation"
+TS_FIELD_ACCESS = "field_access"
+# tree-sitter-java names integer literals by BASE, never plain
+# `integer_literal`; a call site matching that name matches nothing.
+TS_DECIMAL_INTEGER_LITERAL = "decimal_integer_literal"
+TS_HEX_INTEGER_LITERAL = "hex_integer_literal"
+TS_OCTAL_INTEGER_LITERAL = "octal_integer_literal"
+TS_BINARY_INTEGER_LITERAL = "binary_integer_literal"
+TS_JAVA_INTEGER_LITERALS = frozenset(
+    {
+        TS_DECIMAL_INTEGER_LITERAL,
+        TS_HEX_INTEGER_LITERAL,
+        TS_OCTAL_INTEGER_LITERAL,
+        TS_BINARY_INTEGER_LITERAL,
+    }
+)
+TS_JAVA_CHARACTER_LITERAL = "character_literal"
+TS_DECIMAL_FLOATING_POINT_LITERAL = "decimal_floating_point_literal"
+TS_HEX_FLOATING_POINT_LITERAL = "hex_floating_point_literal"
+TS_JAVA_FLOATING_POINT_LITERALS = frozenset(
+    {TS_DECIMAL_FLOATING_POINT_LITERAL, TS_HEX_FLOATING_POINT_LITERAL}
+)
+TS_ARRAY_CREATION_EXPRESSION = "array_creation_expression"
+TS_METHOD_DECLARATION = "method_declaration"
+TS_ENHANCED_FOR_STATEMENT = "enhanced_for_statement"
+# Switch family: colon groups may fall through, arrow rules are exclusive;
+# a default arm is a switch_label with no named children.
+TS_JAVA_SWITCH_EXPRESSION = "switch_expression"
+TS_JAVA_SWITCH_RULE = "switch_rule"
+TS_JAVA_SWITCH_BLOCK_STATEMENT_GROUP = "switch_block_statement_group"
+TS_JAVA_SWITCH_LABEL = "switch_label"
+TS_TRY_WITH_RESOURCES_STATEMENT = "try_with_resources_statement"
+# One declaration inside a try-with-resources header; binds via `name`/`value`
+# fields exactly like a variable_declarator.
+TS_JAVA_RESOURCE = "resource"
+TS_RECORD_DECLARATION = "record_declaration"
+TS_TRUE = "true"
+TS_FALSE = "false"
+
+# Java I/O direct-sink walk node types (issue #714). string_literal wraps a
+# `string_fragment` (shared with JS); `block` is the method-body lexical scope;
+# `lambda_expression` is a nested scope pruned from the enclosing walk. field_access
+# / array_access describe member/subscript access (inert for Java, which has no
+# IO_MEMBER_READS entry -- Java env access is a call, System.getenv, not a member).
+TS_JAVA_STRING_LITERAL = "string_literal"
+TS_JAVA_BLOCK = "block"
+TS_JAVA_LAMBDA_EXPRESSION = "lambda_expression"
+TS_JAVA_ARRAY_ACCESS = "array_access"
+JAVA_FIELD_FIELD = "field"
+JAVA_FIELD_INDEX = "index"
+
+# Tree-sitter field names for child_by_field_name
+TS_FIELD_NAME = "name"
+TS_FIELD_TYPE = "type"
+TS_SCOPED_TYPE_IDENTIFIER = "scoped_type_identifier"
+TS_FIELD_SUPERCLASS = "superclass"
+TS_FIELD_INTERFACES = "interfaces"
+TS_FIELD_TYPE_PARAMETERS = "type_parameters"
+TS_FIELD_PARAMETERS = "parameters"
+TS_FIELD_DECLARATOR = "declarator"
+TS_FIELD_OBJECT = "object"
+TS_FIELD_ARGUMENTS = "arguments"
+TS_FIELD_FUNCTION = "function"
+TS_FIELD_BODY = "body"
+TS_FIELD_LEFT = "left"
+TS_FIELD_RIGHT = "right"
+
+QUERY_CAPTURE_CLASS = "class"
+QUERY_CAPTURE_FUNCTION = "function"
+QUERY_KEY_CLASSES = "classes"
+QUERY_KEY_FUNCTIONS = "functions"
+
+# Java type inference keywords
+JAVA_KEYWORD_THIS = "this"
+JAVA_KEYWORD_SUPER = "super"
+
+# Java heuristic patterns
+JAVA_GETTER_PATTERN = "get"
+JAVA_NAME_PATTERN = "name"
+JAVA_ID_PATTERN = "id"
+JAVA_SIZE_PATTERN = "size"
+JAVA_LENGTH_PATTERN = "length"
+JAVA_CREATE_PATTERN = "create"
+JAVA_NEW_PATTERN = "new"
+JAVA_IS_PATTERN = "is"
+JAVA_HAS_PATTERN = "has"
+JAVA_USER_PATTERN = "user"
+JAVA_ORDER_PATTERN = "order"
+
+# Java entity type names
+ENTITY_CONSTRUCTOR = "Constructor"
+
+# Java callable entity types for method resolution
+# FUNCTION is included so an unqualified call inside a method-body anonymous class
+# can reach the anon's OWN methods (registered as Function nodes under the enclosing
+# scope, e.g. gson's `delegate()` called by the same anon's `read()`); the module
+# scan is a last-resort fallback after precise class/anon-base/enclosing lookups.
+JAVA_CALLABLE_ENTITY_TYPES = frozenset(
+    {ENTITY_METHOD, ENTITY_CONSTRUCTOR, ENTITY_FUNCTION}
+)
+
+# Java primitive type names
+JAVA_TYPE_STRING = "String"
+JAVA_TYPE_INT = "int"
+JAVA_TYPE_DOUBLE = "double"
+JAVA_TYPE_BOOLEAN = "boolean"
+JAVA_TYPE_LONG = "java.lang.Long"
+JAVA_TYPE_LONG_PRIMITIVE = "long"
+JAVA_TYPE_FLOAT = "float"
+JAVA_TYPE_CHAR = "char"
+# A literal's type is fixed by its suffix: `1L` is a long, `1.5f` a float.
+JAVA_LONG_SUFFIXES = ("l", "L")
+JAVA_FLOAT_SUFFIXES = ("f", "F")
+JAVA_TYPE_STRING_FQN = "java.lang.String"
+JAVA_TYPE_OBJECT = "Object"
+
+# Java heuristic return type names
+JAVA_HEURISTIC_USER = "User"
+JAVA_HEURISTIC_ORDER = "Order"
+
+# Java tree-sitter node types for java_utils
+TS_PACKAGE_DECLARATION = "package_declaration"
+TS_ANNOTATION_TYPE_DECLARATION = "annotation_type_declaration"
+TS_CONSTRUCTOR_DECLARATION = "constructor_declaration"
+TS_ANNOTATION = "annotation"
+TS_MARKER_ANNOTATION = "marker_annotation"
+TS_GENERIC_TYPE = "generic_type"
+TS_TYPE_PARAMETER = "type_parameter"
+TS_MODIFIERS = "modifiers"
+TS_LINE_COMMENT = "line_comment"
+TS_BLOCK_COMMENT = "block_comment"
+TS_VOID_TYPE = "void_type"
+TS_PROGRAM = "program"
+TS_THIS = "this"
+TS_SUPER = "super"
+
+# Java modifier node types
+JAVA_MODIFIER_PUBLIC = "public"
+JAVA_MODIFIER_PRIVATE = "private"
+JAVA_MODIFIER_PROTECTED = "protected"
+JAVA_MODIFIER_STATIC = "static"
+JAVA_MODIFIER_FINAL = "final"
+JAVA_MODIFIER_ABSTRACT = "abstract"
+JAVA_MODIFIER_SYNCHRONIZED = "synchronized"
+JAVA_MODIFIER_TRANSIENT = "transient"
+JAVA_MODIFIER_VOLATILE = "volatile"
+
+JAVA_CLASS_MODIFIERS = frozenset(
+    {
+        JAVA_MODIFIER_PUBLIC,
+        JAVA_MODIFIER_PRIVATE,
+        JAVA_MODIFIER_PROTECTED,
+        JAVA_MODIFIER_STATIC,
+        JAVA_MODIFIER_FINAL,
+        JAVA_MODIFIER_ABSTRACT,
+    }
+)
+
+JAVA_METHOD_MODIFIERS = frozenset(
+    {
+        JAVA_MODIFIER_PUBLIC,
+        JAVA_MODIFIER_PRIVATE,
+        JAVA_MODIFIER_PROTECTED,
+        JAVA_MODIFIER_STATIC,
+        JAVA_MODIFIER_FINAL,
+        JAVA_MODIFIER_ABSTRACT,
+        JAVA_MODIFIER_SYNCHRONIZED,
+    }
+)
+
+JAVA_FIELD_MODIFIERS = frozenset(
+    {
+        JAVA_MODIFIER_PUBLIC,
+        JAVA_MODIFIER_PRIVATE,
+        JAVA_MODIFIER_PROTECTED,
+        JAVA_MODIFIER_STATIC,
+        JAVA_MODIFIER_FINAL,
+        JAVA_MODIFIER_TRANSIENT,
+        JAVA_MODIFIER_VOLATILE,
+    }
+)
+
+# Java visibility values
+JAVA_VISIBILITY_PUBLIC = "public"
+JAVA_VISIBILITY_PROTECTED = "protected"
+JAVA_VISIBILITY_PRIVATE = "private"
+JAVA_VISIBILITY_PACKAGE = "package"
+
+# Java class type suffixes and names
+JAVA_DECLARATION_SUFFIX = "_declaration"
+JAVA_TYPE_METHOD = "method"
+JAVA_TYPE_CONSTRUCTOR = "constructor"
+
+# Java class node types for matching
+JAVA_CLASS_NODE_TYPES = frozenset(
+    {
+        TS_CLASS_DECLARATION,
+        TS_INTERFACE_DECLARATION,
+        TS_ENUM_DECLARATION,
+        TS_ANNOTATION_TYPE_DECLARATION,
+        TS_RECORD_DECLARATION,
+    }
+)
+
+# Java method node types
+JAVA_METHOD_NODE_TYPES = frozenset(
+    {
+        TS_METHOD_DECLARATION,
+        TS_CONSTRUCTOR_DECLARATION,
+    }
+)
+
+# Java main method constants
+JAVA_MAIN_METHOD_NAME = "main"
+JAVA_MAIN_PARAM_ARRAY = "String[]"
+JAVA_MAIN_PARAM_VARARGS = "String..."
+JAVA_MAIN_PARAM_TYPE = "String"
+# The JVM launcher starts a `void main` taking nothing or one String array
+# (issue #2527). The array is read from the syntax: brackets on the type
+# (`String[] a`, `String [] a`) or on the name (`String a[]`), or varargs.
+JAVA_MAIN_PARAM_ELEMENT_TYPES = frozenset({JAVA_MAIN_PARAM_TYPE, "java.lang.String"})
+TS_JAVA_ARRAY_TYPE = "array_type"
+TS_JAVA_FIELD_DIMENSIONS = "dimensions"
+TS_JAVA_FIELD_ELEMENT = "element"
+TS_JAVA_DIMENSION_OPEN = "["
+# A body-less `main` (abstract, or an interface's) has nothing to launch; a
+# native one is implemented outside Java.
+TS_JAVA_NATIVE = "native"
+
+# Java path parsing constants
+JAVA_PATH_JAVA = "java"
+JAVA_PATH_KOTLIN = "kotlin"
+JAVA_PATH_SCALA = "scala"
+JAVA_PATH_SRC = "src"
+JAVA_PATH_MAIN = "main"
+JAVA_PATH_TEST = "test"
+
+JAVA_JVM_LANGUAGES = frozenset(
+    {
+        JAVA_PATH_JAVA,
+        JAVA_PATH_KOTLIN,
+        JAVA_PATH_SCALA,
+    }
+)
+
+JAVA_SRC_FOLDERS = frozenset(
+    {
+        JAVA_PATH_MAIN,
+        JAVA_PATH_TEST,
+    }
+)
+
+JAVA_MAVEN_SOURCE_ROOTS = (
+    (JAVA_PATH_SRC, JAVA_PATH_MAIN, JAVA_PATH_JAVA),
+    (JAVA_PATH_SRC, JAVA_PATH_TEST, JAVA_PATH_JAVA),
+)
+
+
+# Conversions the language performs invisibly at a call site, in the order it
+# prefers them (JLS 5.3): a widening primitive conversion first, then boxing,
+# then a widening REFERENCE conversion on the boxed type. `take(42)` is a legal
+# call to take(long), take(Integer), take(Number) and take(Object) alike, so an
+# exact simple-name comparison would reject every applicable overload and send
+# the call back to arity-only matching (issue #1344).
+JAVA_WIDENING_PRIMITIVES: dict[str, tuple[str, ...]] = {
+    "byte": ("short", "int", "long", "float", "double"),
+    "short": ("int", "long", "float", "double"),
+    "char": ("int", "long", "float", "double"),
+    "int": ("long", "float", "double"),
+    "long": ("float", "double"),
+    "float": ("double",),
+}
+JAVA_BOXED_TYPES: dict[str, str] = {
+    "byte": "Byte",
+    "short": "Short",
+    "char": "Character",
+    "int": "Integer",
+    "long": "Long",
+    "float": "Float",
+    "double": "Double",
+    "boolean": "Boolean",
+}
+# Reference supertypes of each boxed (or already reference) type, excluding
+# Object, which ranks last on its own because it is the least specific.
+JAVA_REFERENCE_SUPERTYPES: dict[str, tuple[str, ...]] = {
+    "Byte": ("Number", "Comparable", "Serializable"),
+    "Short": ("Number", "Comparable", "Serializable"),
+    "Character": ("Comparable", "Serializable"),
+    "Integer": ("Number", "Comparable", "Serializable"),
+    "Long": ("Number", "Comparable", "Serializable"),
+    "Float": ("Number", "Comparable", "Serializable"),
+    "Double": ("Number", "Comparable", "Serializable"),
+    "Boolean": ("Comparable", "Serializable"),
+    "String": ("CharSequence", "Comparable", "Serializable"),
+}
+JAVA_TYPE_OBJECT_NAME = "Object"
+# What every array type widens to besides Object (JLS 4.10.3).
+JAVA_ARRAY_SUPERTYPES = frozenset({"Cloneable", "Serializable"})
+# How a variable-arity parameter's type reads in a method signature (`m(T...)`).
+JAVA_VARARGS_SUFFIX = "..."
+# Lower is more specific; the resolver prefers the smallest total across args.
+JAVA_RANK_EXACT = 0
+JAVA_RANK_WIDENED = 1
+JAVA_RANK_BOXED = 2
+JAVA_RANK_SUPERTYPE = 3
+JAVA_RANK_OBJECT = 4
+# A conversion that can be neither proven nor ruled out: the argument's type
+# hierarchy is not fully visible, or the parameter is a type variable. It is
+# counted apart from the ranks above, and a candidate that has one stays in
+# contention with a proven pick it could outrank (issue #2548).
+JAVA_RANK_UNPROVEN = 5
+
+# Direct supertypes of common JDK reference types, by simple name, so an
+# argument such as `new LinkedHashMap<>()` reaches a `Map` parameter through
+# HashMap and AbstractMap. Each lists only what its other entries do not
+# imply, because the walk measures specificity by distance. Unlike the table
+# above it is not exhaustive: a parameter type no chain reaches stays unproven
+# rather than ruled out (issue #2548).
+JAVA_LIBRARY_SUPERTYPES: dict[str, tuple[str, ...]] = {
+    "Collection": ("Iterable",),
+    "List": ("Collection",),
+    "Set": ("Collection",),
+    "SortedSet": ("Set",),
+    "NavigableSet": ("SortedSet",),
+    "Queue": ("Collection",),
+    "Deque": ("Queue",),
+    "AbstractCollection": ("Collection",),
+    "AbstractList": ("AbstractCollection", "List"),
+    "AbstractSequentialList": ("AbstractList",),
+    "AbstractSet": ("AbstractCollection", "Set"),
+    "ArrayList": ("AbstractList", "RandomAccess", "Cloneable", "Serializable"),
+    "LinkedList": ("AbstractSequentialList", "Deque", "Cloneable", "Serializable"),
+    "ArrayDeque": ("AbstractCollection", "Deque", "Cloneable", "Serializable"),
+    "HashSet": ("AbstractSet", "Cloneable", "Serializable"),
+    "LinkedHashSet": ("HashSet",),
+    "TreeSet": ("AbstractSet", "NavigableSet", "Cloneable", "Serializable"),
+    "SortedMap": ("Map",),
+    "NavigableMap": ("SortedMap",),
+    "AbstractMap": ("Map",),
+    "HashMap": ("AbstractMap", "Cloneable", "Serializable"),
+    "LinkedHashMap": ("HashMap",),
+    "TreeMap": ("AbstractMap", "NavigableMap", "Cloneable", "Serializable"),
+    "ConcurrentMap": ("Map",),
+    "ConcurrentHashMap": ("AbstractMap", "ConcurrentMap", "Serializable"),
+    "StringBuilder": ("CharSequence", "Appendable", "Serializable"),
+    "StringBuffer": ("CharSequence", "Appendable", "Serializable"),
+    "Class": ("Type", "Serializable"),
+    "GenericArrayType": ("Type",),
+    "ParameterizedType": ("Type",),
+    "TypeVariable": ("Type",),
+    "WildcardType": ("Type",),
+}
+
+# `void m(C this, int b)`: the explicit receiver, which no caller supplies.
+TS_RECEIVER_PARAMETER = "receiver_parameter"
+
+# An enum body holds its constants first, then an `enum_body_declarations`
+# with the constructors and methods (issue #1807).
+TS_JAVA_ENUM_BODY = "enum_body"
+TS_JAVA_ENUM_CONSTANT = "enum_constant"
+TS_JAVA_ENUM_BODY_DECLARATIONS = "enum_body_declarations"

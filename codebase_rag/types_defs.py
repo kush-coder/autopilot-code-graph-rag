@@ -1,0 +1,2022 @@
+from __future__ import annotations
+
+from collections import defaultdict
+from collections.abc import (
+    Awaitable,
+    Callable,
+    ItemsView,
+    Iterable,
+    KeysView,
+    Mapping,
+    Sequence,
+)
+from dataclasses import dataclass
+from enum import StrEnum
+from pathlib import Path
+from types import MappingProxyType
+from typing import (
+    TYPE_CHECKING,
+    NamedTuple,
+    NotRequired,
+    Protocol,
+    TypedDict,
+    runtime_checkable,
+)
+
+from .constants import (
+    DUPLICATES_MAX_CANDIDATE_PAIRS,
+    DUPLICATES_MAX_SIMILAR_GROUPS,
+    AuditCheck,
+    NodeLabel,
+    RelationshipType,
+    SupportedLanguage,
+)
+
+if TYPE_CHECKING:
+    from rich.console import JustifyMethod, OverflowMethod
+    from rich.style import Style
+    from tree_sitter import Language, Node, Parser, Query
+
+    from .models import LanguageSpec
+
+type LanguageLoader = Callable[[], Language] | None
+
+PropertyValue = str | int | float | bool | list[str] | None
+PropertyDict = dict[str, PropertyValue]
+# Query parameters are only read, so callers may pass any mapping; a plain
+# dict parameter would reject a narrower dict such as dict[str, str].
+PropertyParams = Mapping[str, PropertyValue]
+
+# Any value a parsed JSON document can hold (a package.json manifest, a
+# tsconfig, an OpenAPI spec): recursive, so nested mappings stay typed.
+type JsonValue = (
+    str | int | float | bool | None | list[JsonValue] | dict[str, JsonValue]
+)
+
+type ResultScalar = str | int | float | bool | None
+type ResultValue = (
+    ResultScalar | list[ResultScalar] | dict[str, ResultScalar | list[ResultScalar]]
+)
+type ResultRow = dict[str, ResultValue]
+
+
+class FunctionMatch(TypedDict):
+    node: Node
+    simple_name: str
+    qualified_name: str
+    parent_class: str | None
+    line_number: int
+
+
+class MgclientProbeRequest(TypedDict):
+    """One Memgraph probe, as the parent hands it to the probe's own process."""
+
+    host: str
+    port: int
+    credentials: list[str] | None
+    # Run after connecting, or None to connect and close.
+    query: str | None
+    # The C runtime whose stdio buffers mgclient's stderr, by library name.
+    c_runtime: str
+
+
+class MgclientProbeReport(TypedDict):
+    succeeded: bool
+    # The message of the mgclient error connect raised, which is all that
+    # tells a refused login from a refused connection; None otherwise.
+    connect_error: str | None
+
+
+class StructuralSearchMatch(TypedDict):
+    file: str
+    line: int
+    column: int
+    end_line: int
+    end_column: int
+    text: str
+
+
+class StructuralReplaceChange(TypedDict):
+    file: str
+    matches: int
+    diff: str
+    applied: bool
+
+
+class NodeBatchRow(TypedDict):
+    id: PropertyValue
+    props: PropertyDict
+
+
+class RelBatchRow(TypedDict):
+    from_val: PropertyValue
+    to_val: PropertyValue
+    props: PropertyDict
+    # Set by the flush, which counts written rows by it (issue #2879).
+    row_index: NotRequired[int]
+
+
+BatchParams = NodeBatchRow | RelBatchRow | PropertyDict
+
+
+class BatchWrapper(TypedDict):
+    batch: Sequence[BatchParams]
+
+
+# A Cypher parameter as the embedded engine is handed one: anything JSON can
+# hold, plus the ingestor's batch rows, named because a TypedDict is not a
+# Mapping[str, ...] subtype.
+type CypherParamValue = (
+    str
+    | int
+    | float
+    | bool
+    | None
+    | Sequence[CypherParamValue]
+    | Mapping[str, CypherParamValue]
+    | NodeBatchRow
+    | RelBatchRow
+)
+type CypherParams = Mapping[str, CypherParamValue]
+
+
+type SimpleName = str
+type QualifiedName = str
+type SimpleNameLookup = defaultdict[SimpleName, set[QualifiedName]]
+
+NodeIdentifier = tuple[NodeLabel | str, str, str | None]
+
+
+type ASTNode = Node
+
+
+class ScopeRules(TypedDict):
+    """The node types and fields the Python scope walks read, under the
+    names `scope_rules_from` in rust/cgr_graph_rs/src/trees/python.rs reads."""
+
+    identifier: str
+    nested_scopes: list[str]
+    left_binders: list[str]
+    name_binders: list[str]
+    imports: list[str]
+    patterns: list[str]
+    declarations: list[str]
+    comprehensions: list[str]
+    nonlocal_statement: str
+    with_statement: str
+    except_clause: str
+    case_pattern: str
+    as_pattern: str
+    aliased_import: str
+    dotted_name: str
+    wildcard: str
+    function_definition: str
+    class_definition: str
+    lambda_expression: str
+    for_in_clause: str
+    attribute: str
+    keyword_argument: str
+    separator: str
+    left_field: str
+    name_field: str
+    value_field: str
+    alias_field: str
+    module_field: str
+    parameters_field: str
+    body_field: str
+    attribute_field: str
+
+
+class InterfaceLanguageRules(TypedDict):
+    """One language's `_Rules` in parsers/interface_fingerprint.py, and
+    which of its language branches the language takes."""
+
+    flavor: str
+    functions: list[str]
+    blocks: list[str]
+    definitions: list[str]
+    blockers: list[str]
+    kept_names: list[str]
+    calls: list[str]
+    returns: list[str]
+
+
+class CallableScanRules(TypedDict):
+    """`_CallableScanConfig` in parsers/utils.py."""
+
+    call: str
+    identifier: str
+    closures: list[str]
+    opaque: list[str]
+
+
+class InterfaceRules(TypedDict):
+    """The constants parsers/interface_fingerprint.py and the callable-
+    parameter scan it asks read, under the names `interface_rules_from` in
+    rust/cgr_graph_rs/src/trees/python.rs reads."""
+
+    languages: dict[str, InterfaceLanguageRules]
+    version: str
+    open: bytes
+    close: bytes
+    leaf: bytes
+    missing: bytes
+    elided_body: bytes
+    returned: bytes
+    call: bytes
+    argument: bytes
+    local: bytes
+    length_bytes: int
+    byte_order: str
+    comment: str
+    dunder: str
+    body_field: str
+    name_field: str
+    left_field: str
+    arguments_field: str
+    value_field: str
+    key_field: str
+    function_field: str
+    property_field: str
+    object_field: str
+    parameters_field: str
+    parameter_field: str
+    pattern_field: str
+    alias_field: str
+    callee_fields: list[str]
+    identifier: str
+    keyword_argument: str
+    name_arguments: list[str]
+    cast_wrappers: list[str]
+    call_expression: str
+    member_expression: str
+    prototype_methods: list[str]
+    js_binder_fields: dict[str, list[str]]
+    js_bound_names: list[str]
+    js_return: str
+    js_pair: str
+    js_computed_property_name: str
+    js_require: str
+    js_typed_parameters: list[str]
+    py_identifier: str
+    py_call: str
+    py_attribute: str
+    py_return: str
+    py_read_returns: list[str]
+    receivers: list[str]
+    py_target_holders: list[str]
+    py_target_wrappers: list[str]
+    py_member_targets: list[str]
+    py_caller_scope: str
+    py_named_parameters: list[str]
+    py_typed_parameter: str
+    py_scope_boundaries: list[str]
+    py_decorated_definition: str
+    py_decorated_definitions: list[str]
+    py_shadow_binders: list[str]
+    py_as_pattern_target: str
+    py_imports: list[str]
+    py_global: str
+    py_case_pattern: str
+    py_dotted_name: str
+    py_aliased_import: str
+    python_scan: CallableScanRules
+    js_scan: CallableScanRules
+
+
+class AliasRules(TypedDict):
+    """The constants `python_local_aliases` in parsers/py/variable_analyzer.py
+    reads, under the names `alias_rules_from` in
+    rust/cgr_graph_rs/src/trees/python.rs reads."""
+
+    boundaries: list[str]
+    assignment: str
+    identifier: str
+    attribute: str
+    call: str
+    binary_operator: str
+    boolean_operator: str
+    conditional_expression: str
+    parenthesized_expression: str
+    left_field: str
+    right_field: str
+    operator_field: str
+    and_operator: str
+    dunders: dict[str, str]
+    max_depth: int
+
+
+class TreeRules(TypedDict):
+    """The classification constants the Rust tree bridge applies, under the
+    names `rules_from` in rust/cgr_graph_rs/src/trees/python.rs reads."""
+
+    anchor_version: str
+    comment: str
+    punct: list[str]
+    id_token: str
+    lit_token: str
+    id_substring: str
+    id_extras: list[str]
+    lit_substrings: list[str]
+    lit_extras: list[str]
+    block_substrings: list[str]
+    block_extras: list[str]
+    min_branch_nodes: int
+    wrapped_def_substring: str
+    expression_body_types: list[str]
+    self_body_types: list[str]
+    hash_open: bytes
+    hash_close: bytes
+    digest_size: int
+    body_field: str
+    dart_signature_types: list[str]
+    dart_signature_wrappers: list[str]
+    dart_function_body: str
+    scopes: ScopeRules
+    interface: InterfaceRules
+    aliases: AliasRules
+
+
+class ScopeFacts(NamedTuple):
+    """What one Python scope's own body binds, read once per scope by the
+    scope walks in parsers/py/ast_analyzer.py (issue #3473)."""
+
+    # Its parameters, in order.
+    params: tuple[str, ...]
+    # Every name its statements bind, whatever binds it.
+    bound: frozenset[str]
+    # The names bound where no import-map entry can make them a re-import.
+    plain: frozenset[str]
+    # Each other binding's name with the import paths that, when the import
+    # map holds one of them for the name, make it a re-import.
+    conditional: tuple[tuple[str, tuple[str, ...]], ...]
+    # Names a `global` or `nonlocal` statement declares.
+    declared: frozenset[str]
+    # Names a `nonlocal` statement declares.
+    nonlocals: frozenset[str]
+
+
+# `TreeBridge.scope_facts` as Rust returns it: parameters, plain names,
+# (name, import paths) pairs, declared names and nonlocal names, each sorted
+# but the parameters.
+type NativeScopeFacts = tuple[
+    list[str], list[str], list[tuple[str, list[str]]], list[str], list[str]
+]
+
+
+# `TreeBridge.local_aliases` as Rust returns one alias: the local, its
+# candidate leaves, its dunder and its reflected leaves, each leaf as its
+# descendant index under the scope (`TreeCursor.goto_descendant`).
+type NativeAlias = tuple[str, list[int], str | None, list[int]]
+
+
+# One node as the tree bridge's probe compares it: symbol, type, named flag,
+# byte range, start and end points, child count and field name.
+type DescribedNode = tuple[
+    int, str, bool, int, int, tuple[int, int], tuple[int, int], int, str | None
+]
+
+
+class NodeType(StrEnum):
+    FUNCTION = "Function"
+    METHOD = "Method"
+    CLASS = "Class"
+    MODULE = "Module"
+    INTERFACE = "Interface"
+    PACKAGE = "Package"
+    ENUM = "Enum"
+    TYPE = "Type"
+    UNION = "Union"
+
+
+type TrieNode = dict[str, TrieNode | QualifiedName | NodeType]
+type FunctionRegistry = dict[QualifiedName, NodeType]
+
+
+class OverloadSignature(NamedTuple):
+    # What tells one C++ member overload from another: the parameter types
+    # plus the cv/ref qualifiers (`(const std::string&) const`), and the
+    # parameter count for pairing a definition spelled differently from its
+    # declaration.
+    text: str
+    arity: int
+
+
+class FunctionRegistryTrieProtocol(Protocol):
+    def __contains__(self, qualified_name: QualifiedName) -> bool: ...
+    def __getitem__(self, qualified_name: QualifiedName) -> NodeType: ...
+
+    def __setitem__(
+        self, qualified_name: QualifiedName, func_type: NodeType
+    ) -> None: ...
+
+    def get(
+        self, qualified_name: QualifiedName, default: NodeType | None = None
+    ) -> NodeType | None: ...
+    def keys(self) -> KeysView[QualifiedName]: ...
+    def items(self) -> ItemsView[QualifiedName, NodeType]: ...
+    def find_with_prefix(self, prefix: str) -> list[tuple[QualifiedName, NodeType]]: ...
+
+    def find_with_prefix_and_suffix(
+        self, prefix: str, suffix: str
+    ) -> list[QualifiedName]: ...
+
+    def find_ending_with(self, suffix: str) -> list[QualifiedName]: ...
+
+    def register_unique_qn(
+        self,
+        natural_qn: QualifiedName,
+        start_line: int,
+        start_col: int = 0,
+        kind: NodeType | None = None,
+        origin: str | None = None,
+    ) -> QualifiedName: ...
+
+    def claim_other_space(self, natural_qn: QualifiedName, kind: NodeType) -> bool: ...
+
+    def type_kind(self, qualified_name: QualifiedName) -> NodeType | None: ...
+
+    def variants(self, qualified_name: QualifiedName) -> list[QualifiedName]: ...
+
+    def register_overload_qn(
+        self,
+        natural_qn: QualifiedName,
+        signature: OverloadSignature,
+        start_line: int,
+        start_col: int = 0,
+        declared_in_class: bool = False,
+    ) -> QualifiedName: ...
+
+    def overload_signature(
+        self, qualified_name: QualifiedName
+    ) -> OverloadSignature | None: ...
+
+    def restore_overload(
+        self,
+        qualified_name: QualifiedName,
+        signature_text: str,
+        declared_in_class: bool,
+    ) -> None: ...
+
+    def add_member_alias(
+        self, alias_qn: QualifiedName, target_qn: QualifiedName
+    ) -> None: ...
+
+    def member_alias_targets(
+        self, alias_qn: QualifiedName
+    ) -> tuple[QualifiedName, ...]: ...
+
+    def set_non_method_members(
+        self, class_qn: QualifiedName, names: Iterable[str]
+    ) -> None: ...
+
+    def binds_non_method(self, class_qn: QualifiedName, member: str) -> bool: ...
+
+    def non_method_holders(self, member: str) -> frozenset[QualifiedName]: ...
+
+    def alias_holders(self, member: str) -> frozenset[QualifiedName]: ...
+
+    def mark_property(self, qualified_name: QualifiedName) -> None: ...
+
+    def is_property(self, qualified_name: QualifiedName) -> bool: ...
+
+    def property_names(self) -> set[str]: ...
+
+    def mark_object_member(self, qualified_name: QualifiedName) -> None: ...
+
+    def is_object_member(self, qualified_name: QualifiedName) -> bool: ...
+
+    def mark_abstract(self, qualified_name: QualifiedName) -> None: ...
+
+    def is_abstract(self, qualified_name: QualifiedName) -> bool: ...
+
+    def mark_module_private(self, qualified_name: QualifiedName) -> None: ...
+
+    def is_module_private(self, qualified_name: QualifiedName) -> bool: ...
+
+    def mark_rust_visibility(
+        self, qualified_name: QualifiedName, path: str
+    ) -> None: ...
+
+    def rust_visibility(self, qualified_name: QualifiedName) -> str | None: ...
+
+    def mark_body_scoped_name(self, qualified_name: QualifiedName) -> None: ...
+
+    def is_body_scoped_name(self, qualified_name: QualifiedName) -> bool: ...
+
+    def mark_callable_params(
+        self, qualified_name: QualifiedName, params: dict[str, int]
+    ) -> None: ...
+
+    def callable_params(
+        self, qualified_name: QualifiedName
+    ) -> dict[str, int] | None: ...
+
+    def reserve_qns(
+        self, reservations: dict[QualifiedName, tuple[int, int]]
+    ) -> None: ...
+
+
+class ASTCacheProtocol(Protocol):
+    def __setitem__(self, key: Path, value: tuple[Node, SupportedLanguage]) -> None: ...
+
+    def __getitem__(self, key: Path) -> tuple[Node, SupportedLanguage]: ...
+    def __delitem__(self, key: Path) -> None: ...
+    def __contains__(self, key: Path) -> bool: ...
+    def items(self) -> ItemsView[Path, tuple[Node, SupportedLanguage]]: ...
+    def load(self, key: Path) -> tuple[Node, SupportedLanguage] | None: ...
+
+
+class ColumnDescriptor(Protocol):
+    @property
+    def name(self) -> str: ...
+
+
+class LoadableProtocol(Protocol):
+    def _ensure_loaded(self) -> None: ...
+
+
+@runtime_checkable
+class CursorProtocol(Protocol):
+    def execute(
+        self,
+        query: str,
+        params: dict[str, PropertyValue]
+        | Sequence[BatchParams]
+        | BatchWrapper
+        | None = None,
+    ) -> None: ...
+    def close(self) -> None: ...
+    @property
+    def description(self) -> Sequence[ColumnDescriptor] | None: ...
+    # What a query returns, which is wider than what a write binds.
+    def fetchall(self) -> list[tuple[ResultValue, ...]]: ...
+
+
+@runtime_checkable
+class ConnectionProtocol(Protocol):
+    """The connection surface the graph ingestor relies on.
+
+    Deliberately DB-API-shaped: `MemgraphIngestor` was written against
+    `mgclient` connections, and `services.neo4j_driver` adapts the Neo4j
+    driver to the same shape so one ingestor serves both engines.
+    """
+
+    def cursor(self) -> CursorProtocol: ...
+    def close(self) -> None: ...
+
+
+class PathValidatorProtocol(Protocol):
+    @property
+    def project_root(self) -> Path: ...
+
+
+# What `validate_project_path` builds when it refuses a path: any result type
+# constructible from these two keywords, such as the file tools' models.
+class PathResultFactory[T](Protocol):
+    def __call__(self, *, file_path: str, error_message: str) -> T: ...
+
+
+class TreeSitterNodeProtocol(Protocol):
+    @property
+    def type(self) -> str: ...
+    # Read-only views, so a tree-sitter Node (list[Node], bytes | None) fits.
+    @property
+    def children(self) -> Sequence[TreeSitterNodeProtocol]: ...
+    @property
+    def text(self) -> bytes | None: ...
+
+
+class ConsolePrintOptions(TypedDict, total=False):
+    # Rich's `Console.print` keywords, less `soft_wrap`, which the
+    # terminal-aware console decides itself.
+    sep: str
+    end: str
+    style: str | Style | None
+    justify: JustifyMethod | None
+    overflow: OverflowMethod | None
+    no_wrap: bool | None
+    emoji: bool | None
+    markup: bool | None
+    highlight: bool | None
+    width: int | None
+    height: int | None
+    crop: bool
+    new_line_start: bool
+
+
+class ModelConfigKwargs(TypedDict, total=False):
+    api_key: str | None
+    endpoint: str | None
+    project_id: str | None
+    region: str | None
+    provider_type: str | None
+    thinking_budget: int | None
+    service_account_file: str | None
+
+
+class GraphMetadata(TypedDict):
+    total_nodes: int
+    total_relationships: int
+    exported_at: str
+    # Only on a scoped export (`cgr export -n`, issue #2410).
+    projects: NotRequired[list[str]]
+
+
+class NodeData(TypedDict):
+    node_id: int
+    labels: list[str]
+    properties: dict[str, PropertyValue]
+
+
+class RelationshipData(TypedDict):
+    from_id: int
+    to_id: int
+    type: str
+    properties: dict[str, PropertyValue]
+
+
+class GraphData(TypedDict):
+    nodes: list[NodeData] | list[ResultRow]
+    relationships: list[RelationshipData] | list[ResultRow]
+    metadata: GraphMetadata
+
+
+class GraphSummary(TypedDict):
+    total_nodes: int
+    total_relationships: int
+    node_labels: dict[str, int]
+    relationship_types: dict[str, int]
+    metadata: GraphMetadata
+
+
+class QueryJsonOutput(TypedDict):
+    query: str
+    response: str
+
+
+class EmbeddingQueryResult(TypedDict):
+    node_id: int
+    qualified_name: str
+    label: NodeLabel
+    start_line: int | None
+    end_line: int | None
+    path: str | None
+
+
+class EmbeddingSymbol(NamedTuple):
+    """The function or method an embedding belongs to, by what a re-parse keeps.
+
+    The label is part of it because the graph's identity constraints are per
+    label: a Function and a Method may share a qualified name and still be
+    two nodes, each with an embedding of its own.
+    """
+
+    label: NodeLabel
+    qualified_name: str
+
+
+# One embedding to store: the node it answers for, its vector, its symbol.
+type EmbeddingPoint = tuple[int, list[float], EmbeddingSymbol]
+
+
+class SemanticSearchResult(TypedDict):
+    node_id: int
+    qualified_name: str
+    name: str
+    type: str
+    score: float
+
+
+class JavaClassInfo(TypedDict):
+    name: str | None
+    type: str
+    superclass: str | None
+    interfaces: list[str]
+    modifiers: list[str]
+    type_parameters: list[str]
+
+
+class JavaOverloadRank(NamedTuple):
+    """How well one Java overload fits a call's argument types; smaller is
+    better. `unproven` counts the arguments whose conversion could be neither
+    proven nor ruled out, so it decides first; then the summed conversion
+    ranks (JLS 5.3); then the summed distances up the argument types'
+    hierarchies, which make the nearest supertype the most specific."""
+
+    unproven: int
+    conversions: int
+    distance: int
+
+
+class JavaSupertypes(NamedTuple):
+    """What one Java argument type widens to. `depths` maps each supertype
+    found, by simple name, to its distance up the hierarchy; `unreachable`
+    holds the candidates' parameter types it provably cannot reach, because
+    the whole hierarchy is visible or a JDK type cannot extend a project one.
+    Any other parameter type stays possible. `refs` keeps each supertype as
+    the walk resolved it, at its distance, `project` the ones that are
+    project types, and `complete` whether the walk saw every supertype: a
+    parameter sharing a simple name with one counts it only when it names
+    that very type."""
+
+    depths: Mapping[str, int]
+    unreachable: frozenset[str]
+    # The argument's type as the caller's file resolves it, and as written,
+    # when a candidate parameter shares its simple name and that name may
+    # denote another type.
+    qualified: str | None = None
+    written: str | None = None
+    refs: Mapping[str, int] = MappingProxyType({})
+    project: frozenset[str] = frozenset()
+    complete: bool = False
+
+
+class JavaCandidateLookups(NamedTuple):
+    """What ranking reads from a Java overload's declaration, only when a
+    parameter calls for it: the type variables it may name, and the types its
+    parameters name as its own file resolves them (None where unsure)."""
+
+    type_variables: Callable[[str], frozenset[str]]
+    parameter_types: Callable[[str], tuple[str | None, ...]]
+
+
+class JavaMethodInfo(TypedDict):
+    name: str | None
+    type: str
+    return_type: str | None
+    parameters: list[str]
+    modifiers: list[str]
+    type_parameters: list[str]
+    annotations: list[str]
+
+
+class JavaFieldInfo(TypedDict):
+    name: str | None
+    type: str | None
+    modifiers: list[str]
+    annotations: list[str]
+
+
+class JavaAnnotationInfo(TypedDict):
+    name: str | None
+    arguments: list[str]
+
+
+class JavaMethodCallInfo(TypedDict):
+    name: str | None
+    object: str | None
+    arguments: int
+
+
+class JavaMethodReferenceParts(NamedTuple):
+    # `method_name` is None for a constructor reference (`Type::new`).
+    receiver: ASTNode
+    method_name: str | None
+
+
+class CSharpCallShape(NamedTuple):
+    """How a C# method may be called: the arguments every call must pass
+    (parameters with neither a default nor `params`), whether a `params`
+    tail takes extra arguments, and whether it is static."""
+
+    required: int
+    variadic: bool
+    is_static: bool
+
+
+class JavaStaticImport(NamedTuple):
+    """One Java `import static` declaration: the class whose static members
+    it brings into scope, and the member it names (`import static C.m;`), or
+    None for the on-demand form (`import static C.*;`)."""
+
+    class_path: str
+    member: str | None
+
+
+class CancelledResult(NamedTuple):
+    cancelled: bool
+
+
+class CgrignorePatterns(NamedTuple):
+    exclude: frozenset[str]
+    unignore: frozenset[str]
+
+
+class AgentLoopUI(NamedTuple):
+    status_message: str
+    cancelled_log: str
+    approval_prompt: str
+    denial_default: str
+    panel_title: str
+
+
+OPTIMIZATION_LOOP_UI = AgentLoopUI(
+    status_message="[bold green]Agent is analysing codebase... (Press Ctrl+C to cancel)[/bold green]",
+    cancelled_log="ASSISTANT: [Analysis was cancelled]",
+    approval_prompt="Do you approve this optimisation?",
+    denial_default="User rejected this optimisation without feedback",
+    panel_title="[bold green]Optimisation Agent[/bold green]",
+)
+
+CHAT_LOOP_UI = AgentLoopUI(
+    status_message="[bold green]Thinking... (Press Ctrl+C to cancel)[/bold green]",
+    cancelled_log="ASSISTANT: [Thinking was cancelled]",
+    approval_prompt="Do you approve this change?",
+    denial_default="User rejected this change without feedback",
+    panel_title="[bold green]Assistant[/bold green]",
+)
+
+
+class LanguageImport(NamedTuple):
+    lang_key: SupportedLanguage
+    module_path: str
+    attr_name: str
+    submodule_name: SupportedLanguage
+
+
+class ToolNames(NamedTuple):
+    query_graph: str
+    read_file: str
+    semantic_search: str
+    create_file: str
+    edit_file: str
+    shell_command: str
+    # Whether semantic_search is actually registered. The MCP path omits it when
+    # the vector backend is unavailable, and the prompt must not tell the model
+    # to start with a tool that is absent from its schema (issue #1201).
+    has_semantic_search: bool = True
+
+
+class ConfirmationToolNames(NamedTuple):
+    replace_code: str
+    create_file: str
+    shell_command: str
+    structural_replace: str
+
+
+class ReplaceCodeArgs(TypedDict, total=False):
+    file_path: str
+    target_code: str
+    replacement_code: str
+
+
+class CreateFileArgs(TypedDict, total=False):
+    file_path: str
+    content: str
+
+
+class ShellCommandArgs(TypedDict, total=False):
+    command: str
+
+
+class ReadFileArgs(TypedDict, total=False):
+    file_path: str
+
+
+class StructuralReplaceArgs(TypedDict, total=False):
+    pattern: str
+    rewrite: str
+    language: str
+    dry_run: bool
+
+
+@dataclass
+class RawToolArgs:
+    file_path: str = ""
+    target_code: str = ""
+    replacement_code: str = ""
+    content: str = ""
+    command: str = ""
+    pattern: str = ""
+    rewrite: str = ""
+    language: str = ""
+    dry_run: bool = True
+
+
+ToolArgs = (
+    ReplaceCodeArgs
+    | CreateFileArgs
+    | ShellCommandArgs
+    | ReadFileArgs
+    | StructuralReplaceArgs
+)
+
+
+class LanguageQueries(TypedDict):
+    functions: Query | None
+    classes: Query | None
+    calls: Query | None
+    imports: Query | None
+    locals: Query | None
+    highlights: Query | None
+    config: LanguageSpec
+    language: Language
+    parser: Parser
+
+
+# float admits find_duplicate_code's 0-1 similarity threshold (issue #1342).
+# bool is listed for documentation only, being already a subtype of int, and
+# structural_replace's dry_run default has relied on that since it was added.
+MCPToolArguments = dict[str, str | int | float | bool | dict[str, str] | None]
+
+
+class MCPInputSchemaProperty(TypedDict, total=False):
+    type: str
+    description: str
+    default: str | int | float | bool
+    # JSON Schema's lower bound for a number, enforced by the MCP layer.
+    minimum: int
+    items: dict[str, str]
+    # JSON Schema's key for the value type of an object used as a map.
+    additionalProperties: dict[str, str]
+
+
+MCPInputSchemaProperties = dict[str, MCPInputSchemaProperty]
+
+
+class MCPInputSchema(TypedDict):
+    type: str
+    properties: MCPInputSchemaProperties
+    required: list[str]
+
+
+class MCPToolSchema(NamedTuple):
+    name: str
+    description: str
+    inputSchema: MCPInputSchema
+
+
+class QueryResultDict(TypedDict, total=False):
+    query_used: str
+    results: list[ResultRow]
+    summary: str
+    error: str
+
+
+class CodeSnippetResultDict(TypedDict, total=False):
+    qualified_name: str
+    source_code: str
+    file_path: str
+    line_start: int
+    line_end: int
+    docstring: str | None
+    found: bool
+    error_message: str | None
+    error: str
+
+
+class DeadCodeRow(TypedDict):
+    label: str
+    name: str
+    qualified_name: str
+    # Repo-relative, as a duplicates member's: a qualified name cannot be
+    # turned back into a file in general (issue #2561).
+    path: str
+    start_line: int
+    end_line: int
+
+
+class DeadCodeConfig(NamedTuple):
+    include_tests: bool
+    include_classes: bool
+    root_decorators: frozenset[str]
+    entry_points: tuple[str, ...]
+    exclude_patterns: tuple[str, ...] = ()
+    # Drop CALLS/REFERENCES edges below this confidence before the walk
+    # (issue #1526); None keeps every edge.
+    min_resolution: str | None = None
+    # A route handler is a root by its decorator alone (the default, right
+    # for a single-project graph where nothing can call it). Off, a handler
+    # exposing an endpoint is live only if an indexed call site reaches that
+    # endpoint, so an endpoint nobody calls is reported (issue #1603).
+    endpoint_roots: bool = True
+    # Every public or exported symbol is a root (the default, right for a
+    # library, whose API is called from outside the repository). Off, a
+    # symbol roots only as an entry point, test, decorated handler or runtime
+    # hook, so an application's unused public code is reported (issue #2527).
+    public_roots: bool = True
+
+
+class ProjectSync(NamedTuple):
+    """One project in `cgr status`, as the connected graph records it (#2444)."""
+
+    name: str
+    # None for a project synced before the time was kept in the graph, or
+    # one whose first sync never finished.
+    last_synced_at: str | None
+    interrupted: bool
+    # The checkout the project was indexed from (#2479); None for a project
+    # that records none, or one known only from its incomplete-run marker.
+    root_path: str | None = None
+
+
+class AstFingerprintResult(NamedTuple):
+    """Structural fingerprints of one function body's skeleton."""
+
+    fingerprint: str
+    node_count: int
+    branch_fingerprints: list[str]
+
+
+class DuplicatesConfig(NamedTuple):
+    threshold: float
+    min_nodes: int
+    exact_only: bool
+    exclude_patterns: tuple[str, ...] = ()
+    max_similar_groups: int = DUPLICATES_MAX_SIMILAR_GROUPS
+    max_candidate_pairs: int = DUPLICATES_MAX_CANDIDATE_PAIRS
+
+
+class DuplicateMember(TypedDict):
+    label: str
+    qualified_name: str
+    name: str
+    path: str
+    start_line: int
+    end_line: int
+
+
+class DuplicateLink(TypedDict):
+    # Qualified names of two members whose own pair clears the threshold.
+    first: str
+    second: str
+    similarity: float
+
+
+class DuplicateGroup(TypedDict):
+    kind: str
+    # Groups are disjoint clusters (issue #2473), so two members of a
+    # `similar` group may be linked only through a third: similarity is its
+    # weakest qualifying link and max_similarity its strongest (1.0 for an
+    # `exact` group, and for a cluster holding exact copies).
+    similarity: float
+    max_similarity: float
+    node_count: int
+    members: list[DuplicateMember]
+    # Qualified names of the members that are exact copies of each other,
+    # one list per shared fingerprint. Always empty for an `exact` group,
+    # which is one such list as a whole.
+    exact_subgroups: list[list[str]]
+    # The qualifying pairs between different fingerprints, strongest first:
+    # with the exact copies, the only member pairs that are duplicates. Empty
+    # for an `exact` group, where every pair is one. Collected groups hold one
+    # link per fingerprint pair, named by its best member pair, since two
+    # clone classes would otherwise cost their cross product; the JSON report
+    # expands each over both sides' exact copies (duplicates.expanded_links).
+    links: list[DuplicateLink]
+
+
+class DuplicatesReport(NamedTuple):
+    groups: list[DuplicateGroup]
+    skipped_symbols: int
+    # True when similar-group enumeration stopped at the configured cap:
+    # qualifying groups may be missing and every consumer must say so.
+    truncated: bool
+    # Fingerprint-bearing symbols the scan actually examined. Zero with a
+    # positive skipped count means the graph predates fingerprint stamping
+    # (indexed before the feature): "no duplicates" would be vacuous and the
+    # CLI recommends a re-index instead.
+    analyzed_symbols: int = 0
+
+
+class GraphQueryClient(Protocol):
+    def fetch_all(
+        self, query: str, params: PropertyParams | None = None
+    ) -> list[ResultRow]: ...
+
+
+class ReingestToolResult(TypedDict, total=False):
+    """MCP ``reingest`` payload: what was re-parsed and how long it took."""
+
+    reparsed: list[str]
+    affected: list[str]
+    removed: list[str]
+    skipped: list[str]
+    elapsed_ms: float
+    error: str
+
+
+class ListProjectsSuccessResult(TypedDict):
+    projects: list[str]
+    count: int
+
+
+class ListProjectsErrorResult(TypedDict):
+    projects: list[str]
+    count: int
+    error: str
+
+
+ListProjectsResult = ListProjectsSuccessResult | ListProjectsErrorResult
+
+
+class DeleteProjectSuccessResult(TypedDict):
+    success: bool
+    project: str
+    message: str
+
+
+class DeleteProjectErrorResult(TypedDict):
+    success: bool
+    error: str
+
+
+DeleteProjectResult = DeleteProjectSuccessResult | DeleteProjectErrorResult
+
+
+# The server hands a result straight to json.dumps or str(), so any value is a
+# valid handler result; a narrower union only disagreed with the handlers.
+MCPHandlerType = Callable[..., Awaitable[object]]
+
+
+class NodeSchema(NamedTuple):
+    label: NodeLabel
+    properties: str
+
+
+class GraphNodeRecord(NamedTuple):
+    label: str
+    properties: PropertyDict
+
+
+type RelEndpointSpec = tuple[str, str, PropertyValue]
+
+
+class GraphRelRecord(NamedTuple):
+    from_spec: RelEndpointSpec
+    rel_type: str
+    to_spec: RelEndpointSpec
+
+
+class AuditViolation(NamedTuple):
+    check: AuditCheck
+    detail: str
+
+
+class DeferredParentLink(NamedTuple):
+    """Containment edge whose non-module parent must exist before emission.
+
+    Parents can be registered by a later pass than the child (methods land in
+    the class pass after the function pass; forward declarations register
+    last), so verification waits until every pass finishes. A parent qn that
+    never registers is a phantom the database would drop, so the child
+    anchors to its registered lexical fallback when one is known (a nested
+    prototype assignment belongs to its enclosing function), else its module.
+    """
+
+    parent_label_guess: str
+    parent_qn: str
+    child_label: str
+    child_qn: str
+    module_qn: str
+    rel_type: str = RelationshipType.DEFINES.value
+    fallback_label: str | None = None
+    fallback_qn: str | None = None
+    # Span key of the parent's NODE when the guess qn cannot carry the
+    # registered identity (a C# overload registers signature-suffixed, so
+    # the parameterless sibling shadows the guess); the resolver prefers
+    # this span's recorded location over the qn match.
+    parent_span: tuple[str, int, int] | None = None
+
+
+# (module_qn, 1-based start line, 0-based start column) of a function
+# node; the span identifies the function even on shared lines.
+type FunctionSpanKey = tuple[str, int, int]
+
+
+class FunctionLocation(NamedTuple):
+    """Where the definition pass put a C++ function/method node.
+
+    Keyed by (module_qn, start_line, start_col) so Pass-3 call attribution
+    reuses the exact label and qn Pass 2 registered instead of re-deriving
+    them from the AST; the two walks diverge on preprocessor-distorted class
+    bodies and every divergence is a phantom caller the database drops
+    (issue #652). The column in the key keeps same-line functions (a one-line
+    curried arrow, minified `exports.a = ...; exports.b = ...`) from evicting
+    or masking each other's records.
+    """
+
+    label: str
+    qualified_name: str
+    container_qn: str | None
+    # False when the qn was GENERATED (anonymous_row_col, iife_*): Pass-3
+    # lets an unnamed JS/TS function expression adopt a NAMED record (the
+    # node registered for `exports.f = function`), while a generated record
+    # keeps the historical bubble-to-module attribution.
+    is_named: bool = True
+
+
+class CppParameterType(NamedTuple):
+    """A C++ parameter's bare type name and its pointer/array depth."""
+
+    type_name: str | None
+    indirection: int
+
+
+class CppOperatorSignature(NamedTuple):
+    """What overload viability reads from a free C++ operator's declaration."""
+
+    module_qn: str
+    parameters: tuple[CppParameterType, ...]
+    template_params: frozenset[str]
+
+
+# The source `dict.update` reads as a mapping: anything with keys() and
+# indexing, which is wider than Mapping.
+class KeysAndGetItem[KT, VT](Protocol):
+    def keys(self) -> Iterable[KT]: ...
+
+    def __getitem__(self, key: KT, /) -> VT: ...
+
+
+class FunctionLocations(dict[FunctionSpanKey, FunctionLocation]):
+    """`function_locations` that knows which module each span came from.
+
+    A reused GraphUpdater re-parses a module into a map still holding the
+    previous run's spans, and the key is (module_qn, start_line, start_col):
+    a function renamed in place keeps its key, so the stale record survives
+    and the first-claim guard blocks the live registration (issue #1019).
+
+    Nine call sites across the definition and class passes write into this
+    map, so the module index is maintained by the map itself rather than at
+    each of them, where the next new write site would silently miss it.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._by_module: dict[str, set[FunctionSpanKey]] = {}
+
+    def __setitem__(self, key: FunctionSpanKey, value: FunctionLocation) -> None:
+        super().__setitem__(key, value)
+        self._by_module.setdefault(key[0], set()).add(key)
+
+    def update(
+        self,
+        other: KeysAndGetItem[FunctionSpanKey, FunctionLocation]
+        | Iterable[tuple[FunctionSpanKey, FunctionLocation]] = (),
+        /,
+    ) -> None:
+        # dict.update bypasses __setitem__ on a subclass, which would leave
+        # the index blind to whatever it wrote. dict() takes every source form
+        # dict.update does, and fails on a malformed one before any write.
+        pairs: dict[FunctionSpanKey, FunctionLocation] = dict(other)
+        for key, value in pairs.items():
+            self[key] = value
+
+    def setdefault(  # type: ignore[override]
+        self, key: FunctionSpanKey, default: FunctionLocation
+    ) -> FunctionLocation:
+        # dict.setdefault bypasses __setitem__ just like dict.update does, so a
+        # record written through it would be invisible to the module index and
+        # survive drop_module -- the stale-record bug this map exists to stop.
+        if key not in self:
+            self[key] = default
+        return self[key]
+
+    def drop_module(self, module_qn: str) -> None:
+        """Forget every span record a module contributed, before it re-parses."""
+        for key in self._by_module.pop(module_qn, ()):
+            super().pop(key, None)
+
+
+class CppDefinitionSpan(NamedTuple):
+    """Full line span of a C/C++ function or method the tree-sitter pass ingested.
+
+    Recorded per relative file path so the hybrid C++ frontend can attribute a
+    macro use (a TU-level preprocessing entity with only a location) to the
+    tightest enclosing TREE-SITTER definition after Pass 2; libclang's own
+    spans carry wrong-scheme qns wherever macros hide namespaces.
+    """
+
+    start_line: int
+    end_line: int
+    label: str
+    qualified_name: str
+
+
+class PendingMacroCall(NamedTuple):
+    """A macro use the hybrid C++ frontend saw but cannot attribute yet.
+
+    The caller is resolvable only after the tree-sitter pass has recorded its
+    definition spans; a use outside every span attributes to the fallback
+    Module, mirroring the module-caller rule for ordinary calls.
+    """
+
+    rel_path: str
+    line: int
+    callee_qn: str
+    fallback_module_qn: str
+
+
+class PendingExpansionCall(NamedTuple):
+    """A call that exists only after macro expansion, seen by the hybrid frontend.
+
+    The call's text lives inside a macro definition body, so tree-sitter never
+    sees it at the expansion site. Both ends carry only locations: the caller
+    joins to the tightest tree-sitter definition span containing the expansion
+    site (falling back to the Module), the callee to the span containing the
+    referenced definition (dropped when none exists) -- so the emitted CALLS
+    edge is tree-sitter-scheme on both ends.
+    """
+
+    caller_rel_path: str
+    caller_line: int
+    callee_rel_path: str
+    callee_line: int
+    fallback_module_qn: str
+
+
+class DeferredCppInherit(NamedTuple):
+    """C++ INHERITS edge held back until every class is registered.
+
+    A base written in another header cannot resolve at parse time, so the
+    edge is emitted after Pass 2 with the base resolved namespace-scoped
+    across files; an unresolvable base emits no edge rather than a phantom
+    the database would drop.
+    """
+
+    child_label: str
+    child_qn: str
+    base_name: str
+    guess_qn: str
+    namespace_path: str
+    base_index: int
+
+
+class DeferredInherit(NamedTuple):
+    """Non-C++ INHERITS/IMPLEMENTS edge held back until every class is registered.
+
+    A parent that does not resolve at parse time is anchored to the child's
+    own module qn as a guess; the edge is emitted after Pass 2 with the guess
+    re-resolved against the full registry. An unresolvable parent emits no
+    edge rather than a phantom the database would drop.
+
+    `alt_parent_qn` is a second spelling to try when the first names no
+    registered node: a written path can be exact about where to look and
+    still point at a module that only RE-EXPORTS the parent, where the
+    name-anchored guess is what finds the declaring one.
+
+    `written_ref` is a C# base as written, with its type-argument count in
+    CLR style (`NotificationHandler`1`): the parse-time qn cannot say which
+    name was written, and C# binds that name by scope (namespace, enclosing
+    namespaces, usings), issue #2534; `PB` and `PB<T>` are two types, so the
+    written arity picks between them (issue #2579).
+    """
+
+    rel_type: RelationshipType
+    child_qn: str
+    parent_qn: str
+    module_qn: str
+    base_index: int
+    language: SupportedLanguage
+    alt_parent_qn: str | None = None
+    written_ref: str | None = None
+    # The label the child was declared with. The registry keeps one kind per
+    # name, so a TS interface sharing its name with a value (issue #2520)
+    # cannot be told from that value by its qualified name alone.
+    child_label: str | None = None
+
+
+class RustTraitImpl(NamedTuple):
+    """A Rust `impl Trait for Type` block and the methods it ingested.
+
+    Whether the trait belongs to another crate decides whether those methods
+    are dead-code roots (nothing first-party can call them), and that is only
+    knowable once every first-party trait is registered, so the block is held
+    back for resolve_deferred_inherits to judge (issue #1048).
+    """
+
+    entry: DeferredInherit
+    spelling: str
+    method_qns: list[str]
+
+
+class PendingTypeFact(NamedTuple):
+    """A definition whose annotations still need resolving into edges (#1527)."""
+
+    label: str
+    qualified_name: str
+    module_qn: str
+    return_type: str | None
+    param_types: list[str] | None
+    # The owning file's relative path. Scoped re-ingestion discards the facts
+    # of the files it re-parses by THIS, not by module_qn: `foo.py` and
+    # `foo/__init__.py` share `proj.foo`, and keying on the qn dropped the
+    # unchanged file's facts with the re-parsed one's, leaving its detached
+    # RETURNS/ACCEPTS unbuilt (issue #1892). None only when the definition
+    # was ingested without a file, in which case the module qn is the key.
+    path: str | None = None
+    # The types the definition's RETURNS, and its ACCEPTS, already reach, set
+    # only on a fact requeued from an unchanged file. Its file's imports are
+    # not loaded on such a run, so re-resolving a name its import bound fell
+    # back to the nearest same-named type and added a wrong edge beside the
+    # right one (issue #3007); only a name none of these reach needs
+    # resolving. Kept apart, so a parameter's edge never stands in for a
+    # return edge that is missing (CodeRabbit, PR #3218).
+    resolved_returns: frozenset[str] = frozenset()
+    resolved_accepts: frozenset[str] = frozenset()
+
+
+class DeferredImportEdge(NamedTuple):
+    """IMPORTS edge held back until every file is parsed.
+
+    An internal-looking target is only real if some file (or inline module)
+    actually yields that module qn; verification happens against the full
+    module registry, and a target that resolves nowhere emits no edge.
+    """
+
+    module_qn: str
+    full_name: str
+    language: SupportedLanguage
+    # Import-site edge properties (statement span, alias, imported name;
+    # issue #1522), or None for an import shape that records no site.
+    site: PropertyDict | None = None
+
+
+class ScalaPackageBlock(NamedTuple):
+    """The body of one `package p { ... }` block, as a byte span."""
+
+    start: int
+    end: int
+    # The packages its body opens, innermost first, for relative lookups.
+    enclosing: tuple[str, ...]
+
+
+class ScalaClassBases(NamedTuple):
+    """A Scala class's `extends ... with ...` bases, as written, and its start."""
+
+    point: int
+    bases: tuple[str, ...]
+
+
+class ScalaPackageScan(NamedTuple):
+    """What one Scala file declares and mentions (issue #2450).
+
+    Scala packages need not mirror directories, so the package clauses are
+    the only answer to "does this repo define the package an import names".
+    """
+
+    # Each package the file opens -> the names it declares directly in it.
+    packages: dict[str, frozenset[str]]
+    # Packages whose members the file's imports may name relatively,
+    # innermost first: `package a` then `package b` opens `a.b` and `a`.
+    enclosing: tuple[str, ...]
+    # Every name the file writes outside its import and package clauses: the
+    # evidence that pins a wildcard import to the modules actually used.
+    mentions: frozenset[str]
+    # Every `package p { ... }` block: sibling blocks see different packages.
+    blocks: tuple[ScalaPackageBlock, ...]
+    # Class qn relative to the module -> where it sits and its bases as
+    # written, so a base resolves through the imports of its own block.
+    class_bases: dict[str, ScalaClassBases]
+
+
+class ScalaImportBinding(NamedTuple):
+    """One name a Scala import binds, where it is visible, and its site."""
+
+    local_name: str
+    path: str
+    # The packages the import sits in, innermost first.
+    enclosing: tuple[str, ...]
+    # The package block the import is visible in; None for the whole file.
+    block: ScalaPackageBlock | None
+    site: PropertyDict | None
+
+
+class ScalaBlockImports(NamedTuple):
+    """The resolved import map of one package block."""
+
+    block: ScalaPackageBlock
+    mapping: dict[str, str]
+
+
+class ScalaBinding(NamedTuple):
+    """A name a Scala caller binds: the type it holds, and where it holds it.
+
+    The scope is a byte span, so an inner block's `c` hides an outer `c`
+    only inside that block (issue #2450).
+    """
+
+    name: str
+    # None when the type is unknown without inference, or when one scope
+    # binds the name twice to different types.
+    type_name: str | None
+    scope_start: int
+    scope_end: int
+
+
+class ScalaImportTarget(NamedTuple):
+    """A Scala import path resolved against the project's own packages."""
+
+    # The project qn of the imported member, or None when the path names a
+    # package, whose members are spread over the declaring modules.
+    member_qn: str | None
+    # Declaring module qn -> the names it declares under the resolved package.
+    declaring: dict[str, frozenset[str]]
+
+
+class ScalaPackageIndex(NamedTuple):
+    """Every Scala package the project declares, from both directions."""
+
+    # package -> {declaring module qn -> the names it declares there}
+    modules: dict[str, dict[str, frozenset[str]]]
+    # package -> {declared name -> the module qns declaring it}
+    owners: dict[str, dict[str, tuple[str, ...]]]
+
+
+LanguageFamily = frozenset[SupportedLanguage]
+# {bare module qn: {language family: its file's module qn}} for a stem whose
+# files carry their extension, the name each family's importers land on.
+StemSiblingModules = dict[str, dict[LanguageFamily, str]]
+
+
+# A write tool's post-write step (issue #2916): the written paths in, a note
+# for the tool's result out ("" for nothing to say).
+AfterWrite = Callable[[list[str]], Awaitable[str]]
+
+
+class ReingestReport(NamedTuple):
+    """What one GraphUpdater.reingest() call touched (issue #1524)."""
+
+    reparsed: tuple[str, ...]
+    affected: tuple[str, ...]
+    removed: tuple[str, ...]
+    skipped: tuple[str, ...]
+    elapsed_ms: float
+
+
+class RelationshipSchema(NamedTuple):
+    sources: tuple[NodeLabel, ...]
+    rel_type: RelationshipType
+    targets: tuple[NodeLabel, ...]
+
+
+# shared property string for the ast-grep finding node labels (issue #413)
+_FINDING_NODE_PROPS = (
+    "{qualified_name: string, name: string, message: string, "
+    "start_line: int, end_line: int, path: string, snippet: string?}"
+)
+
+# A gloss is written by an agent and read back later (issue #1808), so unlike
+# every other node here its truth lives only in the graph. `anchor_state` grades
+# how well it is still attached to its subject: EXACT|MOVED|STALE|AMBIGUOUS|LOST.
+# An anchor that cannot be re-established becomes visibly LOST rather than being
+# silently re-bound to the wrong symbol.
+# The labels a gloss can attach to. Deliberately the same set `graph_query`
+# resolves a name or a path:line to (`_DEFINITION_LABELS`), so every anchor an
+# agent can name is one an ANNOTATES edge can point at.
+_GLOSS_TARGET_LABELS = (
+    NodeLabel.MODULE,
+    NodeLabel.CLASS,
+    NodeLabel.FUNCTION,
+    NodeLabel.METHOD,
+    NodeLabel.INTERFACE,
+    NodeLabel.ENUM,
+    NodeLabel.TYPE,
+    NodeLabel.UNION,
+)
+
+# The labels a parameter's annotation can resolve to: what `TypeReferenceResolver`
+# returns today for ACCEPTS, minus nothing -- a parameter typed as a Function
+# is a callable annotation, which the resolver does not produce.
+_PARAMETER_TYPE_LABELS = (
+    NodeLabel.CLASS,
+    NodeLabel.INTERFACE,
+    NodeLabel.ENUM,
+    NodeLabel.TYPE,
+    NodeLabel.UNION,
+)
+
+_PARAMETER_NODE_PROPS = (
+    "{qualified_name: string, name: string, index: int, path: string, "
+    "absolute_path: string, start_line: int?, start_col: int?, "
+    "type_name: string?, is_variadic: boolean?, has_default: boolean?}"
+)
+
+# A field's owner is any label that can declare one; its OF_TYPE targets are
+# the Parameter set, for the same reason (issue #1805).
+_FIELD_OWNER_LABELS = (
+    NodeLabel.CLASS,
+    NodeLabel.INTERFACE,
+    NodeLabel.ENUM,
+    NodeLabel.TYPE,
+    NodeLabel.UNION,
+)
+
+_FIELD_NODE_PROPS = (
+    "{qualified_name: string, name: string, path: string, absolute_path: string, "
+    "start_line: int?, start_col: int?, type_name: string?, "
+    "modifiers: list[string]?, is_static: boolean?, docstring: string?}"
+)
+
+_ENUM_VARIANT_NODE_PROPS = (
+    "{qualified_name: string, name: string, path: string, absolute_path: string, "
+    "start_line: int?, start_col: int?, index: int, value: string?, docstring: string?}"
+)
+
+# A module-level constant (issue #1806). `value` is the right-hand side as
+# written, absent when it is longer than CONSTANT_VALUE_MAX_CHARS.
+_CONSTANT_NODE_PROPS = (
+    "{qualified_name: string, name: string, path: string, absolute_path: string, "
+    "start_line: int?, start_col: int?, type_name: string?, value: string?}"
+)
+
+_GLOSS_NODE_PROPS = (
+    "{qualified_name: string, kind: string, status: string, body: string, "
+    "created_by: string, created_at: string, commit_sha: string?, "
+    "target_qn: string, target_hash: string?, anchor_quote: string?, "
+    "anchor_prefix: string?, anchor_suffix: string?, anchor_state: string, "
+    "moved_from: string?, candidate_qns: list[string]?, project: string?, "
+    "write_id: string?, mention_qns: list[string]?, "
+    "mention_hashes: list[string]?, mention_quotes: list[string]?, "
+    "mentions_lost: list[string]?}"
+)
+
+NODE_SCHEMAS: tuple[NodeSchema, ...] = (
+    # `captured_relationships` is written by every sync from issue #2521 on;
+    # a graph synced before that has none, which reads as "capture unknown".
+    NodeSchema(
+        NodeLabel.PROJECT,
+        "{name: string, root_path: string?, captured_relationships: list[string]?, "
+        "last_synced_at: string?}",
+    ),
+    NodeSchema(
+        NodeLabel.PACKAGE,
+        "{qualified_name: string, name: string, path: string, absolute_path: string}",
+    ),
+    NodeSchema(NodeLabel.FOLDER, "{path: string, name: string, absolute_path: string}"),
+    NodeSchema(
+        NodeLabel.FILE,
+        "{path: string, name: string, extension: string?, absolute_path: string}",
+    ),
+    NodeSchema(
+        NodeLabel.MODULE,
+        "{qualified_name: string, name: string, path: string, absolute_path: string, docstring: string?, flow_covered: boolean?, generated: boolean?, generator: string?, go_package: string?, start_line: int?, end_line: int?, decorators: list[string]?, rust_cfg_test_mods: list[string]?, rust_ungated_mods: list[string]?, front_matter: list[string]?, broken_links: list[string]?, unresolved_specifiers: list[string]?, unresolved_references: list[string]?, interface_fingerprint: string?, php_namespace: string?}",
+    ),
+    NodeSchema(
+        NodeLabel.CLASS,
+        "{qualified_name: string, name: string, modifiers: list[string], decorators: list[string], path: string, absolute_path: string, start_col: int?, start_line: int?, decorated_start_line: int?, end_line: int?, docstring: string?, is_exported: boolean?, anchor_hash: string?, namespace: string?, generic_arity: int?, non_method_members: list[string]?, type_checking_only: boolean?, field_types: list[string]?}",
+    ),
+    NodeSchema(
+        NodeLabel.FUNCTION,
+        "{qualified_name: string, name: string, modifiers: list[string], decorators: list[string], path: string, absolute_path: string, start_col: int?, name_start_line: int?, name_start_col: int?, start_line: int?, decorated_start_line: int?, end_line: int?, docstring: string?, is_exported: boolean?, rust_visibility: string?, is_macro: boolean?, is_object_member: boolean?, is_body_scoped_name: boolean?, is_program_main: boolean?, positional_params: list[string]?, return_type: string?, param_types: list[string]?, first_return_type: string?, chain_return_type: string?, ast_fingerprint: string?, ast_fingerprint_nodes: int?, ast_branch_fingerprints: list[string]?, anchor_hash: string?}",
+    ),
+    NodeSchema(
+        NodeLabel.METHOD,
+        "{qualified_name: string, name: string, modifiers: list[string], decorators: list[string], path: string, absolute_path: string, start_col: int?, name_start_line: int?, name_start_col: int?, start_line: int?, decorated_start_line: int?, end_line: int?, docstring: string?, is_exported: boolean?, is_property: boolean?, member_aliases: list[string]?, overrides_external: boolean?, is_program_main: boolean?, positional_params: list[string]?, return_type: string?, param_types: list[string]?, chain_return_type: string?, signature: string?, declared_in_class: boolean?, extension_receiver: string?, extension_namespace: string?, extension_receiver_arity: int?, ast_fingerprint: string?, ast_fingerprint_nodes: int?, ast_branch_fingerprints: list[string]?, anchor_hash: string?}",
+    ),
+    NodeSchema(
+        NodeLabel.INTERFACE,
+        "{qualified_name: string, name: string, path: string, absolute_path: string, modifiers: list[string]?, decorators: list[string]?, start_col: int?, start_line: int?, decorated_start_line: int?, end_line: int?, docstring: string?, is_exported: boolean?, anchor_hash: string?, namespace: string?, generic_arity: int?, embeds: list[string]?, implementers_unknown: string?, field_types: list[string]?}",
+    ),
+    NodeSchema(
+        NodeLabel.ENUM,
+        "{qualified_name: string, name: string, path: string, absolute_path: string, modifiers: list[string]?, decorators: list[string]?, start_col: int?, start_line: int?, decorated_start_line: int?, end_line: int?, docstring: string?, is_exported: boolean?, anchor_hash: string?, namespace: string?}",
+    ),
+    NodeSchema(
+        NodeLabel.TYPE,
+        "{qualified_name: string, name: string, path: string?, absolute_path: string?, modifiers: list[string]?, decorators: list[string]?, start_col: int?, start_line: int?, decorated_start_line: int?, end_line: int?, docstring: string?, is_exported: boolean?, anchor_hash: string?}",
+    ),
+    NodeSchema(
+        NodeLabel.UNION,
+        "{qualified_name: string, name: string, path: string?, absolute_path: string?, modifiers: list[string]?, decorators: list[string]?, start_col: int?, start_line: int?, decorated_start_line: int?, end_line: int?, docstring: string?, is_exported: boolean?, anchor_hash: string?, field_types: list[string]?}",
+    ),
+    NodeSchema(
+        NodeLabel.MODULE_INTERFACE,
+        "{qualified_name: string, name: string, path: string, absolute_path: string, module_type: string}",
+    ),
+    NodeSchema(
+        NodeLabel.MODULE_IMPLEMENTATION,
+        "{qualified_name: string, name: string, path: string, absolute_path: string, implements_module: string, module_type: string}",
+    ),
+    NodeSchema(NodeLabel.EXTERNAL_PACKAGE, "{name: string}"),
+    NodeSchema(
+        NodeLabel.EXTERNAL_MODULE,
+        "{qualified_name: string, name: string, path: string}",
+    ),
+    # `project` is set on ENDPOINT resources only: an endpoint is scoped to the
+    # project that serves it, and the endpoint linker reads the property back
+    # to match a URL's host to that project. The other kinds are shared
+    # across projects and carry none, hence optional (issue #2536).
+    NodeSchema(
+        NodeLabel.RESOURCE,
+        "{qualified_name: string, name: string, kind: string, project: string?}",
+    ),
+    NodeSchema(
+        NodeLabel.SECTION,
+        "{qualified_name: string, name: string, heading_level: int, "
+        "start_line: int, end_line: int, path: string, absolute_path: string}",
+    ),
+    NodeSchema(NodeLabel.PATTERN, _FINDING_NODE_PROPS),
+    NodeSchema(NodeLabel.CODE_SMELL, _FINDING_NODE_PROPS),
+    NodeSchema(NodeLabel.SECURITY_ISSUE, _FINDING_NODE_PROPS),
+    NodeSchema(NodeLabel.GLOSS, _GLOSS_NODE_PROPS),
+    NodeSchema(NodeLabel.PARAMETER, _PARAMETER_NODE_PROPS),
+    NodeSchema(NodeLabel.FIELD, _FIELD_NODE_PROPS),
+    NodeSchema(NodeLabel.ENUM_VARIANT, _ENUM_VARIANT_NODE_PROPS),
+    NodeSchema(NodeLabel.CONSTANT, _CONSTANT_NODE_PROPS),
+)
+
+
+class RelationshipPropertySchema(NamedTuple):
+    rel_types: tuple[RelationshipType, ...]
+    properties: str
+
+
+# Edge properties, documented for the query-generation prompt (issue #1522):
+# every CALLS/REFERENCES/INSTANTIATES edge locates its producing expression
+# and every IMPORTS edge its statement; FLOWS_TO carries its conduit shape.
+RELATIONSHIP_PROPERTY_SCHEMAS: tuple[RelationshipPropertySchema, ...] = (
+    RelationshipPropertySchema(
+        (
+            RelationshipType.CALLS,
+            RelationshipType.REFERENCES,
+            RelationshipType.INSTANTIATES,
+        ),
+        "{line: int?, col: int?, end_line: int?, end_col: int?, "
+        "arg_count: int?, kwarg_names: list[string]?, star_args: boolean?, star_kwargs: boolean?, "
+        "resolution: string?, unlocatable: boolean?, dispatch_literal: boolean?}",
+    ),
+    RelationshipPropertySchema(
+        (RelationshipType.IMPORTS,),
+        "{line: int?, col: int?, end_line: int?, end_col: int?, "
+        "alias: string?, imported_name: string?}",
+    ),
+    RelationshipPropertySchema(
+        (RelationshipType.FLOWS_TO,),
+        "{kind: string, via: string?}",
+    ),
+    # Declaration order of the variant within its enum, so a query can restore
+    # the source order the graph does not otherwise preserve. Always written
+    # (issue #1807), hence no `?`.
+    RelationshipPropertySchema(
+        (RelationshipType.HAS_VARIANT,),
+        "{index: int}",
+    ),
+)
+
+# What a return or parameter annotation can name (issue #1527).
+_TYPE_NODE_LABELS = (
+    NodeLabel.CLASS,
+    NodeLabel.INTERFACE,
+    NodeLabel.ENUM,
+    NodeLabel.TYPE,
+    NodeLabel.UNION,
+)
+
+RELATIONSHIP_SCHEMAS: tuple[RelationshipSchema, ...] = (
+    RelationshipSchema(
+        (NodeLabel.PROJECT, NodeLabel.PACKAGE, NodeLabel.FOLDER),
+        RelationshipType.CONTAINS_PACKAGE,
+        (NodeLabel.PACKAGE,),
+    ),
+    RelationshipSchema(
+        (NodeLabel.PROJECT, NodeLabel.PACKAGE, NodeLabel.FOLDER),
+        RelationshipType.CONTAINS_FOLDER,
+        (NodeLabel.FOLDER,),
+    ),
+    RelationshipSchema(
+        (NodeLabel.PROJECT, NodeLabel.PACKAGE, NodeLabel.FOLDER),
+        RelationshipType.CONTAINS_FILE,
+        (NodeLabel.FILE,),
+    ),
+    RelationshipSchema(
+        (NodeLabel.PROJECT, NodeLabel.PACKAGE, NodeLabel.FOLDER),
+        RelationshipType.CONTAINS_MODULE,
+        (NodeLabel.MODULE,),
+    ),
+    RelationshipSchema(
+        (NodeLabel.MODULE, NodeLabel.SECTION),
+        RelationshipType.CONTAINS_SECTION,
+        (NodeLabel.SECTION,),
+    ),
+    RelationshipSchema(
+        (NodeLabel.MODULE, NodeLabel.FUNCTION, NodeLabel.METHOD, NodeLabel.CLASS),
+        RelationshipType.DEFINES,
+        (
+            NodeLabel.CLASS,
+            NodeLabel.FUNCTION,
+            NodeLabel.METHOD,
+            NodeLabel.ENUM,
+            NodeLabel.INTERFACE,
+            NodeLabel.TYPE,
+            NodeLabel.UNION,
+            NodeLabel.MODULE,
+        ),
+    ),
+    RelationshipSchema(
+        (
+            NodeLabel.CLASS,
+            NodeLabel.INTERFACE,
+            NodeLabel.ENUM,
+            NodeLabel.TYPE,
+            NodeLabel.UNION,
+        ),
+        RelationshipType.DEFINES_METHOD,
+        (NodeLabel.METHOD,),
+    ),
+    RelationshipSchema(
+        (NodeLabel.MODULE,),
+        RelationshipType.IMPORTS,
+        (NodeLabel.MODULE, NodeLabel.EXTERNAL_MODULE),
+    ),
+    RelationshipSchema(
+        (NodeLabel.MODULE,),
+        RelationshipType.EXPORTS,
+        (NodeLabel.CLASS, NodeLabel.FUNCTION),
+    ),
+    RelationshipSchema(
+        (NodeLabel.MODULE,),
+        RelationshipType.EXPORTS_MODULE,
+        (NodeLabel.MODULE_INTERFACE,),
+    ),
+    RelationshipSchema(
+        (NodeLabel.MODULE,),
+        RelationshipType.IMPLEMENTS_MODULE,
+        (NodeLabel.MODULE_IMPLEMENTATION,),
+    ),
+    RelationshipSchema(
+        (NodeLabel.CLASS, NodeLabel.INTERFACE, NodeLabel.FUNCTION),
+        RelationshipType.INHERITS,
+        # ExternalModule: a positively-external base (typing.Protocol,
+        # js builtin.Error) keeps its edge by targeting the same external
+        # node the import pass mints, mirroring Module IMPORTS.
+        (
+            NodeLabel.CLASS,
+            NodeLabel.INTERFACE,
+            NodeLabel.FUNCTION,
+            NodeLabel.EXTERNAL_MODULE,
+        ),
+    ),
+    RelationshipSchema(
+        (NodeLabel.CLASS, NodeLabel.ENUM),
+        RelationshipType.IMPLEMENTS,
+        # CLASS/ENUM targets: Dart has no `interface` keyword, so `implements
+        # X` names a concrete class (its implicit interface) or an enum.
+        (
+            NodeLabel.INTERFACE,
+            NodeLabel.CLASS,
+            NodeLabel.ENUM,
+            NodeLabel.EXTERNAL_MODULE,
+        ),
+    ),
+    # TypeScript heritage onto a `type` alias of an object type:
+    # `interface InvalidType extends IssueBase` and `class LazyPath implements
+    # ParseInput` (zod's ZodError.ts and types.ts). The parent resolves to the
+    # alias's Type node. Listed as two exact triples rather than adding Type
+    # to the target lists above, which would also document a class that
+    # `extends` an alias and an enum that `implements` one (issue #2536).
+    RelationshipSchema(
+        (NodeLabel.INTERFACE,),
+        RelationshipType.INHERITS,
+        (NodeLabel.TYPE,),
+    ),
+    RelationshipSchema(
+        (NodeLabel.CLASS,),
+        RelationshipType.IMPLEMENTS,
+        (NodeLabel.TYPE,),
+    ),
+    # A Go defined type that is no struct (`type HandlerFunc func(...)`)
+    # carries methods too, and implements an interface by having them.
+    RelationshipSchema(
+        (NodeLabel.TYPE,),
+        RelationshipType.IMPLEMENTS,
+        (NodeLabel.INTERFACE,),
+    ),
+    RelationshipSchema(
+        # A method-body anonymous-class override is a Function node, so it
+        # can source an OVERRIDES edge onto the base Method.
+        (NodeLabel.METHOD, NodeLabel.FUNCTION),
+        RelationshipType.OVERRIDES,
+        (NodeLabel.METHOD,),
+    ),
+    RelationshipSchema(
+        (NodeLabel.FUNCTION, NodeLabel.METHOD),
+        RelationshipType.RETURNS,
+        _TYPE_NODE_LABELS,
+    ),
+    RelationshipSchema(
+        (NodeLabel.FUNCTION, NodeLabel.METHOD),
+        RelationshipType.ACCEPTS,
+        _TYPE_NODE_LABELS,
+    ),
+    RelationshipSchema(
+        (NodeLabel.MODULE_IMPLEMENTATION,),
+        RelationshipType.IMPLEMENTS,
+        (NodeLabel.MODULE_INTERFACE,),
+    ),
+    RelationshipSchema(
+        (NodeLabel.PROJECT,),
+        RelationshipType.DEPENDS_ON_EXTERNAL,
+        (NodeLabel.EXTERNAL_PACKAGE,),
+    ),
+    # A relative link in a Markdown document to a file in the repository
+    # (issue #2394: emitted by the document tier but never documented). It
+    # starts at the innermost Section holding it, or at the Module above the
+    # first heading, and ends at the Section its anchor names, or at the File
+    # (issue #2458).
+    RelationshipSchema(
+        (NodeLabel.MODULE, NodeLabel.SECTION),
+        RelationshipType.LINKS_TO,
+        (NodeLabel.FILE, NodeLabel.SECTION),
+    ),
+    RelationshipSchema(
+        (NodeLabel.MODULE, NodeLabel.FUNCTION, NodeLabel.METHOD),
+        RelationshipType.CALLS,
+        (NodeLabel.FUNCTION, NodeLabel.METHOD, NodeLabel.ENUM, NodeLabel.TYPE),
+    ),
+    RelationshipSchema(
+        (NodeLabel.MODULE, NodeLabel.FUNCTION, NodeLabel.METHOD),
+        RelationshipType.REFERENCES,
+        (NodeLabel.FUNCTION, NodeLabel.METHOD, NodeLabel.CLASS),
+    ),
+    RelationshipSchema(
+        (NodeLabel.MODULE, NodeLabel.FUNCTION, NodeLabel.METHOD),
+        RelationshipType.INSTANTIATES,
+        (NodeLabel.CLASS,),
+    ),
+    RelationshipSchema(
+        (NodeLabel.MODULE, NodeLabel.FUNCTION, NodeLabel.METHOD),
+        RelationshipType.READS_FROM,
+        (NodeLabel.RESOURCE,),
+    ),
+    RelationshipSchema(
+        (NodeLabel.MODULE, NodeLabel.FUNCTION, NodeLabel.METHOD),
+        RelationshipType.WRITES_TO,
+        (NodeLabel.RESOURCE,),
+    ),
+    RelationshipSchema(
+        (NodeLabel.MODULE, NodeLabel.FUNCTION, NodeLabel.METHOD, NodeLabel.RESOURCE),
+        RelationshipType.FLOWS_TO,
+        (NodeLabel.MODULE, NodeLabel.FUNCTION, NodeLabel.METHOD, NodeLabel.RESOURCE),
+    ),
+    RelationshipSchema(
+        (NodeLabel.FUNCTION, NodeLabel.METHOD, NodeLabel.FILE),
+        RelationshipType.EXPOSES,
+        (NodeLabel.RESOURCE,),
+    ),
+    RelationshipSchema(
+        (NodeLabel.RESOURCE,),
+        RelationshipType.RESOLVES_TO,
+        (NodeLabel.RESOURCE,),
+    ),
+    RelationshipSchema(
+        (NodeLabel.MODULE,),
+        RelationshipType.IMPLEMENTS_PATTERN,
+        (NodeLabel.PATTERN,),
+    ),
+    RelationshipSchema(
+        (NodeLabel.MODULE,),
+        RelationshipType.HAS_SMELL,
+        (NodeLabel.CODE_SMELL,),
+    ),
+    RelationshipSchema(
+        (NodeLabel.MODULE,),
+        RelationshipType.HAS_VULNERABILITY,
+        (NodeLabel.SECURITY_ISSUE,),
+    ),
+    # A gloss's subject: exactly one per gloss (issue #1808).
+    RelationshipSchema(
+        (NodeLabel.GLOSS,),
+        RelationshipType.ANNOTATES,
+        _GLOSS_TARGET_LABELS,
+    ),
+    # Symbols the gloss's text refers to, distinct from its subject, so a
+    # traversal can find glosses that discuss a symbol without being filed
+    # under it.
+    RelationshipSchema(
+        (NodeLabel.GLOSS,),
+        RelationshipType.MENTIONS,
+        _GLOSS_TARGET_LABELS,
+    ),
+    RelationshipSchema(
+        (NodeLabel.FUNCTION, NodeLabel.METHOD),
+        RelationshipType.HAS_PARAMETER,
+        (NodeLabel.PARAMETER,),
+    ),
+    RelationshipSchema(
+        _FIELD_OWNER_LABELS,
+        RelationshipType.HAS_FIELD,
+        (NodeLabel.FIELD,),
+    ),
+    # A Python enum is a Class (an `enum.Enum` subclass), so its members hang
+    # off that Class (issue #2583); every other language's owner is an Enum.
+    RelationshipSchema(
+        (NodeLabel.ENUM, NodeLabel.CLASS),
+        RelationshipType.HAS_VARIANT,
+        (NodeLabel.ENUM_VARIANT,),
+    ),
+    # Only a Module declares one today: a class-level member is a Field
+    # (issue #1805), so the two labels never share a qualified name.
+    RelationshipSchema(
+        (NodeLabel.MODULE,),
+        RelationshipType.DEFINES_CONSTANT,
+        (NodeLabel.CONSTANT,),
+    ),
+    RelationshipSchema(
+        (NodeLabel.PARAMETER, NodeLabel.FIELD, NodeLabel.CONSTANT),
+        RelationshipType.OF_TYPE,
+        _PARAMETER_TYPE_LABELS,
+    ),
+)

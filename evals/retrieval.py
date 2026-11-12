@@ -1,0 +1,472 @@
+# Retrieval benchmark: graph-augmented call localization vs grep. For every
+# first-party symbol S, find the files that call S. The graph condition uses
+# cgr's resolved CALLS/INSTANTIATES edges; the grep conditions use ripgrep
+# (bare-name and call-tuned patterns); the optional ColGrep conditions take the
+# top-k files LightOn's semantic grep ranks for S. All are scored against the
+# same Python ast oracle over the same file and symbol universe, as a set of
+# (caller_file, callee_simple_name) name-edges restricted to first-party,
+# non-dunder callees (the set cgr can emit). This isolates retrieval quality
+# (does the graph beat grep) from any LLM in the loop, the decoupled
+# measurement the GitLab GKG eval flagged as out of scope.
+import ast
+import os
+import random
+import re
+import shutil
+import subprocess
+import tempfile
+import time
+from pathlib import Path
+from typing import Annotated
+
+import typer
+from loguru import logger
+
+from codebase_rag import constants as cs
+
+from . import constants as ec
+from . import logs as ls
+from .ast_oracle import _iter_py_files
+from .cgr_graph import _capture
+from .module_calls import _callee_name, _first_party_names, _is_dunder
+from .score import _diff_bucket, _fmt_name_edge, _prf
+from .structure_report import render, write_outputs
+from .types_defs import (
+    ColGrepEdges,
+    DiffBucket,
+    LocationStats,
+    NameEdge,
+    NodeKey,
+    ScoreResult,
+    ScoreRow,
+)
+
+console_target = Path(ec.RETRIEVAL_DEFAULT_TARGET)
+
+_CALLS = cs.RelationshipType.CALLS.value
+_INSTANTIATES = cs.RelationshipType.INSTANTIATES.value
+_MODULE = cs.NodeLabel.MODULE.value
+_METHOD = cs.NodeLabel.METHOD.value
+_IDENTIFIER = re.compile(ec.IDENTIFIER_PATTERN)
+_EMPTY_LOCATION = LocationStats(0, 0, 0, 0.0, 0)
+
+
+def parse_py_trees(target: Path) -> tuple[list[tuple[str, ast.Module]], set[str]]:
+    trees: list[tuple[str, ast.Module]] = []
+    files: set[str] = set()
+    for path in _iter_py_files(target):
+        rel = path.relative_to(target).as_posix()
+        files.add(rel)
+        try:
+            trees.append((rel, ast.parse(path.read_text(encoding=cs.ENCODING_UTF8))))
+        except (SyntaxError, UnicodeDecodeError, ValueError) as error:
+            logger.warning(ls.ORACLE_PARSE_FAILED.format(path=rel, error=error))
+    return trees, files
+
+
+def first_party_symbols(trees: list[tuple[str, ast.Module]]) -> set[str]:
+    names = _first_party_names([tree for _rel, tree in trees])
+    return {name for name in names if not _is_dunder(name)}
+
+
+def _decorator_name(dec: ast.expr) -> str | None:
+    if isinstance(dec, ast.Name):
+        return dec.id
+    if isinstance(dec, ast.Attribute):
+        return dec.attr
+    if isinstance(dec, ast.Call):
+        return _decorator_name(dec.func)
+    return None
+
+
+def first_party_property_names(trees: list[tuple[str, ast.Module]]) -> set[str]:
+    names: set[str] = set()
+    for _rel, tree in trees:
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and any(
+                _decorator_name(dec) in ec.PROPERTY_DECORATORS
+                for dec in node.decorator_list
+            ):
+                names.add(node.name)
+    return {name for name in names if not _is_dunder(name)}
+
+
+def _edge(file: str, name: str) -> NameEdge:
+    return NameEdge(_CALLS, NodeKey(_MODULE, file, ec.MODULE_START_LINE), name)
+
+
+def oracle_call_edges(
+    trees: list[tuple[str, ast.Module]],
+    first_party: set[str],
+    property_names: set[str] | None = None,
+) -> set[NameEdge]:
+    properties = property_names or set()
+    edges: set[NameEdge] = set()
+    for rel, tree in trees:
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and (name := _callee_name(node.func)):
+                if name in first_party:
+                    edges.add(_edge(rel, name))
+            # A bare READ of a first-party property getter invokes it; cgr emits
+            # a CALLS edge, so credit it here too (a property is never called
+            # with parens, so this cannot double-count). Only a Load counts: a
+            # Store (`self.x = v`) invokes the setter and a Del the deleter,
+            # neither of which cgr models as a plain getter call.
+            elif (
+                isinstance(node, ast.Attribute)
+                and node.attr in properties
+                and isinstance(node.ctx, ast.Load | ast.Store)
+            ):
+                edges.add(_edge(rel, node.attr))
+    return edges
+
+
+def cgr_call_edges(
+    target: Path, project_name: str, first_party: set[str]
+) -> set[NameEdge]:
+    ingestor = _capture(target, project_name)
+    caller_path: dict[tuple[str, str], str] = {
+        (str(label), str(uid)): str(props[cs.KEY_PATH])
+        for (label, uid), props in ingestor.nodes.items()
+        if props.get(cs.KEY_PATH) and str(props[cs.KEY_PATH]).endswith(ec.PY_SUFFIX)
+    }
+
+    edges: set[NameEdge] = set()
+    for from_label, from_val, rel_type, to_label, to_val in ingestor.rels:
+        if rel_type not in (_CALLS, _INSTANTIATES):
+            continue
+        path = caller_path.get((from_label, str(from_val)))
+        if path is None:
+            continue
+        segments = str(to_val).split(ec.SEP)
+        name = segments[-1]
+        # A constructor call resolves via CALLS to `X.__init__` (a METHOD); the
+        # oracle sees the class name `X`, so credit the class, matching L2.
+        if name == ec.INIT_STEM and to_label == _METHOD and len(segments) >= 2:
+            name = segments[-2]
+        if _is_dunder(name) or name not in first_party:
+            continue
+        edges.add(_edge(path, name))
+    return edges
+
+
+def _grep_patterns(first_party: set[str], mode: ec.GrepMode) -> str:
+    template = (
+        ec.GREP_CALL_TEMPLATE if mode == ec.GrepMode.CALL else ec.GREP_NAME_TEMPLATE
+    )
+    return ec.PATTERN_SEP.join(
+        template.format(name=re.escape(name)) for name in sorted(first_party)
+    )
+
+
+def grep_call_edges(
+    target: Path, first_party: set[str], files: set[str], mode: ec.GrepMode
+) -> set[NameEdge]:
+    if not first_party:
+        return set()
+    completed = subprocess.run(
+        [
+            ec.RG_BIN,
+            ec.RG_ONLY_MATCHING,
+            ec.RG_WITH_FILENAME,
+            ec.RG_NO_LINE_NUMBER,
+            ec.RG_NO_HEADING,
+            ec.RG_NULL,
+            ec.RG_GLOB_FLAG,
+            ec.RG_PY_GLOB,
+            ec.RG_PATTERN_FILE_FLAG,
+            ec.RG_STDIN,
+            ec.RG_SEARCH_PATH,
+        ],
+        cwd=target,
+        input=_grep_patterns(first_party, mode),
+        capture_output=True,
+        text=True,
+        encoding=cs.ENCODING_UTF8,
+        check=False,
+    )
+    if completed.returncode not in ec.RG_OK_RETURNCODES:
+        logger.warning(completed.stderr.strip())
+        return set()
+
+    edges: set[NameEdge] = set()
+    for line in completed.stdout.splitlines():
+        path_text, sep, matched = line.partition(ec.RG_NULL_SEP)
+        if not sep:
+            continue
+        # Path(...).as_posix() strips the leading ./ and folds Windows
+        # backslashes to the forward-slash form parse_py_trees keys files on.
+        rel = Path(path_text).as_posix()
+        if rel not in files:
+            continue
+        token = _IDENTIFIER.match(matched)
+        if token is not None and token.group(0) in first_party:
+            edges.add(_edge(rel, token.group(0)))
+    return edges
+
+
+def _run_colgrep(
+    target: Path, data_dir: Path, subcommand: str, args: list[str]
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            ec.COLGREP_BIN,
+            subcommand,
+            ec.COLGREP_FORCE_CPU,
+            ec.COLGREP_COLOR_FLAG,
+            ec.COLGREP_COLOR_NEVER,
+            *args,
+        ],
+        cwd=target,
+        env={**os.environ, ec.COLGREP_DATA_DIR_ENV: str(data_dir)},
+        capture_output=True,
+        text=True,
+        encoding=cs.ENCODING_UTF8,
+        check=False,
+    )
+
+
+def colgrep_index(target: Path, data_dir: Path) -> str | None:
+    completed = _run_colgrep(
+        target, data_dir, ec.COLGREP_INIT, [ec.COLGREP_YES, ec.RG_SEARCH_PATH]
+    )
+    return completed.stderr.strip() if completed.returncode != 0 else None
+
+
+def _colgrep_search_args(name: str, mode: ec.GrepMode, top_k: int) -> list[str]:
+    args = [
+        ec.COLGREP_FILES_ONLY,
+        ec.COLGREP_TOP_K_FLAG,
+        str(top_k),
+        ec.COLGREP_INCLUDE_FLAG,
+        ec.RG_PY_GLOB,
+        ec.COLGREP_NO_UPDATE,
+    ]
+    # NAME asks the ranker for the bare symbol (keyword and semantic scores
+    # fused); CALL first narrows to code units matching the same call pattern
+    # grep_call uses, then lets the model rank them.
+    if mode == ec.GrepMode.CALL:
+        args += [
+            ec.COLGREP_PATTERN_FLAG,
+            ec.GREP_CALL_TEMPLATE.format(name=re.escape(name)),
+            ec.COLGREP_CASE_SENSITIVE,
+        ]
+    return [*args, ec.COLGREP_END_OF_OPTIONS, name, ec.RG_SEARCH_PATH]
+
+
+def colgrep_call_edges(
+    target: Path,
+    first_party: set[str],
+    files: set[str],
+    mode: ec.GrepMode,
+    data_dir: Path,
+    top_k: int = ec.COLGREP_DEFAULT_TOP_K,
+) -> ColGrepEdges:
+    root = target.resolve()
+    edges: set[NameEdge] = set()
+    for name in sorted(first_party):
+        completed = _run_colgrep(
+            root,
+            data_dir,
+            ec.COLGREP_SEARCH,
+            _colgrep_search_args(name, mode, top_k),
+        )
+        # colgrep exits 0 with no output when nothing matches, even under -e,
+        # so a nonzero exit is a real failure. Scoring it would count that
+        # symbol's callers as misses and quietly lower recall, and one failure
+        # usually means the index or model is broken for every search.
+        if completed.returncode != 0:
+            return ColGrepEdges(edges, (name, completed.stderr.strip()))
+        for line in completed.stdout.splitlines():
+            # colgrep prints absolute paths or paths relative to its cwd,
+            # depending on the user's settings; joining onto the root handles
+            # both, and resolve() matches the canonical paths it reports.
+            try:
+                rel = (root / line.strip()).resolve().relative_to(root).as_posix()
+            except ValueError:
+                continue
+            if rel in files:
+                edges.add(_edge(rel, name))
+    return ColGrepEdges(edges, None)
+
+
+def sample_symbols(symbols: set[str], size: int, seed: int) -> set[str]:
+    if size <= 0 or size >= len(symbols):
+        return set(symbols)
+    rng = random.Random(seed)  # noqa: S311 - seeded sampling for reproducible evals
+    return set(rng.sample(sorted(symbols), size))
+
+
+def _colgrep_conditions(
+    target: Path, first_party: set[str], files: set[str], top_k: int
+) -> list[tuple[str, set[NameEdge]]]:
+    with tempfile.TemporaryDirectory(prefix=ec.COLGREP_TMP_PREFIX) as tmp:
+        data_dir = Path(tmp) / ec.COLGREP_INDICES_DIR
+        return _colgrep_conditions_in(target, first_party, files, top_k, data_dir)
+
+
+def _colgrep_conditions_in(
+    target: Path,
+    first_party: set[str],
+    files: set[str],
+    top_k: int,
+    data_dir: Path,
+) -> list[tuple[str, set[NameEdge]]]:
+    logger.info(ls.RETRIEVAL_COLGREP_INDEXING.format(target=target))
+    start = time.perf_counter()
+    if (error := colgrep_index(target, data_dir)) is not None:
+        logger.error(
+            ls.RETRIEVAL_COLGREP_INDEX_FAILED.format(target=target, error=error)
+        )
+        raise typer.Exit(code=1)
+    logger.success(
+        ls.RETRIEVAL_COLGREP_INDEXED.format(seconds=time.perf_counter() - start)
+    )
+
+    conditions: list[tuple[str, set[NameEdge]]] = []
+    for mode, label in (
+        (ec.GrepMode.NAME, ec.RetrievalCondition.COLGREP_NAME.value),
+        (ec.GrepMode.CALL, ec.RetrievalCondition.COLGREP_CALL.value),
+    ):
+        queries = len(first_party)
+        logger.info(
+            ls.RETRIEVAL_EXTRACTING_COLGREP.format(
+                mode=mode.value, top_k=top_k, count=queries, target=target
+            )
+        )
+        start = time.perf_counter()
+        edges, failure = colgrep_call_edges(
+            target, first_party, files, mode, data_dir, top_k
+        )
+        if failure is not None:
+            name, error = failure
+            logger.error(
+                ls.RETRIEVAL_COLGREP_QUERY_FAILED.format(
+                    mode=mode.value, name=name, error=error
+                )
+            )
+            raise typer.Exit(code=1)
+        seconds = time.perf_counter() - start
+        logger.success(
+            ls.RETRIEVAL_COLGREP_DONE.format(
+                mode=mode.value,
+                count=len(edges),
+                queries=queries,
+                seconds=seconds,
+                per_query=seconds / max(queries, 1),
+            )
+        )
+        conditions.append((label, edges))
+    return conditions
+
+
+def score_retrieval(
+    conditions: list[tuple[str, set[NameEdge]]], oracle: set[NameEdge]
+) -> ScoreResult:
+    rows: list[ScoreRow] = []
+    diff: dict[str, DiffBucket] = {}
+    for label, retrieved in conditions:
+        row = _prf(ec.Category.RETRIEVAL.value, label, retrieved, oracle)
+        if row is not None:
+            rows.append(row)
+        diff[ec.RETRIEVAL_DIFF_PREFIX + label] = _diff_bucket(
+            retrieved, oracle, _fmt_name_edge
+        )
+    return ScoreResult(rows=rows, location=_EMPTY_LOCATION, diff=diff)
+
+
+def main(
+    target: Annotated[
+        Path, typer.Option(help="cgr source to evaluate call retrieval for.")
+    ] = console_target,
+    project_name: Annotated[
+        str, typer.Option(help="cgr project name; defaults to target dir name.")
+    ] = "",
+    out_dir: Annotated[
+        Path,
+        typer.Option(
+            help="Directory for retrieval_scores.csv and retrieval_diff.json."
+        ),
+    ] = Path(ec.DEFAULT_OUT_DIR),
+    sample: Annotated[
+        int,
+        typer.Option(
+            help="Score every condition on a seeded random sample of this many "
+            "symbols (0 = all). ColGrep runs one search per symbol, so bound it."
+        ),
+    ] = 0,
+    seed: Annotated[
+        int, typer.Option(help="Seed for --sample.")
+    ] = ec.RETRIEVAL_SAMPLE_SEED,
+    colgrep: Annotated[
+        bool,
+        typer.Option(help="Add the ColGrep conditions (needs `colgrep` on PATH)."),
+    ] = False,
+    colgrep_k: Annotated[
+        int, typer.Option(help="Files ColGrep returns per search (its -k).")
+    ] = ec.COLGREP_DEFAULT_TOP_K,
+) -> None:
+    if shutil.which(ec.RG_BIN) is None:
+        logger.error(ls.RETRIEVAL_RG_MISSING.format(binary=ec.RG_BIN))
+        raise typer.Exit(code=1)
+    if colgrep and shutil.which(ec.COLGREP_BIN) is None:
+        logger.error(ls.RETRIEVAL_COLGREP_MISSING.format(binary=ec.COLGREP_BIN))
+        raise typer.Exit(code=1)
+
+    target = target.resolve()
+    project = project_name or target.name
+
+    trees, files = parse_py_trees(target)
+    first_party = first_party_symbols(trees)
+    logger.info(ls.RETRIEVAL_SYMBOLS.format(count=len(first_party)))
+    if 0 < sample < len(first_party):
+        total = len(first_party)
+        first_party = sample_symbols(first_party, sample, seed)
+        logger.info(
+            ls.RETRIEVAL_SAMPLED.format(count=len(first_party), total=total, seed=seed)
+        )
+
+    logger.info(ls.RETRIEVAL_EXTRACTING_ORACLE.format(target=target))
+    # Intersect with the (possibly sampled) universe: the oracle credits a
+    # property read without checking first_party, which would otherwise leak
+    # unsampled names into the oracle.
+    properties = first_party_property_names(trees) & first_party
+    oracle = oracle_call_edges(trees, first_party, properties)
+    logger.success(ls.RETRIEVAL_ORACLE_DONE.format(count=len(oracle)))
+    # With no call to grade, a condition that also finds nothing has no row at
+    # all, so the table would silently lose conditions; a small --sample of
+    # uncalled symbols is the realistic way to get here.
+    if not oracle:
+        logger.error(ls.RETRIEVAL_EMPTY_ORACLE.format(count=len(first_party)))
+        raise typer.Exit(code=1)
+
+    logger.info(ls.RETRIEVAL_EXTRACTING_CGR.format(target=target, project=project))
+    graph = cgr_call_edges(target, project, first_party)
+    logger.success(ls.RETRIEVAL_CGR_DONE.format(count=len(graph)))
+
+    conditions: list[tuple[str, set[NameEdge]]] = [
+        (ec.RetrievalCondition.GRAPH.value, graph)
+    ]
+    for mode, label in (
+        (ec.GrepMode.NAME, ec.RetrievalCondition.GREP_NAME.value),
+        (ec.GrepMode.CALL, ec.RetrievalCondition.GREP_CALL.value),
+    ):
+        logger.info(ls.RETRIEVAL_EXTRACTING_GREP.format(mode=mode.value, target=target))
+        grep_edges = grep_call_edges(target, first_party, files, mode)
+        logger.success(
+            ls.RETRIEVAL_GREP_DONE.format(mode=mode.value, count=len(grep_edges))
+        )
+        conditions.append((label, grep_edges))
+
+    if colgrep:
+        conditions += _colgrep_conditions(target, first_party, files, colgrep_k)
+
+    result = score_retrieval(conditions, oracle)
+    write_outputs(
+        result, out_dir, ec.RETRIEVAL_SCORES_FILENAME, ec.RETRIEVAL_DIFF_FILENAME
+    )
+    render(result, ec.RETRIEVAL_TITLE)
+
+
+if __name__ == "__main__":
+    typer.run(main)

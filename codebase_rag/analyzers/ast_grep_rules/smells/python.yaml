@@ -1,0 +1,73 @@
+# ast-grep code-smell rules for Python (issue #413).
+# Each match becomes a CodeSmell node linked to the file's Module via HAS_SMELL.
+ast_grep_id: python
+extensions: [.py]
+rules:
+  - id: bare_except
+    message: "Bare except swallows every exception"
+    rule:
+      kind: except_clause
+      regex: '^except\s*:'
+  - id: broad_except
+    message: "Broad except Exception/BaseException catches too much"
+    # The caught type itself, read from the clause's own children: a regex
+    # over the clause's text also read its body, so a specific handler with a
+    # nested `except Exception` matched, and so did `except ExceptionGroup`
+    # (issue #2693). BaseException is broader still: it also swallows
+    # KeyboardInterrupt and SystemExit (flake8-bugbear B036, issue #2865).
+    rule:
+      kind: except_clause
+      has:
+        any:
+          - { kind: identifier, regex: '^(Base)?Exception$' }
+          - { kind: tuple, has: { kind: identifier, regex: '^(Base)?Exception$' } }
+          - kind: as_pattern
+            has:
+              any:
+                - { kind: identifier, regex: '^(Base)?Exception$' }
+                - { kind: tuple, has: { kind: identifier, regex: '^(Base)?Exception$' } }
+  # An annotated default (`items: list = []`) is a typed_default_parameter
+  # (issue #2693).
+  # A default built by calling a mutable builtin (`x=list()`, `x=set()`) is
+  # evaluated once and shared exactly like the literal (issue #2864). The
+  # callee is matched by name, bare or through `collections.`.
+  - id: mutable_default_list
+    message: "Mutable default argument (list) is shared across calls"
+    rule:
+      any: [{ kind: default_parameter }, { kind: typed_default_parameter }]
+      has:
+        field: value
+        any:
+          - kind: list
+          - kind: call
+            has: { field: function, kind: identifier, regex: '^list$' }
+  - id: mutable_default_dict
+    message: "Mutable default argument (dict) is shared across calls"
+    rule:
+      any: [{ kind: default_parameter }, { kind: typed_default_parameter }]
+      has:
+        field: value
+        any:
+          - kind: dictionary
+          - kind: call
+            has:
+              field: function
+              regex: '^(dict|(collections\.)?(defaultdict|OrderedDict))$'
+  - id: mutable_default_set
+    message: "Mutable default argument (set) is shared across calls"
+    rule:
+      any: [{ kind: default_parameter }, { kind: typed_default_parameter }]
+      has:
+        field: value
+        any:
+          - kind: set
+          - kind: call
+            has: { field: function, kind: identifier, regex: '^set$' }
+  - id: wildcard_import
+    message: "Wildcard import pollutes the namespace"
+    rule:
+      pattern: "from $M import *"
+  - id: global_statement
+    message: "global statement couples the function to module state"
+    rule:
+      kind: global_statement

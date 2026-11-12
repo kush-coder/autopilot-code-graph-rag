@@ -1,0 +1,332 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+from google.protobuf.message import Message
+from loguru import logger
+
+import codec.schema_pb2 as pb
+
+from .. import constants as cs
+from .. import logs as ls
+from ..types_defs import PropertyDict, PropertyValue
+
+LABEL_TO_ONEOF_FIELD: dict[cs.NodeLabel, str] = {
+    cs.NodeLabel.PROJECT: cs.ONEOF_PROJECT,
+    cs.NodeLabel.PACKAGE: cs.ONEOF_PACKAGE,
+    cs.NodeLabel.FOLDER: cs.ONEOF_FOLDER,
+    cs.NodeLabel.MODULE: cs.ONEOF_MODULE,
+    cs.NodeLabel.CLASS: cs.ONEOF_CLASS,
+    cs.NodeLabel.FUNCTION: cs.ONEOF_FUNCTION,
+    cs.NodeLabel.METHOD: cs.ONEOF_METHOD,
+    cs.NodeLabel.FILE: cs.ONEOF_FILE,
+    cs.NodeLabel.EXTERNAL_PACKAGE: cs.ONEOF_EXTERNAL_PACKAGE,
+    cs.NodeLabel.EXTERNAL_MODULE: cs.ONEOF_EXTERNAL_MODULE,
+    cs.NodeLabel.MODULE_IMPLEMENTATION: cs.ONEOF_MODULE_IMPLEMENTATION,
+    cs.NodeLabel.MODULE_INTERFACE: cs.ONEOF_MODULE_INTERFACE,
+    cs.NodeLabel.INTERFACE: cs.ONEOF_INTERFACE,
+    cs.NodeLabel.ENUM: cs.ONEOF_ENUM,
+    cs.NodeLabel.TYPE: cs.ONEOF_TYPE,
+    cs.NodeLabel.UNION: cs.ONEOF_UNION,
+    cs.NodeLabel.RESOURCE: cs.ONEOF_RESOURCE,
+    cs.NodeLabel.SECTION: cs.ONEOF_SECTION,
+    cs.NodeLabel.PATTERN: cs.ONEOF_PATTERN,
+    cs.NodeLabel.CODE_SMELL: cs.ONEOF_CODE_SMELL,
+    cs.NodeLabel.SECURITY_ISSUE: cs.ONEOF_SECURITY_ISSUE,
+    cs.NodeLabel.GLOSS: cs.ONEOF_GLOSS,
+    cs.NodeLabel.PARAMETER: cs.ONEOF_PARAMETER,
+    cs.NodeLabel.FIELD: cs.ONEOF_FIELD,
+    cs.NodeLabel.ENUM_VARIANT: cs.ONEOF_ENUM_VARIANT,
+    cs.NodeLabel.CONSTANT: cs.ONEOF_CONSTANT,
+}
+
+ONEOF_FIELD_TO_LABEL: dict[str, cs.NodeLabel] = {
+    v: k for k, v in LABEL_TO_ONEOF_FIELD.items()
+}
+
+PATH_BASED_LABELS = frozenset({cs.NodeLabel.FOLDER, cs.NodeLabel.FILE})
+NAME_BASED_LABELS = frozenset({cs.NodeLabel.EXTERNAL_PACKAGE, cs.NodeLabel.PROJECT})
+
+
+# Endpoints plus the site-keyed props (issue #1522) that make parallel edges
+# between one node pair distinct records, mirroring MERGE_KEY_PROPS_BY_REL,
+# then the endpoint labels: the graph matches an endpoint by label and id, and
+# a TS interface and class may share one qualified name (issue #2520). Last,
+# so they only break ties and the order of every other edge is unchanged.
+_RelKey = tuple[str, int, str, tuple[tuple[str, PropertyValue], ...], str, str]
+
+_REL_TYPE_CACHE: dict = {}
+_MSG_CLASS_CACHE: dict[str, type | None] = {}
+
+
+def _message_class_for(label: str) -> type | None:
+    # The generated protobuf message class for a node label, memoised.
+    if label not in _MSG_CLASS_CACHE:
+        _MSG_CLASS_CACHE[label] = getattr(pb, label, None)
+    return _MSG_CLASS_CACHE[label]
+
+
+class ProtobufFileIngestor:
+    __slots__ = (
+        "output_dir",
+        "_nodes",
+        "_relationships",
+        "split_index",
+        "_repo_prefix",
+        "_unflushed",
+    )
+
+    def __init__(
+        self,
+        output_path: str,
+        split_index: bool = False,
+        repo_path: str | None = None,
+    ):
+        self.output_dir = Path(output_path)
+        # Keyed by (label, id): a Field and a Method may share `<owner>.<name>`,
+        # and the read side (graph_diff._node_key) identifies a node by payload
+        # kind plus identity, so the writer must too or one of the pair is lost
+        # (local review of #1899). Sorted output stays deterministic.
+        self._nodes: dict[tuple[str, str], pb.Node] = {}
+        self._relationships: dict[_RelKey, pb.Relationship] = {}
+        self.split_index = split_index
+        # File/Folder identities are ABSOLUTE paths in the live graph (the
+        # realtime watcher deletes by absolute path, issue #1141), which would
+        # make the artifact differ per checkout location. The canonical export
+        # relativizes every id under the repo root instead (issue #1138).
+        self._repo_prefix = (
+            str(Path(repo_path).resolve()).replace("\\", "/").rstrip("/") + "/"
+            if repo_path
+            else None
+        )
+        # The updater flushes more than once per run and the artifact is
+        # rewritten whole each time, so a flush with nothing new since the
+        # last one rewrote the same bytes and reported the write again
+        # (issue #2401). True until the first write, so an empty index is
+        # still written.
+        self._unflushed = True
+        logger.info(ls.PROTOBUF_INIT.format(path=self.output_dir))
+
+    def _canonical_ref(self, value: str) -> str:
+        # Separator-normalized prefix strip: Windows writers hand native
+        # backslash paths while the resolved prefix and POSIX writers use
+        # forward slashes, so both sides normalize before the comparison and
+        # the artifact always carries forward-slash relative ids.
+        if self._repo_prefix is None:
+            return value
+        normalized = value.replace("\\", "/")
+        if normalized.startswith(self._repo_prefix):
+            return normalized[len(self._repo_prefix) :]
+        # Already-relative Windows ids (src\main.py) must also serialize with
+        # forward slashes or the artifact bytes differ per OS; source-derived
+        # identities are the same text on every OS, so this normalization is
+        # itself deterministic.
+        return normalized
+
+    def _get_node_id(self, label: cs.NodeLabel, properties: PropertyDict) -> str:
+        if label in PATH_BASED_LABELS:
+            return self._canonical_ref(str(properties.get(cs.KEY_PATH, "")))
+        if label in NAME_BASED_LABELS:
+            return str(properties.get(cs.KEY_NAME, ""))
+        return str(properties.get(cs.KEY_QUALIFIED_NAME, ""))
+
+    def ensure_node_batch(self, label: str, properties: PropertyDict) -> None:
+        self._unflushed = True
+        node_label = cs.NodeLabel(label)
+        node_id = self._get_node_id(node_label, properties)
+        if not node_id:
+            return
+
+        payload_field_name = LABEL_TO_ONEOF_FIELD.get(node_label)
+        if not payload_field_name:
+            logger.warning(ls.PROTOBUF_NO_ONEOF_MAPPING.format(label=label))
+            return
+
+        # Repeated ensures of one node MERGE, mirroring the graph sink's
+        # `MERGE ... SET n += props`: a later batch may carry properties
+        # the first did not (the Rust cfg(test) declaration record lands
+        # after the module's own node, issue #1010). Each provided key
+        # replaces the stored value wholesale, lists included. The slot is
+        # per LABEL, so a same-named node of another label (Rust `mod run`
+        # and `fn run`; a Field and a Method) has its own record rather than
+        # being dropped as a cross-label writer.
+        node_key = (node_label, node_id)
+        if (existing := self._nodes.get(node_key)) is not None:
+            payload_message = getattr(existing, payload_field_name)
+        else:
+            if not _message_class_for(label):
+                logger.warning(ls.PROTOBUF_NO_MESSAGE_CLASS.format(label=label))
+                return
+            node = pb.Node()
+            payload_message = getattr(node, payload_field_name)
+            self._nodes[node_key] = node
+
+        self._assign_payload_fields(payload_message, properties)
+
+    def update_node_properties(self, label: str, properties: PropertyDict) -> None:
+        # A node already held takes the given keys; one never written stays
+        # absent, as a graph `MATCH ... SET` matches nothing, rather than
+        # appearing as a record that carries only these keys.
+        node_label = cs.NodeLabel(label)
+        payload_field_name = LABEL_TO_ONEOF_FIELD.get(node_label)
+        node = self._nodes.get((node_label, self._get_node_id(node_label, properties)))
+        if node is None or payload_field_name is None:
+            return
+        self._unflushed = True
+        self._assign_payload_fields(getattr(node, payload_field_name), properties)
+
+    def _assign_payload_fields(
+        self, payload_message: Message, properties: PropertyDict
+    ) -> None:
+        for key, value in properties.items():
+            if value is not None and hasattr(payload_message, key):
+                self._assign_payload_field(payload_message, key, value)
+
+    def _assign_payload_field(
+        self, payload_message: Message, key: str, value: PropertyValue
+    ) -> None:
+        if key == cs.KEY_PATH and isinstance(value, str):
+            # The payload path must match the node's canonical id: writers
+            # already emit repo-relative paths here, but the export enforces it
+            # so an absolute writer path can never make the artifact
+            # checkout-specific.
+            value = self._canonical_ref(value)
+        destination_attribute = getattr(payload_message, key)
+        if hasattr(destination_attribute, "extend") and isinstance(value, list):
+            del destination_attribute[:]
+            destination_attribute.extend(value)
+        else:
+            setattr(payload_message, key, value)
+
+    def ensure_relationship_batch(
+        self,
+        from_spec: tuple[str, str, PropertyValue],
+        rel_type: str,
+        to_spec: tuple[str, str, PropertyValue],
+        properties: PropertyDict | None = None,
+    ) -> None:
+        self._unflushed = True
+        if rel_type in _REL_TYPE_CACHE:
+            rel_type_enum = _REL_TYPE_CACHE[rel_type]
+        else:
+            resolved = getattr(pb.Relationship.RelationshipType, rel_type, None)
+            if resolved is None:
+                logger.warning(ls.PROTOBUF_UNKNOWN_REL_TYPE.format(rel_type=rel_type))
+                resolved = (
+                    pb.Relationship.RelationshipType.RELATIONSHIP_TYPE_UNSPECIFIED
+                )
+            rel_type_enum = resolved
+            _REL_TYPE_CACHE[rel_type] = rel_type_enum
+
+        from_label, _, from_val_raw = from_spec
+        to_label, _, to_val_raw = to_spec
+
+        from_val = (
+            self._canonical_ref(str(from_val_raw)) if from_val_raw is not None else ""
+        )
+        to_val = self._canonical_ref(str(to_val_raw)) if to_val_raw is not None else ""
+
+        # Site-keyed edges (one CALLS per call site, one IMPORTS per bound
+        # name; issue #1522) are distinct records, mirroring the graph sink's
+        # MERGE key; a row without a site still collapses on its endpoints.
+        site_key = tuple(
+            (key, properties[key])
+            for key in cs.MERGE_KEY_PROPS_BY_REL.get(rel_type, ())
+            if properties and key in properties
+        )
+        unique_key = (
+            from_val,
+            rel_type_enum,
+            to_val,
+            site_key,
+            str(from_label),
+            str(to_label),
+        )
+        if unique_key in self._relationships:
+            if properties:
+                self._relationships[unique_key].properties.update(properties)
+            return
+
+        if not from_val.strip() or not to_val.strip():
+            logger.warning(
+                ls.PROTOBUF_INVALID_REL.format(source_id=from_val, target_id=to_val)
+            )
+            return
+
+        rel = pb.Relationship()
+        rel.type = rel_type_enum
+        rel.source_id = from_val
+        rel.source_label = str(from_label)
+        rel.target_id = to_val
+        rel.target_label = str(to_label)
+        if properties:
+            rel.properties.update(properties)
+        self._relationships[unique_key] = rel
+
+    def _sorted_nodes(self) -> list[pb.Node]:
+        # Canonical order (issue #1138): the map is keyed on (label, id), a
+        # total order even where two labels share an id; insertion order
+        # (parse order) must never leak into the artifact bytes.
+        return [node for _key, node in sorted(self._nodes.items())]
+
+    def _sorted_relationships(self) -> list[pb.Relationship]:
+        # The map key leads with (source_id, type, target_id): a deterministic
+        # total order with the type enum's integer as the middle tiebreak.
+        return [rel for _key, rel in sorted(self._relationships.items())]
+
+    def _write_layout(
+        self,
+        written: dict[str, bytes],
+        stale: tuple[str, ...],
+    ) -> None:
+        # The two layouts are mutually exclusive: a leftover file from the
+        # other one beside a fresh index would double every manifest coverage
+        # count, so publishing a layout always unlinks the other's files.
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        for name, payload in written.items():
+            with open(self.output_dir / name, "wb") as f:
+                f.write(payload)
+        for name in stale:
+            (self.output_dir / name).unlink(missing_ok=True)
+
+        logger.success(
+            ls.PROTOBUF_FLUSH_SUCCESS.format(
+                nodes=len(self._nodes),
+                rels=len(self._relationships),
+                path=self.output_dir,
+            )
+        )
+
+    def _flush_joint(self) -> None:
+        index = pb.GraphCodeIndex()
+        index.nodes.extend(self._sorted_nodes())
+        index.relationships.extend(self._sorted_relationships())
+
+        self._write_layout(
+            {cs.PROTOBUF_INDEX_FILE: index.SerializeToString(deterministic=True)},
+            (cs.PROTOBUF_NODES_FILE, cs.PROTOBUF_RELS_FILE),
+        )
+
+    def _flush_split(self) -> None:
+        nodes_index = pb.GraphCodeIndex()
+        rels_index = pb.GraphCodeIndex()
+        nodes_index.nodes.extend(self._sorted_nodes())
+        rels_index.relationships.extend(self._sorted_relationships())
+
+        self._write_layout(
+            {
+                cs.PROTOBUF_NODES_FILE: nodes_index.SerializeToString(
+                    deterministic=True
+                ),
+                cs.PROTOBUF_RELS_FILE: rels_index.SerializeToString(deterministic=True),
+            },
+            (cs.PROTOBUF_INDEX_FILE,),
+        )
+
+    def flush_all(self) -> None:
+        if not self._unflushed:
+            logger.debug(ls.PROTOBUF_FLUSH_UNCHANGED.format(path=self.output_dir))
+            return
+        logger.info(ls.PROTOBUF_FLUSHING.format(path=self.output_dir))
+        self._flush_split() if self.split_index else self._flush_joint()
+        self._unflushed = False

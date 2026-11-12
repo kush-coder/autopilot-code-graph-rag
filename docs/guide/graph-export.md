@@ -1,0 +1,158 @@
+---
+description: "Export the Code-Graph-RAG knowledge graph to JSON for programmatic analysis and integration."
+---
+
+# Graph Export
+
+Export the knowledge graph, or chosen projects in it, to JSON for programmatic access and integration with other tools.
+
+## Export Commands
+
+**Export one repository's graph while syncing it:**
+
+```bash
+cgr start --repo-path /path/to/repo --update-graph -o my_graph.json
+```
+
+![cgr start --repo-path requests --update-graph -o my_graph.json syncing psf/requests and exporting only its project](../assets/demos/graph-export-start.gif)
+
+The file holds only that repository's project, scoped the way
+`cgr export --project` scopes it (below), even when the shared graph
+holds other projects.
+
+**Export the whole shared graph (every indexed project):**
+
+```bash
+cgr export -o my_graph.json
+```
+
+![cgr export -o my_graph.json exporting the whole shared graph, which holds four projects](../assets/demos/graph-export.gif)
+
+**Export one project, several, or a workspace:**
+
+```bash
+cgr export -o my_project.json --project my-project
+cgr export -o two.json -p api -p web
+cgr export -o shop.json --workspace shop
+```
+
+![cgr export scoped to one project, to two projects with -n, and to the shop workspace, with jq printing each file's metadata.projects](../assets/demos/graph-export-projects.gif)
+
+*Real project names carry a path hash; the `shop` workspace holds the `shop` and `myproj` repositories.*
+
+A project's export holds what the project owns (its folders, files, modules
+and definitions), the relationships that start there, and the nodes those
+relationships reach, such as a shared external module, so every relationship
+in the file has both ends in it. A shared `Resource` node is never owned, so
+the links that start at one, a client URL's `RESOLVES_TO` to an endpoint or
+an env var's `FLOWS_TO` into a URL, are added when both of their ends are in
+the file: export a client together with its server and the calls between
+them are kept. The file lists its projects under `metadata.projects`.
+
+## Working with Exported Data
+
+```python
+from codebase_rag.graph_loader import load_graph
+
+graph = load_graph("my_graph.json")
+
+summary = graph.summary()
+print(f"Total nodes: {summary['total_nodes']}")
+print(f"Total relationships: {summary['total_relationships']}")
+
+functions = graph.find_nodes_by_label("Function")
+classes = graph.find_nodes_by_label("Class")
+
+for func in functions[:5]:
+    relationships = graph.get_relationships_for_node(func.node_id)
+    print(f"Function {func.properties['name']} has {len(relationships)} relationships")
+```
+
+![python analyse.py running the snippet above against an exported graph and printing the totals and five functions](../assets/demos/graph-export-sdk.gif)
+
+*`analyse.py` holds the snippet above, unchanged.*
+
+## Example Analysis Script
+
+```bash
+python examples/graph_export_example.py my_graph.json
+```
+
+![python examples/graph_export_example.py summarising the exported graph: relationship counts, example functions and classes](../assets/demos/graph-export-example.gif)
+
+*Run from the code-graph-rag checkout with `LOGURU_FORMAT='{message}'` set to drop the log prefixes.*
+
+## Use Cases
+
+Exported graph data is useful for:
+
+- Integration with other tools
+- Custom analysis scripts
+- Building documentation generators
+- Creating code metrics dashboards
+
+See the [Python SDK](../sdk/overview.md) for more programmatic access patterns.
+
+## Canonical index and provenance manifest
+
+`cgr index` writes a canonical artifact: nodes and relationships are sorted
+(node id; then source id, relationship type, target id) and serialized with
+deterministic protobuf encoding, and every File/Folder identity is
+repo-relative. Two exports of the same source state with the same analyzer
+version and capture configuration are byte-identical, wherever the repo is
+checked out.
+
+Alongside the artifacts, `manifest.json` records the provenance: the source
+commit and a dirty-tree flag (null when the target is not a git repository),
+the analyzer version, the sha256 of the codec schema, the capture
+configuration, a sha256 per artifact, and a per-language coverage summary
+(module counts and `flow_covered` totals) computed from the artifact itself,
+so the claims can never drift from the content. The `created_at` timestamp is
+metadata only and participates in no hash.
+
+Verify an index against its manifest:
+
+```bash
+cgr verify-index -i ./index-dir
+# Anchored to an attestation-vouched manifest digest:
+cgr verify-index -i ./index-dir --trusted-manifest-sha256 <digest>
+```
+
+![cgr index --repo-path requests -o ./index-dir writing index.bin and manifest.json, jq showing the manifest's source, artifact hash and coverage, and cgr verify-index passing](../assets/demos/graph-export-index.gif)
+
+![cgr verify-index passing with --trusted-manifest-sha256, then failing with an artifact hash mismatch after index.bin is tampered with](../assets/demos/graph-export-verify.gif)
+
+Local verification alone proves internal consistency; a writer who can
+replace both an artifact and its recorded hash defeats it. Passing the
+manifest digest an attestation vouches for anchors the whole chain: manifest
+bytes, then artifact hashes, then artifacts.
+
+Verification fails when an artifact is missing or its hash mismatches, when an
+artifact is not covered by the manifest, or when the manifest's coverage
+summary disagrees with the graph content. In CI, attesting `manifest.json`
+(GitHub artifact attestation) extends the chain to a signer identity: the
+attestation proves who produced the manifest, and the manifest proves which
+artifact bytes and source state it belongs to.
+
+## Snapshot diff
+
+Compare two canonical snapshots structurally:
+
+```bash
+cgr diff-index --old ./snapshot-a --new ./snapshot-b
+cgr diff-index --old ./snapshot-a --new ./snapshot-b --json-out delta.json
+```
+
+![cgr diff-index reporting two added functions, their DEFINES edges and a new CALLS edge, then writing the same delta with --json-out](../assets/demos/graph-export-diff.gif)
+
+*`snapshot-a` and `snapshot-b` were written with `cgr index` before and after adding two functions to a small repository.*
+
+Nodes match on kind plus identity plus path (path included because a
+qualified name alone is not unique in the Rust cfg-twin cases) and report as
+added, removed, or changed with a property-level delta; relationships group
+by type with added/removed endpoints and property changes; the coverage
+section lists modules whose `flow_covered` flipped and per-language summary
+changes, so a diff can also say the analyzer sees less than it used to.
+Renames report as remove plus add in this first cut. Artifacts recorded
+under different codec schemas refuse to diff (exit 2): field semantics may
+differ between schema versions, so the comparison would be meaningless.

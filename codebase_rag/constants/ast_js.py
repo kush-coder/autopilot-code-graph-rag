@@ -1,0 +1,604 @@
+# JavaScript/TypeScript tree-sitter node types, queries, and captures.
+
+from .ast_nodes import (
+    TS_CALL_EXPRESSION,
+    TS_CLASS_DECLARATION,
+    TS_IDENTIFIER,
+    TS_INTERFACE_DECLARATION,
+    TS_MEMBER_EXPRESSION,
+    TS_NEW_EXPRESSION,
+    TS_STRING,
+    TS_TYPE_ALIAS_DECLARATION,
+)
+
+# Locals query patterns for JS/TS
+JS_LOCALS_PATTERN = """
+; Variable definitions
+(variable_declarator name: (identifier) @local.definition)
+(function_declaration name: (identifier) @local.definition)
+(class_declaration name: (identifier) @local.definition)
+
+; Variable references
+(identifier) @local.reference
+"""
+
+TS_LOCALS_PATTERN = """
+; Variable definitions (TypeScript has multiple declaration types)
+(variable_declarator name: (identifier) @local.definition)
+(lexical_declaration (variable_declarator name: (identifier) @local.definition))
+(variable_declaration (variable_declarator name: (identifier) @local.definition))
+
+; Function definitions
+(function_declaration name: (identifier) @local.definition)
+
+; Class definitions (uses type_identifier for class names)
+(class_declaration name: (type_identifier) @local.definition)
+
+; Variable references
+(identifier) @local.reference
+"""
+
+# Receivers that address the MODULE itself in CommonJS code (`exports.render()`,
+# `module.exports.x()`, prototype-pattern `this`): only these bind a dotted call
+# to a same-module free function; `view.render()` is an instance call.
+JS_MODULE_RECEIVERS = frozenset({"exports", "module", "this"})
+# A chained call's receiver written as a construction (`new Box()`,
+# `(new Box())`): only text that reads `new` once these are stripped is
+# looked up in the file's tree to see whether it IS a construction (#2465).
+JS_NEW_KEYWORD = "new"
+JS_RECEIVER_LEADING_CHARS = "( \t\r\n"
+# The directive that makes a script or function strict, where a function
+# declared in a block is scoped to that block (no Annex B hoisting).
+JS_USE_STRICT_DIRECTIVE = "use strict"
+# `this.` receiver prefix of a call name; a prototype-assigned function
+# (`Date.prototype.strftime`) dispatches such calls to a sibling method of
+# the same prototype target before the module-receiver fallback applies.
+JS_THIS_CALL_PREFIX = "this."
+
+JS_TS_PARENT_REF_TYPES = (TS_IDENTIFIER, TS_MEMBER_EXPRESSION)
+# The `*` of `export * from './m'`. The JavaScript and TypeScript grammars
+# spell it as an anonymous token, not Java's named `asterisk` node.
+TS_JS_STAR = "*"
+# TypeScript's CommonJS export (`export = value`) is an export_statement whose
+# token after `export` is `=`.
+TS_EXPORT_ASSIGNMENT_TOKEN = "="
+# A type-only export (`export type { T }`, `export interface I`) is erased at
+# runtime, so it says nothing about the module's value exports.
+TS_TYPE_ONLY_TOKEN = "type"
+TS_TYPE_ONLY_EXPORT_DECLARATIONS = frozenset(
+    {TS_INTERFACE_DECLARATION, TS_TYPE_ALIAS_DECLARATION}
+)
+# The callee node of a dynamic `import("./x")`.
+TS_JS_DYNAMIC_IMPORT = "import"
+# Every statement that is a call, awaited or not, at any depth: where a
+# `require("./db");` or `import("./cache");` whose value is dropped sits
+# (issue #3267).
+JS_CALL_STATEMENT_QUERY = (
+    "(expression_statement [(call_expression) (await_expression) "
+    "(unary_expression)]) @statement"
+)
+# `void import("./cache")` discards the promise as a bare call does.
+JS_VOID_OPERATOR = "void"
+# `createRequire(import.meta.url)` (node:module) makes a CommonJS loader.
+JS_CREATE_REQUIRE = "createRequire"
+JS_NODE_MODULE_SPECIFIERS = frozenset({"module", "node:module"})
+CAPTURE_JS_CALL_STATEMENT = "statement"
+# What a `createRequire` loader resolves from: the module's own file when it
+# is given `import.meta.url`, `import.meta.filename` or CommonJS's
+# `__filename`, or the file a `new URL("../plugins/entry.js",
+# import.meta.url)` names. `import.meta`'s first token tells it from the
+# other meta property, `new.target`.
+TS_JS_IMPORT_META_KEYWORD = "import"
+JS_IMPORT_META_URL_PROPERTIES = frozenset({"url"})
+JS_IMPORT_META_FILE_PROPERTIES = JS_IMPORT_META_URL_PROPERTIES | {"filename"}
+JS_IMPORT_META_DIRECTORY_PROPERTIES = frozenset({"dirname"})
+JS_FILENAME_GLOBAL = "__filename"
+JS_DIRNAME_GLOBAL = "__dirname"
+JS_URL_CONSTRUCTOR = "URL"
+JS_NODE_URL_SPECIFIERS = frozenset({"url", "node:url"})
+JS_URL_LOCATION_CONVERTERS = ("fileURLToPath", "pathToFileURL")
+# A `new URL()` input that is not a plain relative path: a scheme, a query, a
+# fragment, a percent escape, or a backslash the URL parser reads as `/`.
+JS_URL_NON_PATH_CHARACTERS = frozenset(":?#%\\")
+# JSX element nodes that carry a component name (javascript and tsx grammars
+# share these); the closing element repeats the name and must not double-emit.
+TS_JSX_SELF_CLOSING_ELEMENT = "jsx_self_closing_element"
+TS_JSX_OPENING_ELEMENT = "jsx_opening_element"
+# A JSX element with children, its closing tag, and the fields that hold the
+# two tags' names: a rename rewrites the closing tag with the opening one,
+# which is the only one the graph records (issue #2811).
+TS_JSX_ELEMENT = "jsx_element"
+TS_JSX_CLOSING_ELEMENT = "jsx_closing_element"
+FIELD_JSX_CLOSE_TAG = "close_tag"
+# The `{...}` wrapper around an expression in a JSX attribute value or child
+# (`onClick={handleLogout}`, `onClick={() => x()}`); its inner expression can
+# hand a function to the element as a prop.
+TS_JSX_EXPRESSION = "jsx_expression"
+
+# TS "cast" wrappers transparent for reference resolution: `x as T`,
+# `x satisfies T`, and non-null `x!`. Their first named child is the wrapped
+# value, so unwrapping reaches the referenced expression
+# (`persistImpl as unknown as Persist`).
+TS_AS_EXPRESSION = "as_expression"
+TS_SATISFIES_EXPRESSION = "satisfies_expression"
+TS_NON_NULL_EXPRESSION = "non_null_expression"
+TS_CAST_WRAPPER_TYPES = frozenset(
+    {TS_AS_EXPRESSION, TS_SATISFIES_EXPRESSION, TS_NON_NULL_EXPRESSION}
+)
+# The angle-bracket cast `<T>x`: transparent too, but its value is its LAST
+# named child (the first is the type).
+TS_TYPE_ASSERTION = "type_assertion"
+
+# JS/TS ingest node types
+TS_PAIR = "pair"
+TS_OBJECT = "object"
+TS_TEMPLATE_STRING = "template_string"
+TS_TEMPLATE_SUBSTITUTION = "template_substitution"
+TS_ARRAY = "array"
+
+# When a variable_declarator's value is one of these, the variable binds the
+# call/construction RESULT, not a function, so an arrow inside its arguments
+# (`const m = useMutation({fn: () => {}})`) must not inherit the variable's
+# name; arrows nested under a const-bound object still take the object's name.
+JS_CALL_RESULT_VALUE_TYPES = frozenset({TS_CALL_EXPRESSION, TS_NEW_EXPRESSION})
+TS_FUNCTION_EXPRESSION = "function_expression"
+# The `get` accessor keyword prefixing a getter `method_definition`
+# (`get thing() {...}`); its presence marks the method as a property whose
+# reads are member accesses, not invocations.
+TS_GET_ACCESSOR_KEYWORD = "get"
+TS_SET_ACCESSOR_KEYWORD = "set"
+TS_ARROW_FUNCTION = "arrow_function"
+TS_REQUIRED_PARAMETER = "required_parameter"
+TS_OPTIONAL_PARAMETER = "optional_parameter"
+# TypeScript `this` pseudo-parameter (`function f(this: T, ...)`): a type-only
+# annotation, not a runtime argument, so it occupies no positional slot.
+TS_THIS_PARAMETER = "this"
+TS_ASSIGNMENT_PATTERN = "assignment_pattern"
+TS_JS_ASSIGNMENT_EXPRESSION = "assignment_expression"
+# A class field holding a value (`log = noop`); `name` is the property, `value`
+# is the initializer. Used to reference a NAMED function a field binds.
+TS_PUBLIC_FIELD_DEFINITION = "public_field_definition"
+# `x += v` and friends: reads the old value AND writes the new one.
+TS_JS_AUGMENTED_ASSIGNMENT_EXPRESSION = "augmented_assignment_expression"
+# `x++` / `--x`: also a read-then-write; the operand is the `argument` field.
+TS_JS_UPDATE_EXPRESSION = "update_expression"
+TS_JS_FIELD_ARGUMENT = "argument"
+TS_FIELD_PATTERN = "pattern"
+TS_FIELD_PARAMETER = "parameter"
+TS_FIELD_INITIALIZER = "initializer"
+TS_MODULE = "module"
+TS_CLASS_BODY = "class_body"
+
+TS_PROPERTY_IDENTIFIER = "property_identifier"
+# A TypeScript enum's members (issue #2583): the body holds each bare member
+# as a `property_identifier` child and each `Name = value` member as an
+# `enum_assignment` with `name` and `value` fields.
+TS_JS_ENUM_BODY = "enum_body"
+TS_JS_ENUM_ASSIGNMENT = "enum_assignment"
+# A quoted member's name is the string the runtime reads, so its escapes are
+# decoded: `\uXXXX`, `\u{X}` and `\xXX` name a code point, a backslash before
+# a line terminator continues the line, these letters stand for control
+# characters, and any other escaped character is itself.
+JS_HEX_ESCAPE_PREFIXES = frozenset({"u", "x"})
+JS_LINE_CONTINUATIONS = frozenset({"\n", "\r\n", "\r", "\u2028", "\u2029"})
+JS_CHAR_ESCAPES: dict[str, str] = {
+    "b": "\b",
+    "f": "\f",
+    "n": "\n",
+    "r": "\r",
+    "t": "\t",
+    "v": "\v",
+    "0": "\0",
+}
+# Escapes name UTF-16 code units, so a surrogate pair joins into one character.
+JS_STRING_ENCODING = "utf-16"
+# `[expr]` as an object-literal / class-member key.
+TS_JS_COMPUTED_PROPERTY_NAME = "computed_property_name"
+# The `(a, b = 1, ...rest)` parameter list of a function.
+TS_JS_FORMAL_PARAMETERS = "formal_parameters"
+# A class field in the JS grammar (`[k] = v` in a class body); TS spells it
+# public_field_definition. Its key sits in the `property` field.
+TS_JS_FIELD_DEFINITION = "field_definition"
+# The Symbol global: `Symbol('x')` / `Symbol.for('x')` mint the unique keys
+# that symbol-keyed member dispatch (issue #989) indexes.
+JS_SYMBOL_GLOBAL = "Symbol"
+
+# JS prototype property keywords
+JS_PROTOTYPE_KEYWORD = "prototype"
+JS_OBJECT_NAME = "Object"
+JS_CREATE_METHOD = "create"
+# `Object.assign(module.exports, { Svc })` publishes the keys it copies.
+JS_OBJECT_ASSIGN_METHOD = "assign"
+# The other `Object` calls the CommonJS export reader models.
+JS_OBJECT_FREEZE_METHOD = "freeze"
+JS_OBJECT_DEFINE_PROPERTY_METHOD = "defineProperty"
+# What the CommonJS export reader (`js_ts.commonjs_exports`) must recognise
+# to keep a module's exports knowable: a read of `exports` through `typeof`
+# or an equality test, and the constructs that hide a write from it.
+TS_JS_UNARY_EXPRESSION = "unary_expression"
+TS_JS_THIS = "this"
+TS_JS_ASYNC_KEYWORD = "async"
+JS_TYPEOF_OPERATOR = "typeof"
+JS_DELETE_OPERATOR = "delete"
+JS_EQUALITY_OPERATORS = frozenset({"===", "!==", "==", "!="})
+JS_ARGUMENTS_NAME = "arguments"
+JS_EVAL_NAME = "eval"
+
+# JS/TS ingest query capture names
+CAPTURE_CHILD_CLASS = "child_class"
+CAPTURE_PARENT_CLASS = "parent_class"
+CAPTURE_CONSTRUCTOR_NAME = "constructor_name"
+CAPTURE_PROTOTYPE_KEYWORD = "prototype_keyword"
+CAPTURE_METHOD_NAME = "method_name"
+CAPTURE_METHOD_FUNCTION = "method_function"
+CAPTURE_MEMBER_EXPR = "member_expr"
+CAPTURE_FUNCTION_EXPR = "function_expr"
+CAPTURE_ARROW_FUNCTION = "arrow_function"
+
+# JS prototype inheritance query
+JS_PROTOTYPE_INHERITANCE_QUERY = """
+(assignment_expression
+  left: (member_expression
+    object: (identifier) @child_class
+    property: (property_identifier) @prototype (#eq? @prototype "prototype"))
+  right: (call_expression
+    function: (member_expression
+      object: (identifier) @object_name (#eq? @object_name "Object")
+      property: (property_identifier) @create_method (#eq? @create_method "create"))
+    arguments: (arguments
+      (member_expression
+        object: (identifier) @parent_class
+        property: (property_identifier) @parent_prototype (#eq? @parent_prototype "prototype")))))
+"""
+
+# JS prototype method assignment query
+JS_PROTOTYPE_METHOD_QUERY = """
+(assignment_expression
+  left: (member_expression
+    object: (member_expression
+      object: (identifier) @constructor_name
+      property: (property_identifier) @prototype_keyword (#eq? @prototype_keyword "prototype"))
+    property: (property_identifier) @method_name)
+  right: [(function_expression) (generator_function)] @method_function)
+"""
+
+# JS object method query
+JS_OBJECT_METHOD_QUERY = """
+(pair
+  key: (property_identifier) @method_name
+  value: [(function_expression) (generator_function)] @method_function)
+"""
+
+# JS method definition query
+JS_METHOD_DEF_QUERY = """
+(object
+  (method_definition
+    name: (property_identifier) @method_name) @method_function)
+"""
+
+# JS object arrow function query
+JS_OBJECT_ARROW_QUERY = """
+(object
+  (pair
+    (property_identifier) @method_name
+    (arrow_function) @arrow_function))
+"""
+
+# JS assignment arrow function query
+JS_ASSIGNMENT_ARROW_QUERY = """
+(assignment_expression
+  (member_expression) @member_expr
+  (arrow_function) @arrow_function)
+"""
+
+# JS assignment function expression query
+JS_ASSIGNMENT_FUNCTION_QUERY = """
+(assignment_expression
+  (member_expression) @member_expr
+  [(function_expression) (generator_function)] @function_expr)
+"""
+
+# JS/TS control-flow node types + fields for the path-sensitive taint walk
+# (issue #714 follow-up). Each if/else, loop, and try branch is evaluated against
+# a COPY of the incoming taint state and unioned at the merge, so taint surviving
+# on ANY path survives and a kill counts only when it happens on EVERY path. The
+# values coincide with the Python grammar's but stay JS-scoped per the per-language
+# constants convention.
+TS_JS_IF_STATEMENT = "if_statement"
+# Switch family: cases may fall through into the next case.
+TS_JS_SWITCH_STATEMENT = "switch_statement"
+TS_JS_SWITCH_CASE = "switch_case"
+TS_JS_SWITCH_DEFAULT = "switch_default"
+# `c ? a : b` (shared name with the Java grammar); C++ spells it
+# conditional_expression.
+TS_JS_TERNARY_EXPRESSION = "ternary_expression"
+# tree-sitter-javascript parses `await (X)()` as a CALL to an identifier
+# spelled `await` with X as its argument (the TS grammar does not); climbs
+# treat that call as the transparent await it denotes.
+JS_AWAIT_IDENTIFIER = "await"
+# tree-sitter-typescript binds `await` / a unary operator tighter than a call
+# with type arguments: `await f<T>(x)` is a call whose `function` is the
+# await_expression `await f` (issue #2930).
+TS_JS_AWAIT_EXPRESSION = "await_expression"
+TS_JS_UNARY_EXPRESSION = "unary_expression"
+TS_JS_FIELD_TYPE_ARGUMENTS = "type_arguments"
+TS_JS_PREFIXED_CALLEES = frozenset({TS_JS_AWAIT_EXPRESSION, TS_JS_UNARY_EXPRESSION})
+# Short-circuit operators whose result IS one of the operands, so a
+# bind through them unions both operands' taints.
+JS_SHORT_CIRCUIT_OPERATORS: frozenset[str] = frozenset({"||", "??", "&&"})
+# The computed-name leaf prefix of a well-known-symbol class member
+# (`[Symbol.iterator]`, `[Symbol.toStringTag]`) as the definition pass
+# registers it; user symbol keys register without the `Symbol.` path.
+JS_WELL_KNOWN_SYMBOL_NAME_PREFIX = "[Symbol."
+JS_COMPUTED_NAME_PREFIX = "["
+JS_COMPUTED_NAME_SUFFIX = "]"
+JS_WELL_KNOWN_SYMBOL_BRACKET_PREFIX = "[Symbol["
+JS_SYMBOL_FOR_PREFIX = "for("
+JS_STRING_QUOTES = "'\""
+# Registry symbols whose members RUNTIMES invoke themselves; an
+# application-defined Symbol.for(...) key is reached only by visible code.
+JS_RUNTIME_REGISTRY_SYMBOL_KEYS = frozenset(
+    {
+        "nodejs.util.inspect.custom",
+        "nodejs.rejection",
+    }
+)
+# `&&` alone among them cannot yield its LEFT operand as a function value.
+JS_OPERATOR_LOGICAL_AND = "&&"
+TS_JS_ELSE_CLAUSE = "else_clause"
+TS_JS_WHILE_STATEMENT = "while_statement"
+TS_JS_FOR_STATEMENT = "for_statement"
+TS_JS_FOR_IN_STATEMENT = "for_in_statement"
+TS_JS_TRY_STATEMENT = "try_statement"
+TS_JS_CATCH_CLAUSE = "catch_clause"
+# `(a, b)`: the comma operator; its value is the LAST operand.
+TS_JS_SEQUENCE_EXPRESSION = "sequence_expression"
+TS_JS_SWITCH_BODY = "switch_body"
+# `for (var x of xs)` hoists x to the function; only this `kind` widens the
+# loop binding's scope past the for statement itself.
+TS_JS_VAR_KIND = "var"
+TS_JS_FINALLY_CLAUSE = "finally_clause"
+FIELD_ALTERNATIVE = "alternative"
+FIELD_CONSEQUENCE = "consequence"
+FIELD_HANDLER = "handler"
+FIELD_FINALIZER = "finalizer"
+# The C-style `for (init; cond; increment)` update clause, which runs AFTER the
+# body each iteration, so taint the body carries into it reaches the next one.
+FIELD_INCREMENT = "increment"
+
+# JS/TS module system node types
+TS_TYPE_ANNOTATION = "type_annotation"
+# TypeScript type-annotation shapes (issue #1303). Arrays and array-shaped
+# generics carry their element in the canonical `list[<element>]` marker,
+# which only for-of loop-variable inference unwraps.
+TS_ARRAY_TYPE = "array_type"
+TS_GENERIC_TYPE = "generic_type"
+TS_UNION_TYPE = "union_type"
+TS_TYPE_IDENTIFIER = "type_identifier"
+TS_NESTED_TYPE_IDENTIFIER = "nested_type_identifier"
+# What a TS `implements` or interface `extends` entry may name (issue #2560):
+# a bare type, or a namespace member (`r.Plain`). A generic_type (`Router<T>`)
+# names one of these through its `name` field.
+TS_HERITAGE_TYPE_NAME_TYPES = (TS_TYPE_IDENTIFIER, TS_NESTED_TYPE_IDENTIFIER)
+TS_JS_OPERATOR_OF = "of"
+TS_NULLISH_TYPE_TEXTS = frozenset({"null", "undefined"})
+TS_ARRAY_GENERIC_NAMES = frozenset(
+    {"Array", "ReadonlyArray", "Set", "Iterable", "IterableIterator"}
+)
+JS_LIST_TYPE_PREFIX = "list["
+JS_LIST_TYPE_FORMAT = "list[{element}]"
+# A fluent chain hop types from the callee's return (issue #2468). `: this`
+# names the receiver's own class. A callable carrying one of these keywords
+# does not hand the caller what its body returns: an `async` one gives a
+# Promise, a `*` generator an iterator, and an accessor is read or written as
+# a property, never called.
+TS_THIS_TYPE = "this_type"
+# What a `return this` (or `: this`) hands back before the receiver it is
+# called on is known: an instance of the receiver's class from an instance
+# method, the receiver class itself from a static one. A hop on the class
+# itself reaches only its static members.
+JS_RECEIVER_INSTANCE = "this"
+JS_CLASS_VALUE_PREFIX = "typeof "
+JS_RECEIVER_CLASS = f"{JS_CLASS_VALUE_PREFIX}{JS_RECEIVER_INSTANCE}"
+TS_CHAIN_OPAQUE_CALLABLE_KEYWORDS = frozenset({"async", "*", "get", "set"})
+TS_ACCESSOR_KEYWORDS = frozenset({"get", "set"})
+# `declare class C {}` / `declare module "x" {}`.
+TS_AMBIENT_DECLARATION = "ambient_declaration"
+# A member call's receiver declaration, read to confirm or rule out a method
+# bound only by name (issue #2609).
+TS_PREDEFINED_TYPE = "predefined_type"
+TS_TUPLE_TYPE = "tuple_type"
+TS_PARENTHESIZED_TYPE = "parenthesized_type"
+# `readonly T[]` (issue #3276).
+TS_READONLY_TYPE = "readonly_type"
+# The generic containers whose `xs[i]` is an element: indexable, unlike a
+# `Set` or an `Iterable` (issue #3276).
+TS_INDEXABLE_GENERIC_NAMES = frozenset({"Array", "ReadonlyArray"})
+# An `xs["length"]` index names the array's own property, not an element
+# (issue #3276).
+TS_PROPERTY_NAME_INDEX_TYPES = frozenset({TS_STRING, TS_TEMPLATE_STRING})
+# How deep a type alias may refer to another before the chain is abandoned:
+# `type A = B; type B = A` names nothing (issue #3276).
+TS_ALIAS_MAX_DEPTH = 8
+TS_FIELD_TYPE_ARGUMENTS = "type_arguments"
+TS_TYPE_DECLARATION_NODES = frozenset(
+    {
+        "class_declaration",
+        "abstract_class_declaration",
+        "interface_declaration",
+        "type_alias_declaration",
+        "enum_declaration",
+    }
+)
+# Utility types whose value has every member of their first type argument.
+TS_MEMBER_PRESERVING_UTILITY_TYPES = frozenset(
+    {"Readonly", "Partial", "Required", "NonNullable"}
+)
+# Utility types computing a type the declaration alone does not pin down:
+# `Pick`/`Omit` keep or drop keys, the rest map or extract. Their result may
+# or may not have a method, so they neither confirm nor rule out a binding.
+TS_UNSETTLED_UTILITY_TYPES = frozenset(
+    {
+        "Pick",
+        "Omit",
+        "Record",
+        "Exclude",
+        "Extract",
+        "ReturnType",
+        "InstanceType",
+        "Awaited",
+        "ThisType",
+        "NoInfer",
+    }
+)
+# `@param {Type} name` and `@param {Type} [name]` in a JSDoc block.
+JSDOC_PARAM_TAG_PATTERN = r"@param\s+\{([^{}]*)\}\s+\[?([A-Za-z_$][\w$]*)"
+JSDOC_TYPE_NAME_PATTERN = r"[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*"
+# `@template T` and `@template K, V`: the names a JSDoc block declares as
+# type parameters.
+JSDOC_TEMPLATE_TAG_PATTERN = (
+    r"@template\s+(?:\{[^{}]*\}\s+)?([A-Za-z_$][\w$]*(?:\s*,\s*[A-Za-z_$][\w$]*)*)"
+)
+# Nullable, non-null and optional marks around a JSDoc type name.
+JSDOC_TYPE_MODIFIER_CHARS = "?!="
+JSDOC_ANY_TYPES = frozenset({"*", "?", "any", "unknown"})
+TS_IMPORT_ALIAS = "import_alias"
+TS_JS_WITH_STATEMENT = "with_statement"
+TS_CLASS_STATIC_BLOCK = "class_static_block"
+TS_OBJECT_PATTERN = "object_pattern"
+TS_ARRAY_PATTERN = "array_pattern"
+TS_REST_PATTERN = "rest_pattern"
+# `f(...xs)`: an argument passing as many values as `xs` holds.
+TS_SPREAD_ELEMENT = "spread_element"
+# Bodiless TS declarations: an overload, an interface member, an abstract or
+# ambient one. A call matches one of possibly several such signatures.
+TS_METHOD_SIGNATURE = "method_signature"
+TS_ABSTRACT_METHOD_SIGNATURE = "abstract_method_signature"
+TS_SHORTHAND_PROPERTY_IDENTIFIER_PATTERN = "shorthand_property_identifier_pattern"
+TS_SHORTHAND_PROPERTY_IDENTIFIER = "shorthand_property_identifier"
+TS_PAIR_PATTERN = "pair_pattern"
+# `{ a = dflt }` in a destructuring pattern: `left` binds, `right` is a READ.
+TS_OBJECT_ASSIGNMENT_PATTERN = "object_assignment_pattern"
+# `process.env.X` is a member_expression; `process.env['X']` a subscript, used
+# to detect environment-variable reads (issue #714 process.env follow-up).
+TS_SUBSCRIPT_EXPRESSION = "subscript_expression"
+TS_FIELD_INDEX = "index"
+TS_FUNCTION_DECLARATION = "function_declaration"
+TS_GENERATOR_FUNCTION_DECLARATION = "generator_function_declaration"
+TS_GENERATOR_FUNCTION = "generator_function"
+
+# The callable-parameter scan (`parsers/utils.py`, and the tree bridge's port
+# of it for the interface fingerprint): the scopes that capture an enclosing
+# function's parameters, and the ones it never enters.
+JS_TS_CALLABLE_CLOSURE_TYPES = frozenset(
+    {TS_ARROW_FUNCTION, TS_FUNCTION_EXPRESSION, TS_FUNCTION_DECLARATION}
+)
+JS_TS_CALLABLE_OPAQUE_TYPES = frozenset({TS_CLASS_DECLARATION})
+# A TypeScript parameter, whose name sits in its `pattern` field.
+JS_TS_TYPED_PARAMETER_TYPES = frozenset({TS_REQUIRED_PARAMETER, TS_OPTIONAL_PARAMETER})
+
+# Tree-sitter field names for module system
+FIELD_FUNCTION = "function"
+FIELD_KEY = "key"
+
+# JS/TS module system keywords
+JS_REQUIRE_KEYWORD = "require"
+JS_EXPORTS_KEYWORD = "exports"
+JS_MODULE_KEYWORD = "module"
+# A `lexical_declaration`'s `kind`: only a `const` binding can never be
+# reassigned, which is what lets a request URL fold its value (issue #2521).
+JS_CONST_KEYWORD = "const"
+
+# JS/TS export type descriptions
+JS_EXPORT_TYPE_COMMONJS = "CommonJS Export"
+JS_EXPORT_TYPE_COMMONJS_MODULE = "CommonJS Module Export"
+JS_EXPORT_TYPE_ES6_FUNCTION = "ES6 Export Function"
+JS_EXPORT_TYPE_ES6_FUNCTION_DECL = "ES6 Export Function Declaration"
+
+# JS/TS CommonJS destructure query
+JS_COMMONJS_DESTRUCTURE_QUERY = """
+(lexical_declaration
+  (variable_declarator
+    name: (object_pattern)
+    value: (call_expression
+      function: (identifier) @func (#eq? @func "require")
+    )
+  ) @variable_declarator
+)
+"""
+
+# JS/TS CommonJS exports function query
+JS_COMMONJS_EXPORTS_FUNCTION_QUERY = """
+(assignment_expression
+  left: (member_expression
+    object: (identifier) @exports_obj
+    property: (property_identifier) @export_name)
+  right: [(function_expression) (arrow_function)] @export_function)
+"""
+
+# JS/TS CommonJS module.exports query
+# The DIRECT form `module.exports = function (...) {...}` / arrow: the whole
+# module IS one function (fastify's generated error-serializer). Two-level
+# member on the left, unlike the three-level named-property form below.
+JS_COMMONJS_DIRECT_EXPORT_QUERY = """
+(assignment_expression
+  left: (member_expression
+    object: (identifier) @module_obj
+    property: (property_identifier) @exports_prop)
+  right: [(function_expression) (arrow_function) (call_expression)] @export_function)
+"""
+
+JS_COMMONJS_MODULE_EXPORTS_QUERY = """
+(assignment_expression
+  left: (member_expression
+    object: (member_expression
+      object: (identifier) @module_obj
+      property: (property_identifier) @exports_prop)
+    property: (property_identifier) @export_name)
+  right: [(function_expression) (arrow_function)] @export_function)
+"""
+
+# JS/TS ES6 export const query
+JS_ES6_EXPORT_CONST_QUERY = """
+(export_statement
+  (lexical_declaration
+    (variable_declarator
+      name: (identifier) @export_name
+      value: [(function_expression) (arrow_function)] @export_function)))
+"""
+
+# JS/TS ES6 export function query
+JS_ES6_EXPORT_FUNCTION_QUERY = """
+(export_statement
+  [(function_declaration) (generator_function_declaration)] @export_function)
+"""
+
+# Query capture names for module system
+CAPTURE_FUNC = "func"
+CAPTURE_VARIABLE_DECLARATOR = "variable_declarator"
+CAPTURE_EXPORTS_OBJ = "exports_obj"
+CAPTURE_MODULE_OBJ = "module_obj"
+CAPTURE_EXPORTS_PROP = "exports_prop"
+CAPTURE_EXPORT_NAME = "export_name"
+CAPTURE_EXPORT_FUNCTION = "export_function"
+
+# Value nodes a call argument can be without running code, and the methods
+# through which a function is called with an explicit receiver, for
+# change_signature (issue #1908).
+TS_JS_NUMBER = "number"
+TS_JS_NULL = "null"
+TS_JS_UNDEFINED = "undefined"
+TS_JS_ACCESSOR_KEYWORDS = frozenset({"get", "set"})
+JS_RECEIVER_METHODS = frozenset({"call", "apply"})
+# `\u0061` and `\u{61}` both spell the identifier `a`, and a parameter name
+# written with escapes is refused; a direct `eval` reads locals named in a
+# string. For change_signature (issue #1908).
+JS_IDENTIFIER_ESCAPE = r"\\u\{([0-9a-fA-F]+)\}|\\u([0-9a-fA-F]{4})"
+JS_ESCAPE_MARK = "\\"
+JS_EVAL_NAME = "eval"
+# The argument passed for a default a call skips: undefined even where the
+# caller has bound the name `undefined` to something else.
+JS_SKIPPED_ARGUMENT = "void 0"
+# A function body opening with either of these, exactly as written, runs in
+# strict mode, and JavaScript then refuses a default among its parameters.
+JS_USE_STRICT_DIRECTIVES = frozenset({"'use strict'", '"use strict"'})

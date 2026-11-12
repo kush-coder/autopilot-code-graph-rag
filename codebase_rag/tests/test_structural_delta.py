@@ -1,0 +1,1752 @@
+# Structural delta after a write (issue #1525): the touched files' subgraph
+# is read before and after the scoped re-ingest and the difference reported
+# as dangling callers, signature changes with per-site arity verdicts, new
+# duplicates, new import cycles and the tests reaching the changed symbols.
+# The graph is the in-memory stateful ingestor the reingest tests use, which
+# answers the delta's fixed queries from its node and edge tables.
+
+from __future__ import annotations
+
+import subprocess
+from pathlib import Path
+from typing import cast
+from unittest.mock import MagicMock, patch
+
+import pytest
+from typer.testing import CliRunner
+
+from codebase_rag import constants as cs
+from codebase_rag.checkout_state import state_file
+from codebase_rag.cli import app
+from codebase_rag.graph_updater import GraphUpdater
+from codebase_rag.parser_loader import load_parsers
+from codebase_rag.structural_delta import (
+    StructuralDelta,
+    has_findings,
+    normalise_paths,
+    observe,
+    strongly_connected,
+)
+from evals.cgr_graph import _StatefulIngestor
+
+PROJECT = "delta_fixture"
+
+BIG_BODY = (
+    "    total = 0\n"
+    "    for item in items:\n"
+    "        if item is None:\n"
+    "            continue\n"
+    "        if isinstance(item, str):\n"
+    "            total += len(item)\n"
+    "        elif item > 10:\n"
+    "            total += item * 2\n"
+    "        else:\n"
+    "            total += item\n"
+    "    return total\n"
+)
+
+FIXTURE: dict[str, str] = {
+    "pkg/__init__.py": "",
+    "pkg/util.py": (
+        "def helper(a):\n    return a + 1\n\n\ndef tally(items):\n" + BIG_BODY
+    ),
+    "pkg/app.py": "from pkg.util import helper\n\n\ndef run():\n    return helper(1)\n",
+    "main.py": "from pkg.app import run\n\n\ndef main():\n    run()\n",
+    "tests/__init__.py": "",
+    "tests/test_app.py": (
+        "from pkg.app import run\n\n\ndef test_run():\n    assert run() == 2\n"
+    ),
+}
+
+
+def _git(root: Path, *args: str) -> None:
+    subprocess.run(["git", *args], cwd=root, check=True, capture_output=True)
+
+
+def _write(root: Path, rel: str, text: str) -> None:
+    path = root / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+
+
+def _updater(store: _StatefulIngestor, root: Path) -> GraphUpdater:
+    parsers, queries = load_parsers()
+    return GraphUpdater(
+        ingestor=store,
+        repo_path=root,
+        parsers=parsers,
+        queries=queries,
+        project_name=PROJECT,
+    )
+
+
+@pytest.fixture
+def indexed(temp_repo: Path) -> tuple[Path, _StatefulIngestor, GraphUpdater]:
+    root = temp_repo / PROJECT
+    root.mkdir()
+    for rel, text in FIXTURE.items():
+        _write(root, rel, text)
+    store = _StatefulIngestor()
+    updater = _updater(store, root)
+    updater.run(force=True)
+    return root, store, updater
+
+
+def _observe(
+    root: Path,
+    store: _StatefulIngestor,
+    updater: GraphUpdater,
+    changed: list[str],
+    deleted: list[str] | None = None,
+    declared_renames: frozenset[tuple[str, str]] = frozenset(),
+) -> StructuralDelta:
+    return observe(
+        store.fetch_all,
+        PROJECT,
+        [*changed, *(deleted or [])],
+        lambda: updater.reingest(changed, deleted=deleted or []),
+        repo_root=root,
+        declared_renames=declared_renames,
+    )
+
+
+def _qn(rel: str) -> str:
+    return f"{PROJECT}.{rel}"
+
+
+def _assert_cli_check_accepts(
+    root: Path,
+    store: _StatefulIngestor,
+    project_name: str,
+    projects: list[str],
+) -> None:
+    cli_store = MagicMock(wraps=store)
+    cli_store.list_projects = MagicMock(return_value=projects)
+    context = MagicMock()
+    context.__enter__.return_value = cli_store
+    context.__exit__.return_value = False
+    with patch("codebase_rag.cli.connect_memgraph", return_value=context):
+        result = CliRunner().invoke(
+            app,
+            [
+                "check",
+                "--repo-path",
+                str(root),
+                "--project",
+                project_name,
+            ],
+        )
+    assert result.exit_code == 0, result.output
+
+
+# --- acceptance ---------------------------------------------------------------
+
+
+def test_rename_without_updating_callers_reports_dangling_callers(
+    indexed: tuple[Path, _StatefulIngestor, GraphUpdater],
+) -> None:
+    root, store, updater = indexed
+    _write(
+        root,
+        "pkg/util.py",
+        FIXTURE["pkg/util.py"].replace("def helper(a):", "def assist(a):"),
+    )
+    delta = _observe(root, store, updater, ["pkg/util.py"])
+
+    assert delta["symbols"]["renamed"] == [
+        {
+            "old": _qn("pkg.util.helper"),
+            "new": _qn("pkg.util.assist"),
+            "path": "pkg/util.py",
+        }
+    ]
+    assert delta["symbols"]["added"] == []
+    assert delta["symbols"]["removed"] == []
+    assert delta["dangling_callers"] == [
+        {
+            "caller": _qn("pkg.app.run"),
+            "path": "pkg/app.py",
+            "line": 5,
+            "col": 11,
+            "target": _qn("pkg.util.helper"),
+            "renamed_to": _qn("pkg.util.assist"),
+        }
+    ]
+    assert has_findings(delta)
+
+
+def test_updated_caller_is_not_dangling(
+    indexed: tuple[Path, _StatefulIngestor, GraphUpdater],
+) -> None:
+    root, store, updater = indexed
+    _write(
+        root,
+        "pkg/util.py",
+        FIXTURE["pkg/util.py"].replace("def helper(a):", "def assist(a):"),
+    )
+    _write(root, "pkg/app.py", FIXTURE["pkg/app.py"].replace("helper", "assist"))
+    delta = _observe(root, store, updater, ["pkg/util.py", "pkg/app.py"])
+
+    assert delta["dangling_callers"] == []
+    assert delta["symbols"]["renamed"][0]["new"] == _qn("pkg.util.assist")
+
+
+def test_two_arg_call_to_one_arg_function_is_an_arity_finding(
+    indexed: tuple[Path, _StatefulIngestor, GraphUpdater],
+) -> None:
+    root, store, updater = indexed
+    _write(
+        root, "pkg/app.py", FIXTURE["pkg/app.py"].replace("helper(1)", "helper(1, 2)")
+    )
+    delta = _observe(root, store, updater, ["pkg/app.py"])
+
+    assert delta["arity_findings"] == [
+        {
+            "caller": _qn("pkg.app.run"),
+            "path": "pkg/app.py",
+            "line": 5,
+            "col": 11,
+            "arg_count": 2,
+            "kwarg_names": [],
+            "declared_count": 1,
+            "verdict": cs.DELTA_ARITY_TOO_MANY,
+        }
+    ]
+    assert delta["signature_changes"] == []
+    assert has_findings(delta)
+
+
+def test_signature_change_lists_every_site_with_a_verdict(
+    indexed: tuple[Path, _StatefulIngestor, GraphUpdater],
+) -> None:
+    root, store, updater = indexed
+    _write(
+        root,
+        "pkg/util.py",
+        FIXTURE["pkg/util.py"].replace("def helper(a):", "def helper(a, b):"),
+    )
+    delta = _observe(root, store, updater, ["pkg/util.py"])
+
+    assert delta["symbols"]["changed"] == [_qn("pkg.util.helper")]
+    (change,) = delta["signature_changes"]
+    assert change["before"] == ["a"]
+    assert change["after"] == ["a", "b"]
+    (site,) = change["sites"]
+    assert site["path"] == "pkg/app.py"
+    assert site["line"] == 5
+    # `b` has no default, so `helper(1)` is certainly short (issue #2845);
+    # it read `possibly_missing` while the header was not read back.
+    assert site["verdict"] == cs.DELTA_ARITY_TOO_FEW
+    assert site["declared_count"] == 2
+
+
+def _link_remote_callers(store: _StatefulIngestor) -> None:
+    """A handler in this project exposes an endpoint and an RPC resource;
+    another project's client reaches the endpoint through a NETWORK resource
+    and the RPC directly. Edges added the way the extractors emit them."""
+    resource = cs.NodeLabel.RESOURCE.value
+    function = cs.NodeLabel.FUNCTION.value
+    qn = cs.KEY_QUALIFIED_NAME
+    store.ensure_node_batch(
+        resource,
+        {qn: "svc.ep", cs.KEY_NAME: "GET /helper", cs.KEY_KIND: "ENDPOINT"},
+    )
+    store.ensure_node_batch(
+        resource, {qn: "svc.rpc", cs.KEY_NAME: "Greeter", cs.KEY_KIND: "RPC"}
+    )
+    store.ensure_node_batch(
+        resource,
+        {qn: "client.net", cs.KEY_NAME: "http://svc/helper", cs.KEY_KIND: "NETWORK"},
+    )
+    store.ensure_node_batch(
+        function, {qn: "client.app.call", cs.KEY_PATH: "app.py", cs.KEY_NAME: "call"}
+    )
+    store.ensure_node_batch(
+        function, {qn: "client.rpc.hello", cs.KEY_PATH: "rpc.py", cs.KEY_NAME: "hello"}
+    )
+    # A caller inside the handler's own project, over HTTP and over RPC: a
+    # local site, not a remote caller (bot review on PR #1978).
+    store.ensure_node_batch(
+        function,
+        {
+            qn: _qn("pkg.local.self_call"),
+            cs.KEY_PATH: "pkg/local.py",
+            cs.KEY_NAME: "self_call",
+        },
+    )
+    helper = (function, qn, _qn("pkg.util.helper"))
+    rel = cs.RelationshipType
+    store.ensure_relationship_batch(helper, rel.EXPOSES.value, (resource, qn, "svc.ep"))
+    store.ensure_relationship_batch(
+        helper, rel.EXPOSES.value, (resource, qn, "svc.rpc")
+    )
+    store.ensure_relationship_batch(
+        (resource, qn, "client.net"), rel.RESOLVES_TO.value, (resource, qn, "svc.ep")
+    )
+    # Reads and writes one URL: one remote caller, not two.
+    for access in (rel.READS_FROM.value, rel.WRITES_TO.value):
+        store.ensure_relationship_batch(
+            (function, qn, "client.app.call"), access, (resource, qn, "client.net")
+        )
+    store.ensure_relationship_batch(
+        (function, qn, "client.rpc.hello"),
+        rel.WRITES_TO.value,
+        (resource, qn, "svc.rpc"),
+    )
+    for target in ("client.net", "svc.rpc"):
+        store.ensure_relationship_batch(
+            (function, qn, _qn("pkg.local.self_call")),
+            rel.READS_FROM.value,
+            (resource, qn, target),
+        )
+
+
+def _link_non_remote_kinds(store: _StatefulIngestor) -> None:
+    """The same two shapes, built from kinds that are NOT service boundaries:
+    a DATABASE resource resolving to the endpoint, and a plain ENDPOINT
+    exposed directly. Neither is a remote call site (bot review on PR #1978).
+    """
+    resource = cs.NodeLabel.RESOURCE.value
+    function = cs.NodeLabel.FUNCTION.value
+    qn = cs.KEY_QUALIFIED_NAME
+    rel = cs.RelationshipType
+    store.ensure_node_batch(
+        resource,
+        {qn: "svc.plain", cs.KEY_NAME: "GET /plain", cs.KEY_KIND: "ENDPOINT"},
+    )
+    store.ensure_node_batch(
+        resource, {qn: "client.db", cs.KEY_NAME: "pg://svc", cs.KEY_KIND: "DATABASE"}
+    )
+    store.ensure_node_batch(
+        function, {qn: "client.dbapp.go", cs.KEY_PATH: "db.py", cs.KEY_NAME: "go"}
+    )
+    helper = (function, qn, _qn("pkg.util.helper"))
+    store.ensure_relationship_batch(
+        helper, rel.EXPOSES.value, (resource, qn, "svc.plain")
+    )
+    store.ensure_relationship_batch(
+        (resource, qn, "client.db"), rel.RESOLVES_TO.value, (resource, qn, "svc.plain")
+    )
+    for target in ("client.db", "svc.plain"):
+        store.ensure_relationship_batch(
+            (function, qn, "client.dbapp.go"),
+            rel.READS_FROM.value,
+            (resource, qn, target),
+        )
+
+
+def test_only_network_rpc_and_dispatch_kinds_are_remote_callers(
+    indexed: tuple[Path, _StatefulIngestor, GraphUpdater],
+) -> None:
+    """A DATABASE resource resolving to an endpoint, and a plain ENDPOINT
+    read directly, are not service boundaries. Without the kind filters both
+    shapes were reported as remote callers, overstating the blast radius of
+    a signature change (bot review on PR #1978)."""
+    root, store, updater = indexed
+    _write(
+        root,
+        "pkg/util.py",
+        FIXTURE["pkg/util.py"].replace("def helper(a):", "def helper(a, b):"),
+    )
+
+    def apply() -> None:
+        updater.reingest(["pkg/util.py"], deleted=[])
+        _link_non_remote_kinds(store)
+
+    delta = observe(store.fetch_all, PROJECT, ["pkg/util.py"], apply, repo_root=root)
+
+    (change,) = delta["signature_changes"]
+    assert change["remote_callers"] == [], change["remote_callers"]
+
+
+def test_signature_change_lists_the_remote_callers_of_its_endpoint(
+    indexed: tuple[Path, _StatefulIngestor, GraphUpdater],
+) -> None:
+    """A changed handler's remote call sites, through the NETWORK resource
+    that resolves to its endpoint and directly for its RPC resource, in any
+    project (issue #1603). No CALLS edge lists them, so `sites` alone says
+    the change is contained when it is not. A client that both reads and
+    writes the URL is one caller (local review P2); a caller in the
+    handler's own project is not listed (bot review on PR #1978)."""
+    root, store, updater = indexed
+    _write(
+        root,
+        "pkg/util.py",
+        FIXTURE["pkg/util.py"].replace("def helper(a):", "def helper(a, b):"),
+    )
+
+    def apply() -> None:
+        # Re-ingesting the file rebuilds the handler, and the route
+        # extractor would re-emit its EXPOSES edges with it; the fixture
+        # has no route decorator, so the edges are laid after the rebuild.
+        updater.reingest(["pkg/util.py"], deleted=[])
+        _link_remote_callers(store)
+
+    delta = observe(store.fetch_all, PROJECT, ["pkg/util.py"], apply, repo_root=root)
+
+    (change,) = delta["signature_changes"]
+    assert [s["path"] for s in change["sites"]] == ["pkg/app.py"]
+    assert change["remote_callers"] == [
+        {
+            "qualified_name": "client.app.call",
+            "label": cs.NodeLabel.FUNCTION.value,
+            "path": "app.py",
+            "url": "http://svc/helper",
+            "endpoint": "GET /helper",
+        },
+        {
+            "qualified_name": "client.rpc.hello",
+            "label": cs.NodeLabel.FUNCTION.value,
+            "path": "rpc.py",
+            "url": "Greeter",
+            "endpoint": "Greeter",
+        },
+    ]
+
+
+def test_a_caller_both_query_shapes_return_is_listed_once() -> None:
+    """The indirect and the direct query are each DISTINCT within
+    themselves; a row both return is one caller (bot review on PR #1978)."""
+    from codebase_rag.structural_delta import _remote_callers
+
+    row = {
+        cs.KEY_HANDLER: "svc.h",
+        cs.KEY_ENDPOINT: "GET /x",
+        cs.KEY_LABEL: "Function",
+        cs.KEY_QUALIFIED_NAME: "client.app.call",
+        cs.KEY_PATH: "app.py",
+        cs.KEY_URL: "http://svc/x",
+    }
+    found = _remote_callers(lambda query, params=None: [dict(row)], "svc", ["svc.h"])
+    assert [c["qualified_name"] for c in found["svc.h"]] == ["client.app.call"]
+
+
+def test_remote_callers_alone_are_a_finding(
+    indexed: tuple[Path, _StatefulIngestor, GraphUpdater],
+) -> None:
+    """A signature change whose only impact is a remote caller still fails
+    --fail-on-found: no local site would flag it (issue #1603)."""
+    root, store, updater = indexed
+    _write(
+        root,
+        "pkg/util.py",
+        FIXTURE["pkg/util.py"].replace("def helper(a):", "def helper(a, b):"),
+    )
+
+    def apply() -> None:
+        updater.reingest(["pkg/util.py"], deleted=[])
+        _link_remote_callers(store)
+
+    delta = observe(store.fetch_all, PROJECT, ["pkg/util.py"], apply, repo_root=root)
+
+    (change,) = delta["signature_changes"]
+    assert change["remote_callers"]
+    # Drop the local site so the remote callers are the only impact left.
+    remote_only = {**delta, "signature_changes": [{**change, "sites": []}]}
+    nothing = {
+        **delta,
+        "signature_changes": [{**change, "sites": [], "remote_callers": []}],
+    }
+    assert has_findings(cast(StructuralDelta, remote_only))
+    assert not has_findings(cast(StructuralDelta, nothing))
+
+
+def test_a_signature_change_with_no_endpoint_has_no_remote_callers(
+    indexed: tuple[Path, _StatefulIngestor, GraphUpdater],
+) -> None:
+    """The control: the same change on a definition that exposes nothing
+    reports an empty list, not a missing key."""
+    root, store, updater = indexed
+    _write(
+        root,
+        "pkg/util.py",
+        FIXTURE["pkg/util.py"].replace("def helper(a):", "def helper(a, b):"),
+    )
+    delta = _observe(root, store, updater, ["pkg/util.py"])
+
+    (change,) = delta["signature_changes"]
+    assert change["remote_callers"] == []
+
+
+def test_variadic_callee_is_never_too_many(
+    indexed: tuple[Path, _StatefulIngestor, GraphUpdater],
+) -> None:
+    root, store, updater = indexed
+    _write(
+        root,
+        "pkg/util.py",
+        FIXTURE["pkg/util.py"].replace("def helper(a):", "def helper(a, *rest):"),
+    )
+    _write(
+        root,
+        "pkg/app.py",
+        FIXTURE["pkg/app.py"].replace("helper(1)", "helper(1, 2, 3)"),
+    )
+    delta = _observe(root, store, updater, ["pkg/util.py", "pkg/app.py"])
+
+    assert delta["arity_findings"] == []
+    assert not has_findings(delta)
+
+
+def test_keyword_arguments_to_a_kwargs_callee_are_not_too_many(
+    indexed: tuple[Path, _StatefulIngestor, GraphUpdater],
+) -> None:
+    root, store, updater = indexed
+    _write(
+        root,
+        "pkg/util.py",
+        FIXTURE["pkg/util.py"].replace("def helper(a):", "def helper(a, **kw):"),
+    )
+    _write(
+        root, "pkg/app.py", FIXTURE["pkg/app.py"].replace("helper(1)", "helper(1, b=2)")
+    )
+    delta = _observe(root, store, updater, ["pkg/util.py", "pkg/app.py"])
+    # One positional for one positional parameter; the keyword names nothing
+    # in the positional list and is neutral, not an extra argument.
+    assert delta["arity_findings"] == []
+    assert not has_findings(delta)
+
+
+def test_extra_positional_to_a_keyword_only_callee_is_too_many(
+    indexed: tuple[Path, _StatefulIngestor, GraphUpdater],
+) -> None:
+    root, store, updater = indexed
+    _write(
+        root,
+        "pkg/util.py",
+        FIXTURE["pkg/util.py"].replace("def helper(a):", "def helper(a, *, b=1):"),
+    )
+    _write(
+        root,
+        "pkg/app.py",
+        FIXTURE["pkg/app.py"].replace("helper(1)", "helper(1, 2, b=3)"),
+    )
+    delta = _observe(root, store, updater, ["pkg/util.py", "pkg/app.py"])
+    # A bare `*` accepts no extra positionals: this call raises TypeError.
+    assert [f["verdict"] for f in delta["arity_findings"]] == [cs.DELTA_ARITY_TOO_MANY]
+
+
+def test_pasting_a_helper_under_a_new_name_is_a_new_duplicate(
+    indexed: tuple[Path, _StatefulIngestor, GraphUpdater],
+) -> None:
+    root, store, updater = indexed
+    _write(root, "pkg/extra.py", "def summarise(items):\n" + BIG_BODY)
+    delta = _observe(root, store, updater, ["pkg/extra.py"])
+
+    assert delta["symbols"]["added"] == [_qn("pkg.extra.summarise")]
+    (duplicate,) = delta["new_duplicates"]
+    assert duplicate["qualified_name"] == _qn("pkg.extra.summarise")
+    assert duplicate["kind"] == cs.KIND_EXACT
+    assert duplicate["similarity"] == 1.0
+    assert duplicate["original"] == {
+        "qualified_name": _qn("pkg.util.tally"),
+        "path": "pkg/util.py",
+        "start_line": 5,
+    }
+
+
+def test_new_import_cycle_is_reported_once(
+    indexed: tuple[Path, _StatefulIngestor, GraphUpdater],
+) -> None:
+    root, store, updater = indexed
+    _write(
+        root,
+        "pkg/util.py",
+        "from pkg.app import run\n\n\n" + FIXTURE["pkg/util.py"],
+    )
+    delta = _observe(root, store, updater, ["pkg/util.py"])
+    assert delta["new_import_cycles"] == [[_qn("pkg.app"), _qn("pkg.util")]]
+
+    # The cycle already exists now: a further neutral edit must not
+    # report it again.
+    _write(root, "pkg/util.py", (root / "pkg/util.py").read_text() + "# note\n")
+    again = _observe(root, store, updater, ["pkg/util.py"])
+    assert again["new_import_cycles"] == []
+    assert not has_findings(again)
+
+
+def test_tests_reaching_the_changed_symbols(
+    indexed: tuple[Path, _StatefulIngestor, GraphUpdater],
+) -> None:
+    root, store, updater = indexed
+    _write(root, "pkg/util.py", FIXTURE["pkg/util.py"].replace("a + 1", "a + 2"))
+    delta = _observe(root, store, updater, ["pkg/util.py"])
+
+    # A literal change moves neither the skeleton nor the signature, so
+    # `changed` is empty; the edited file's symbols still decide the tests.
+    assert delta["symbols"]["changed"] == []
+    assert delta["tests_reaching"] == [
+        {
+            "qualified_name": _qn("tests.test_app.test_run"),
+            "path": "tests/test_app.py",
+            "depth": 2,
+            "through": _qn("pkg.app.run"),
+        }
+    ]
+
+
+def test_deleting_a_file_removes_its_symbols_and_dangles_callers(
+    indexed: tuple[Path, _StatefulIngestor, GraphUpdater],
+) -> None:
+    root, store, updater = indexed
+    (root / "pkg/util.py").unlink()
+    delta = _observe(root, store, updater, [], deleted=["pkg/util.py"])
+
+    assert delta["removed_files"] == ["pkg/util.py"]
+    assert _qn("pkg.util.helper") in delta["symbols"]["removed"]
+    assert [d["caller"] for d in delta["dangling_callers"]] == [_qn("pkg.app.run")]
+    assert delta["dangling_callers"][0]["renamed_to"] is None
+
+
+def test_neutral_edit_reports_nothing(
+    indexed: tuple[Path, _StatefulIngestor, GraphUpdater],
+) -> None:
+    root, store, updater = indexed
+    _write(root, "pkg/app.py", FIXTURE["pkg/app.py"] + "# trailing comment\n")
+    delta = _observe(root, store, updater, ["pkg/app.py"])
+
+    assert delta["symbols"] == {
+        "added": [],
+        "removed": [],
+        "renamed": [],
+        "changed": [],
+    }
+    assert not has_findings(delta)
+    assert delta["reparsed"] == ["pkg/app.py"]
+    assert delta["paths"] == ["pkg/app.py"]
+
+
+def test_delta_overhead_is_small(
+    indexed: tuple[Path, _StatefulIngestor, GraphUpdater],
+) -> None:
+    root, store, updater = indexed
+    _write(root, "pkg/util.py", FIXTURE["pkg/util.py"].replace("a + 1", "a + 3"))
+    delta = _observe(root, store, updater, ["pkg/util.py"])
+    assert delta["reingest_ms"] > 0
+    assert delta["delta_ms"] < 200
+
+
+# --- units --------------------------------------------------------------------
+
+
+def test_strongly_connected_components() -> None:
+    graph = {
+        "a": frozenset({"b"}),
+        "b": frozenset({"c"}),
+        "c": frozenset({"a"}),
+        "d": frozenset({"a"}),
+        "e": frozenset({"e"}),
+    }
+    components = {tuple(sorted(c)) for c in strongly_connected(graph)}
+    assert components == {("a", "b", "c"), ("d",), ("e",)}
+
+
+def test_normalise_paths_makes_repo_relative_posix(tmp_path: Path) -> None:
+    inside = tmp_path / "pkg" / "x.py"
+    outside = tmp_path.parent / "elsewhere.py"
+    assert normalise_paths([inside, "pkg/y.py", outside], tmp_path) == [
+        "pkg/x.py",
+        "pkg/y.py",
+    ]
+
+
+# --- MCP write tools and cgr check ------------------------------------------
+
+
+@pytest.fixture
+def registry(
+    indexed: tuple[Path, _StatefulIngestor, GraphUpdater],
+) -> tuple[Path, _StatefulIngestor, object]:
+    from unittest.mock import MagicMock
+
+    from codebase_rag.mcp.tools import MCPToolsRegistry
+
+    root, store, updater = indexed
+    ingestor = MagicMock()
+    ingestor.fetch_all = store.fetch_all
+    ingestor.list_projects.return_value = [PROJECT]
+    registry = MCPToolsRegistry(
+        project_root=str(root), ingestor=ingestor, cypher_gen=MagicMock()
+    )
+    registry._live_updater = updater
+    return root, store, registry
+
+
+async def test_write_file_appends_the_structural_delta(
+    registry: tuple[Path, _StatefulIngestor, object],
+) -> None:
+    import json
+
+    root, _store, reg = registry
+    result = await reg.write_file(  # type: ignore[attr-defined]
+        "pkg/app.py", FIXTURE["pkg/app.py"].replace("helper(1)", "helper(1, 2)")
+    )
+    head, _sep, payload = result.partition(cs.MCP_DELTA_HEADER + "\n")
+    assert head.startswith(cs.MCP_WRITE_SUCCESS.format(path="pkg/app.py"))
+    delta = json.loads(payload)
+    assert delta["arity_findings"][0]["verdict"] == cs.DELTA_ARITY_TOO_MANY
+    assert delta["reparsed"] == ["pkg/app.py"]
+
+
+async def test_surgical_replace_appends_the_structural_delta(
+    registry: tuple[Path, _StatefulIngestor, object],
+) -> None:
+    import json
+
+    _root, _store, reg = registry
+    result = await reg.surgical_replace_code(  # type: ignore[attr-defined]
+        "pkg/util.py", "def helper(a):", "def assist(a):"
+    )
+    _head, _sep, payload = result.partition(cs.MCP_DELTA_HEADER + "\n")
+    delta = json.loads(payload)
+    assert delta["dangling_callers"][0]["caller"] == _qn("pkg.app.run")
+
+
+async def test_write_on_an_unindexed_project_appends_nothing(temp_repo: Path) -> None:
+    from unittest.mock import MagicMock
+
+    from codebase_rag.mcp.tools import MCPToolsRegistry
+
+    ingestor = MagicMock()
+    ingestor.list_projects.return_value = []
+    reg = MCPToolsRegistry(
+        project_root=str(temp_repo), ingestor=ingestor, cypher_gen=MagicMock()
+    )
+    result = await reg.write_file("fresh.py", "x = 1\n")
+    assert result == cs.MCP_WRITE_SUCCESS.format(path="fresh.py")
+    ingestor.fetch_all.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("error", "invalidated"),
+    [(RuntimeError("memgraph went away"), True), (ValueError("bad path"), False)],
+)
+def test_a_failed_write_reingest_invalidates_the_live_graph(
+    temp_repo: Path, error: Exception, invalidated: bool
+) -> None:
+    from unittest.mock import MagicMock
+
+    from codebase_rag.mcp.tools import MCPToolsRegistry
+
+    registry = MCPToolsRegistry(
+        project_root=str(temp_repo), ingestor=MagicMock(), cypher_gen=MagicMock()
+    )
+    updater = MagicMock()
+    updater.project_name = "proj"
+    updater.reingest.side_effect = error
+    registry._live_updater = updater
+    registry._graph_incomplete = False
+    note = registry._delta_after_write(["pkg/app.py"])
+    assert "memgraph" in note or "bad path" in note
+    # A failure after the re-ingest began may have left a partial graph, so
+    # the updater is dropped and the graph marked incomplete; a validation
+    # error raised before any change leaves both as they were.
+    assert (registry._live_updater is None) is invalidated
+    assert registry._graph_incomplete is invalidated
+
+
+def test_check_reports_the_delta_since_a_git_ref(
+    indexed: tuple[Path, _StatefulIngestor, GraphUpdater],
+) -> None:
+    import subprocess
+
+    from codebase_rag.parser_loader import load_parsers
+    from codebase_rag.structural_check import changed_since, run_check
+
+    root, store, _updater = indexed
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "-m",
+            "base",
+        ],
+        cwd=root,
+        check=True,
+    )
+    _write(
+        root,
+        "pkg/util.py",
+        FIXTURE["pkg/util.py"].replace("def helper(a):", "def assist(a):"),
+    )
+    (root / "main.py").unlink()
+    _write(root, "pkg/new.py", "def fresh():\n    return 1\n")
+
+    assert changed_since(root, "HEAD") == (["pkg/new.py", "pkg/util.py"], ["main.py"])
+    parsers, queries = load_parsers()
+    delta = run_check(root, "HEAD", PROJECT, store, parsers, queries)
+    assert delta["dangling_callers"][0]["target"] == _qn("pkg.util.helper")
+    assert _qn("main.main") in delta["symbols"]["removed"]
+    assert delta["symbols"]["added"] == [_qn("pkg.new.fresh")]
+
+
+def test_check_rejects_a_dash_prefixed_base(temp_repo: Path) -> None:
+    from codebase_rag.structural_check import CheckError, changed_since
+
+    root = temp_repo / PROJECT
+    for rel, text in FIXTURE.items():
+        _write(root, rel, text)
+    import subprocess
+
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+    subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "b"],
+        cwd=root,
+        check=True,
+    )
+    _write(root, "pkg/util.py", FIXTURE["pkg/util.py"] + "\n")
+    # `--cached` would be read by git as its own option and compare the
+    # index, hiding the working-tree edit.
+    with pytest.raises(CheckError):
+        changed_since(root, "--cached")
+    assert changed_since(root, "HEAD") == (["pkg/util.py"], [])
+
+
+def test_check_reads_paths_git_would_c_quote(temp_repo: Path) -> None:
+    import subprocess
+
+    from codebase_rag.structural_check import changed_since
+
+    root = temp_repo / PROJECT
+    for rel, text in FIXTURE.items():
+        _write(root, rel, text)
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+    subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "b"],
+        cwd=root,
+        check=True,
+    )
+    # Git C-quotes non-ASCII bytes in its default output; `-z` keeps them
+    # raw. A space would NOT do here: git leaves a space bare in
+    # `ls-files --others`, so the fixture has to carry a byte git actually
+    # quotes or the test stops detecting the quoting bug. A tab is quoted
+    # but is not a legal NTFS filename character, and the fixture write
+    # itself raised OSError on the Windows runners.
+    _write(root, "pkg/odd\u00e9name.py", "def odd():\n    return 1\n")
+    assert changed_since(root, "HEAD") == (["pkg/odd\u00e9name.py"], [])
+
+
+def test_check_uses_the_scope_the_graph_was_indexed_under(temp_repo: Path) -> None:
+    from codebase_rag.structural_check import indexed_scope
+
+    root = temp_repo / PROJECT
+    for rel, text in FIXTURE.items():
+        _write(root, rel, text)
+    # No stamp yet: only `.cgrignore` (here, nothing) defines the scope.
+    assert indexed_scope(root, PROJECT) == (None, None)
+    store = _StatefulIngestor()
+    parsers, queries = __import__(
+        "codebase_rag.parser_loader", fromlist=["load_parsers"]
+    ).load_parsers()
+    GraphUpdater(
+        ingestor=store,
+        repo_path=root,
+        parsers=parsers,
+        queries=queries,
+        project_name=PROJECT,
+        exclude_paths=frozenset({"generated_src"}),
+        unignore_paths=frozenset({"build"}),
+    ).run(force=True)
+    # The completed run stamped its CLI-only scope; the check reads it back.
+    assert indexed_scope(root, PROJECT) == (
+        frozenset({"generated_src"}),
+        frozenset({"build"}),
+    )
+    # Another project indexed from the same tree takes the top-level stamp,
+    # but each keeps its own entry, so the first project's check still reads
+    # ITS scope rather than borrowing the other's (issue #1987).
+    GraphUpdater(
+        ingestor=_StatefulIngestor(),
+        repo_path=root,
+        parsers=parsers,
+        queries=queries,
+        project_name="other_project",
+    ).run(force=True)
+    from codebase_rag.structural_check import CheckError
+
+    assert indexed_scope(root, PROJECT) == (
+        frozenset({"generated_src"}),
+        frozenset({"build"}),
+    )
+    assert indexed_scope(root, "other_project") == (None, None)
+    # A project that never indexed this tree still has no scope to borrow.
+    with pytest.raises(CheckError):
+        indexed_scope(root, "never_indexed", explicit=True)
+
+
+def test_indexing_two_projects_on_one_tree_does_not_reuse_fast_path(
+    temp_repo: Path,
+) -> None:
+    """A repository cache must not make a sibling project look indexed."""
+    from codebase_rag.graph_updater import _load_exclusion_state
+    from codebase_rag.structural_check import indexed_scope, run_check
+
+    root = temp_repo / PROJECT
+    for rel, text in FIXTURE.items():
+        _write(root, rel, text)
+    _git(root, "init", "-q")
+    _git(root, "add", "-A")
+    _git(
+        root,
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-q",
+        "-m",
+        "b",
+    )
+    parsers, queries = load_parsers()
+    store = _StatefulIngestor()
+
+    GraphUpdater(
+        ingestor=store,
+        repo_path=root,
+        parsers=parsers,
+        queries=queries,
+        project_name="project_a",
+    ).run(force=True)
+    assert any(
+        str(properties.get(cs.KEY_QUALIFIED_NAME, "")) == "project_a.pkg.util.helper"
+        for properties in store.nodes.values()
+    )
+    _assert_cli_check_accepts(root, store, "project_a", ["project_a"])
+    assert indexed_scope(root, "project_a", explicit=True) == (None, None)
+    assert not has_findings(
+        run_check(
+            root,
+            "HEAD",
+            "project_a",
+            store,
+            parsers,
+            queries,
+            project_named=True,
+        )
+    )
+
+    _write(
+        root,
+        "pkg/util.py",
+        FIXTURE["pkg/util.py"].replace("def helper(a):", "def assist(a):"),
+    )
+    second = GraphUpdater(
+        ingestor=store,
+        repo_path=root,
+        parsers=parsers,
+        queries=queries,
+        project_name="project_b",
+    )
+    second.run(force=True)
+    assert second.skipped_because_in_sync is False
+    _assert_cli_check_accepts(root, store, "project_b", ["project_a", "project_b"])
+    assert indexed_scope(root, "project_b", explicit=True) == (None, None)
+    assert not has_findings(
+        run_check(
+            root,
+            "HEAD",
+            "project_b",
+            store,
+            parsers,
+            queries,
+            project_named=True,
+        )
+    )
+
+    third = GraphUpdater(
+        ingestor=store,
+        repo_path=root,
+        parsers=parsers,
+        queries=queries,
+        project_name="project_a",
+    )
+    third.run()
+
+    assert third.skipped_because_in_sync is False
+    assert not any(
+        str(properties.get(cs.KEY_QUALIFIED_NAME, "")) == "project_a.pkg.util.helper"
+        for properties in store.nodes.values()
+    )
+    assert any(
+        str(properties.get(cs.KEY_QUALIFIED_NAME, "")) == "project_a.pkg.util.assist"
+        for properties in store.nodes.values()
+    )
+    assert any(
+        str(properties.get(cs.KEY_QUALIFIED_NAME, "")).startswith("project_a.")
+        for properties in store.nodes.values()
+    )
+    assert any(
+        str(properties.get(cs.KEY_QUALIFIED_NAME, "")).startswith("project_b.")
+        for properties in store.nodes.values()
+    )
+    assert _load_exclusion_state(state_file(root, cs.EXCLUSION_STATE_FILENAME)) == {
+        "exclude": [],
+        "unignore": [],
+        "project": "project_a",
+        "named": "1",
+    }
+
+
+def test_check_keeps_excluded_files_out_of_the_graph(
+    temp_repo: Path,
+) -> None:
+    import subprocess
+
+    from codebase_rag.parser_loader import load_parsers
+    from codebase_rag.structural_check import run_check
+
+    root = temp_repo / PROJECT
+    for rel, text in FIXTURE.items():
+        _write(root, rel, text)
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+    subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "b"],
+        cwd=root,
+        check=True,
+    )
+    store = _StatefulIngestor()
+    _updater(store, root).run(force=True)
+    _write(root, "generated_src/thing.py", "def vendored():\n    return 1\n")
+    parsers, queries = load_parsers()
+    delta = run_check(
+        root,
+        "HEAD",
+        PROJECT,
+        store,
+        parsers,
+        queries,
+        exclude_paths=frozenset({"generated_src"}),
+    )
+    # The excluded file differs from the base but never enters the graph.
+    assert _qn("generated_src.thing.vendored") not in delta["symbols"]["added"]
+    assert all("generated_src" not in p for p in delta["reparsed"])
+
+
+def test_unnamed_check_preserves_unnamed_stamp_after_reingest(
+    temp_repo: Path,
+) -> None:
+    import subprocess
+
+    from codebase_rag.graph_updater import _load_exclusion_state
+    from codebase_rag.parser_loader import load_parsers
+    from codebase_rag.structural_check import CheckError, indexed_scope, run_check
+    from codebase_rag.utils.path_utils import derive_project_name
+
+    root = temp_repo / PROJECT
+    for rel, text in FIXTURE.items():
+        _write(root, rel, text)
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+    subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "b"],
+        cwd=root,
+        check=True,
+    )
+    store = _StatefulIngestor()
+    parsers, queries = load_parsers()
+    project_name = derive_project_name(root)
+    GraphUpdater(
+        ingestor=store,
+        repo_path=root,
+        parsers=parsers,
+        queries=queries,
+        project_name=project_name,
+        project_named=False,
+    ).run(force=True)
+    _write(
+        root,
+        "pkg/util.py",
+        FIXTURE["pkg/util.py"].replace("def helper(a):", "def assist(a):"),
+    )
+
+    run_check(
+        root,
+        "HEAD",
+        project_name,
+        store,
+        parsers,
+        queries,
+        project_named=False,
+    )
+
+    assert indexed_scope(root, project_name) == (None, None)
+    # The check left the stamp as the unnamed run wrote it.
+    stamp = _load_exclusion_state(state_file(root, cs.EXCLUSION_STATE_FILENAME))
+    assert stamp is not None, stamp
+    assert not stamp.get("named"), stamp
+    with pytest.raises(CheckError):
+        indexed_scope(root, "explicit-project", explicit=True)
+
+
+def test_check_works_when_the_project_is_below_the_git_toplevel(
+    temp_repo: Path,
+) -> None:
+    import subprocess
+
+    from codebase_rag.parser_loader import load_parsers
+    from codebase_rag.structural_check import changed_since, run_check
+
+    top = temp_repo / "mono"
+    root = top / "svc"
+    for rel, text in FIXTURE.items():
+        _write(root, rel, text)
+    subprocess.run(["git", "init", "-q"], cwd=top, check=True)
+    subprocess.run(["git", "add", "-A"], cwd=top, check=True)
+    subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "b"],
+        cwd=top,
+        check=True,
+    )
+    store = _StatefulIngestor()
+    _updater(store, root).run(force=True)
+    _write(
+        root,
+        "pkg/util.py",
+        FIXTURE["pkg/util.py"].replace("def helper(a):", "def assist(a):"),
+    )
+    # `git diff` names files relative to the toplevel unless told otherwise;
+    # the project root is one level below it.
+    assert changed_since(root, "HEAD")[0] == ["pkg/util.py"]
+    parsers, queries = load_parsers()
+    delta = run_check(root, "HEAD", PROJECT, store, parsers, queries)
+    (rename,) = delta["symbols"]["renamed"]
+    assert rename["old"] == _qn("pkg.util.helper")
+    assert rename["new"] == _qn("pkg.util.assist")
+    assert delta["dangling_callers"][0]["target"] == _qn("pkg.util.helper")
+
+
+def test_check_ignores_cgr_state_files(
+    temp_repo: Path,
+) -> None:
+    import subprocess
+
+    from codebase_rag.parser_loader import load_parsers
+    from codebase_rag.structural_check import changed_since, run_check
+
+    root = temp_repo / PROJECT
+    for rel, text in FIXTURE.items():
+        _write(root, rel, text)
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+    subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "b"],
+        cwd=root,
+        check=True,
+    )
+    store = _StatefulIngestor()
+    _updater(store, root).run(force=True)
+    # Indexing keeps its state out of the tree (issue #2427); one an older
+    # cgr left there is still untracked and must not count as an edit.
+    (root / cs.HASH_CACHE_FILENAME).write_text("{}")
+    assert changed_since(root, "HEAD") == ([], [])
+    parsers, queries = load_parsers()
+    delta = run_check(root, "HEAD", PROJECT, store, parsers, queries)
+    assert delta["paths"] == []
+    assert delta["reparsed"] == []
+
+
+def test_keyword_arguments_are_counted_once(
+    indexed: tuple[Path, _StatefulIngestor, GraphUpdater],
+) -> None:
+    root, store, updater = indexed
+    _write(
+        root,
+        "pkg/util.py",
+        FIXTURE["pkg/util.py"].replace("def helper(a):", "def helper(a, b=1):"),
+    )
+    _write(
+        root, "pkg/app.py", FIXTURE["pkg/app.py"].replace("helper(1)", "helper(1, b=2)")
+    )
+    delta = _observe(root, store, updater, ["pkg/util.py", "pkg/app.py"])
+    # `arg_count` already includes the keyword: two arguments for two
+    # parameters is exact, not one too many.
+    assert delta["arity_findings"] == []
+    (change,) = delta["signature_changes"]
+    assert change["sites"][0]["verdict"] == cs.DELTA_ARITY_OK
+
+
+def test_moved_definition_is_paired_across_files(
+    indexed: tuple[Path, _StatefulIngestor, GraphUpdater],
+) -> None:
+    root, store, updater = indexed
+    # `tally` leaves util.py for core.py unchanged: a move, reported as a
+    # rename across files rather than a removal plus an addition.
+    _write(root, "pkg/util.py", "def helper(a):\n    return a + 1\n")
+    _write(root, "pkg/core.py", "def tally(items):\n" + BIG_BODY)
+    delta = _observe(root, store, updater, ["pkg/util.py", "pkg/core.py"])
+    assert delta["symbols"]["renamed"] == [
+        {
+            "old": _qn("pkg.util.tally"),
+            "new": _qn("pkg.core.tally"),
+            "path": "pkg/util.py",
+        }
+    ]
+    assert delta["symbols"]["added"] == []
+    assert delta["symbols"]["removed"] == []
+    assert delta["new_duplicates"] == []
+
+
+def test_check_accepts_a_stamp_written_under_the_repositorys_default_name(
+    temp_repo: Path,
+) -> None:
+    from codebase_rag.structural_check import CheckError, indexed_scope
+    from codebase_rag.utils.path_utils import derive_project_name
+
+    root = temp_repo / PROJECT
+    for rel, text in FIXTURE.items():
+        _write(root, rel, text)
+    default_project = derive_project_name(root)
+    parsers, queries = __import__(
+        "codebase_rag.parser_loader", fromlist=["load_parsers"]
+    ).load_parsers()
+    # `cgr index` without --project: GraphUpdater stamps the bare directory
+    # name, while `cgr check` derives the digest-suffixed one for the same tree.
+    GraphUpdater(
+        ingestor=_StatefulIngestor(),
+        repo_path=root,
+        parsers=parsers,
+        queries=queries,
+        project_name=default_project,
+        project_named=False,
+        exclude_paths=frozenset({"generated_src"}),
+    ).run(force=True)
+    assert indexed_scope(root, default_project) == (
+        frozenset({"generated_src"}),
+        None,
+    )
+    # A later project's run takes the top-level stamp, but the unnamed run's
+    # own entry still answers for this tree's default name (issue #1987)...
+    GraphUpdater(
+        ingestor=_StatefulIngestor(),
+        repo_path=root,
+        parsers=parsers,
+        queries=queries,
+        project_name="other_project",
+    ).run(force=True)
+    own_name = derive_project_name(root)
+    assert indexed_scope(root, own_name) == (frozenset({"generated_src"}), None)
+    # ...while a stamp from a project that is not this tree under any name
+    # still refuses a name nothing indexed.
+    with pytest.raises(CheckError):
+        indexed_scope(root, "unrelated", explicit=True)
+
+
+def test_check_refuses_the_default_names_stamp_for_a_named_project(
+    temp_repo: Path,
+) -> None:
+    """An explicit --project owns only its own name.
+
+    The unnamed-run names (derived and bare directory) are what this tree
+    would have been called had the run not named it, so lending them to a
+    DIFFERENT explicitly requested project applies one project's exclusions
+    to another's graph.
+    """
+    from codebase_rag.structural_check import CheckError, indexed_scope
+    from codebase_rag.utils.path_utils import derive_project_name
+
+    root = temp_repo / PROJECT
+    for rel, text in FIXTURE.items():
+        _write(root, rel, text)
+    parsers, queries = __import__(
+        "codebase_rag.parser_loader", fromlist=["load_parsers"]
+    ).load_parsers()
+    # An unnamed run: stamps the bare directory name, excluding `generated_src`.
+    GraphUpdater(
+        ingestor=_StatefulIngestor(),
+        repo_path=root,
+        parsers=parsers,
+        queries=queries,
+        exclude_paths=frozenset({"generated_src"}),
+    ).run(force=True)
+    # `cgr check --project other_project` must NOT inherit that scope.
+    with pytest.raises(CheckError):
+        indexed_scope(root, "other_project")
+    # The same stamp still serves the unnamed run it belongs to, under
+    # either spelling of this tree's identity: `list_projects` shows the
+    # derived name, so asking by that name must not be refused.
+    assert indexed_scope(root, derive_project_name(root)) == (
+        frozenset({"generated_src"}),
+        None,
+    )
+    assert indexed_scope(root, root.name) == (
+        frozenset({"generated_src"}),
+        None,
+    )
+
+
+def test_a_callee_lookup_does_not_reach_another_project() -> None:
+    """The by-qn definition lookup is scoped to the project asking.
+
+    `CYPHER_DELTA_SITES` prefix-scopes only the CALLER side, so a callee
+    name that no definition in the touched files resolves reaches the by-qn
+    lookup. In a shared graph holding several projects an identically named
+    definition from another project would otherwise answer it and supply
+    the parameter list the arity verdict is computed from.
+    """
+    from codebase_rag.structural_delta import snapshot
+
+    store = _StatefulIngestor()
+    store.ensure_node_batch(
+        cs.NodeLabel.FUNCTION.value,
+        {
+            cs.KEY_QUALIFIED_NAME: "proj.pkg.app.main",
+            cs.KEY_NAME: "main",
+            cs.KEY_PATH: "pkg/app.py",
+            cs.KEY_START_LINE: 1,
+        },
+    )
+    # Another project's symbol, outside the touched paths, so the only route
+    # to it is the by-qn lookup.
+    store.ensure_node_batch(
+        cs.NodeLabel.FUNCTION.value,
+        {
+            cs.KEY_QUALIFIED_NAME: "other.pkg.util.helper",
+            cs.KEY_NAME: "helper",
+            cs.KEY_PATH: "elsewhere/util.py",
+            cs.KEY_START_LINE: 1,
+            cs.KEY_POSITIONAL_PARAMS: ["a"],
+        },
+    )
+    store.ensure_relationship_batch(
+        (cs.NodeLabel.FUNCTION.value, cs.KEY_QUALIFIED_NAME, "proj.pkg.app.main"),
+        cs.RelationshipType.CALLS.value,
+        (cs.NodeLabel.FUNCTION.value, cs.KEY_QUALIFIED_NAME, "other.pkg.util.helper"),
+        {cs.KEY_LINE: 5, cs.KEY_COL: 1, cs.KEY_ARG_COUNT: 3},
+    )
+
+    taken = snapshot(store.fetch_all, "proj", ["pkg/app.py"])
+
+    # The call site is seen -- the lookup really is reached, so the empty
+    # `callees` below is a refusal rather than a walk that never happened.
+    assert [site.callee for site in taken.sites] == ["other.pkg.util.helper"]
+    assert taken.callees == {}
+
+
+def test_snapshot_uses_the_longest_registered_project_owner() -> None:
+    """A dotted project name must not leak into its shorter sibling scope."""
+    from codebase_rag.structural_delta import snapshot
+
+    store = _StatefulIngestor()
+    for project_name in ("proj", "proj.extra"):
+        store.ensure_node_batch(
+            cs.NodeLabel.PROJECT.value,
+            {cs.KEY_NAME: project_name},
+        )
+
+    store.ensure_node_batch(
+        cs.NodeLabel.FUNCTION.value,
+        {
+            cs.KEY_QUALIFIED_NAME: "proj.pkg.app.main",
+            cs.KEY_NAME: "main",
+            cs.KEY_PATH: "pkg/app.py",
+            cs.KEY_START_LINE: 1,
+        },
+    )
+    store.ensure_node_batch(
+        cs.NodeLabel.FUNCTION.value,
+        {
+            cs.KEY_QUALIFIED_NAME: "proj.extra.pkg.app.main",
+            cs.KEY_NAME: "main",
+            cs.KEY_PATH: "pkg/app.py",
+            cs.KEY_START_LINE: 1,
+        },
+    )
+    store.ensure_node_batch(
+        cs.NodeLabel.FUNCTION.value,
+        {
+            cs.KEY_QUALIFIED_NAME: "proj.pkg.util.helper",
+            cs.KEY_NAME: "helper",
+            cs.KEY_PATH: "pkg/util.py",
+            cs.KEY_START_LINE: 1,
+        },
+    )
+    store.ensure_node_batch(
+        cs.NodeLabel.FUNCTION.value,
+        {
+            cs.KEY_QUALIFIED_NAME: "proj.extra.pkg.util.helper",
+            cs.KEY_NAME: "helper",
+            cs.KEY_PATH: "elsewhere/util.py",
+            cs.KEY_START_LINE: 1,
+            cs.KEY_POSITIONAL_PARAMS: ["a"],
+        },
+    )
+    store.ensure_relationship_batch(
+        (cs.NodeLabel.FUNCTION.value, cs.KEY_QUALIFIED_NAME, "proj.pkg.app.main"),
+        cs.RelationshipType.CALLS.value,
+        (
+            cs.NodeLabel.FUNCTION.value,
+            cs.KEY_QUALIFIED_NAME,
+            "proj.extra.pkg.util.helper",
+        ),
+        {cs.KEY_LINE: 5, cs.KEY_COL: 1, cs.KEY_ARG_COUNT: 1},
+    )
+    store.ensure_relationship_batch(
+        (
+            cs.NodeLabel.FUNCTION.value,
+            cs.KEY_QUALIFIED_NAME,
+            "proj.extra.pkg.app.main",
+        ),
+        cs.RelationshipType.CALLS.value,
+        (cs.NodeLabel.FUNCTION.value, cs.KEY_QUALIFIED_NAME, "proj.pkg.util.helper"),
+        {cs.KEY_LINE: 5, cs.KEY_COL: 1, cs.KEY_ARG_COUNT: 1},
+    )
+
+    for module_qn, path in (
+        ("proj.pkg.app", "pkg/app.py"),
+        ("proj.pkg.util", "pkg/util.py"),
+        ("proj.extra.pkg.app", "pkg/app.py"),
+        ("proj.extra.pkg.util", "pkg/util.py"),
+        ("proj.extra", "lib.rs"),
+    ):
+        store.ensure_node_batch(
+            cs.NodeLabel.MODULE.value,
+            {
+                cs.KEY_QUALIFIED_NAME: module_qn,
+                cs.KEY_NAME: module_qn.rsplit(".", 1)[-1],
+                cs.KEY_PATH: path,
+            },
+        )
+    store.ensure_relationship_batch(
+        (cs.NodeLabel.MODULE.value, cs.KEY_QUALIFIED_NAME, "proj.pkg.app"),
+        cs.RelationshipType.IMPORTS.value,
+        (cs.NodeLabel.MODULE.value, cs.KEY_QUALIFIED_NAME, "proj.pkg.util"),
+    )
+    store.ensure_relationship_batch(
+        (
+            cs.NodeLabel.MODULE.value,
+            cs.KEY_QUALIFIED_NAME,
+            "proj.extra.pkg.app",
+        ),
+        cs.RelationshipType.IMPORTS.value,
+        (
+            cs.NodeLabel.MODULE.value,
+            cs.KEY_QUALIFIED_NAME,
+            "proj.extra.pkg.util",
+        ),
+    )
+    store.ensure_relationship_batch(
+        (cs.NodeLabel.MODULE.value, cs.KEY_QUALIFIED_NAME, "proj.extra"),
+        cs.RelationshipType.IMPORTS.value,
+        (cs.NodeLabel.MODULE.value, cs.KEY_QUALIFIED_NAME, "proj.pkg.util"),
+    )
+
+    taken = snapshot(store.fetch_all, "proj", ["pkg/app.py"])
+
+    assert sorted(taken.definitions) == ["proj.pkg.app.main"]
+    assert [(site.caller, site.callee) for site in taken.sites] == [
+        ("proj.pkg.app.main", "proj.extra.pkg.util.helper")
+    ]
+    assert taken.callees == {}
+    assert taken.imports == {
+        "proj.pkg.app": frozenset({"proj.pkg.util"}),
+        "proj.pkg.util": frozenset(),
+    }
+
+
+def test_check_refuses_a_named_projects_stamp_for_the_default_project(
+    temp_repo: Path,
+) -> None:
+    """A project named after its own directory is not the default project.
+
+    `cgr index --project myrepo` in a tree called `myrepo` writes a stamp
+    whose owner string is identical to the one an unnamed run would write,
+    so the name alone cannot say which it was. The stamp records it, and
+    the default (digest-derived) project must not inherit that scope.
+    """
+    from codebase_rag.structural_check import CheckError, indexed_scope
+    from codebase_rag.utils.path_utils import derive_project_name
+
+    root = temp_repo / PROJECT
+    for rel, text in FIXTURE.items():
+        _write(root, rel, text)
+    parsers, queries = __import__(
+        "codebase_rag.parser_loader", fromlist=["load_parsers"]
+    ).load_parsers()
+    # Named explicitly, and the name happens to equal the directory name.
+    GraphUpdater(
+        ingestor=_StatefulIngestor(),
+        repo_path=root,
+        parsers=parsers,
+        queries=queries,
+        project_name=root.name,
+        exclude_paths=frozenset({"generated_src"}),
+    ).run(force=True)
+    # The default project is a different graph and must not take that scope.
+    own_name = derive_project_name(root)
+    with pytest.raises(CheckError):
+        indexed_scope(root, own_name)
+    # The project it belongs to still reads it.
+    assert indexed_scope(root, root.name, explicit=True) == (
+        frozenset({"generated_src"}),
+        None,
+    )
+
+
+def test_check_refuses_an_unnamed_stamp_for_a_named_project(
+    temp_repo: Path,
+) -> None:
+    """An unnamed run overwrites the stamp; the named project's scope is gone.
+
+    The stamp is per repository, so a later `cgr index` with no --project
+    replaces whatever `cgr index --project myrepo` had written. Its owner
+    string is the directory name either way, so only the recorded
+    provenance separates them -- and once overwritten the named project's
+    scope is not recoverable, so the check must refuse rather than apply
+    the unnamed run's.
+    """
+    from codebase_rag.structural_check import CheckError, indexed_scope
+    from codebase_rag.utils.path_utils import derive_project_name
+
+    root = temp_repo / PROJECT
+    for rel, text in FIXTURE.items():
+        _write(root, rel, text)
+    parsers, queries = __import__(
+        "codebase_rag.parser_loader", fromlist=["load_parsers"]
+    ).load_parsers()
+    # The unnamed run, which owns the stamp on disk.
+    GraphUpdater(
+        ingestor=_StatefulIngestor(),
+        repo_path=root,
+        parsers=parsers,
+        queries=queries,
+        exclude_paths=frozenset({"generated_src"}),
+    ).run(force=True)
+    # `cgr check --project <basename>` is a different graph and must refuse.
+    with pytest.raises(CheckError):
+        indexed_scope(root, root.name, explicit=True)
+    # The unnamed default it belongs to still reads it -- so the refusal
+    # above is about provenance, not a stamp that cannot be read at all.
+    assert indexed_scope(root, derive_project_name(root)) == (
+        frozenset({"generated_src"}),
+        None,
+    )
+
+
+@pytest.mark.parametrize("base", ["HEAD~1..HEAD", "HEAD~1...HEAD", "no-such-rev"])
+def test_check_refuses_a_base_that_is_not_one_commit(
+    temp_repo: Path, base: str
+) -> None:
+    from codebase_rag.structural_check import CheckError, changed_since
+
+    root = temp_repo / PROJECT
+    for rel, text in FIXTURE.items():
+        _write(root, rel, text)
+    _git(root, "init", "-q")
+    _git(root, "add", "-A")
+    _git(root, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "one")
+    _write(root, "pkg/extra.py", "X = 1\n")
+    _git(root, "add", "-A")
+    _git(root, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "two")
+    # The range would compare the two commits and miss this working-tree edit.
+    _write(root, "pkg/extra.py", "X = 2\n")
+    with pytest.raises(CheckError, match="one commit"):
+        changed_since(root, base)
+    assert changed_since(root, "HEAD") == (["pkg/extra.py"], [])
+
+
+# An EMPTY container carries no fingerprint, so the only signal the pairing
+# ever had was "one of this label left the file and one appeared" -- which an
+# unrelated replacement satisfies exactly. The contract treats an unexpected
+# rename as a failure, so an invented one rolls back a correct edit
+# (Greptile, PR #1547).
+def test_an_unrelated_empty_class_is_not_reported_as_a_rename(
+    indexed: tuple[Path, _StatefulIngestor, GraphUpdater],
+) -> None:
+    root, store, updater = indexed
+    _write(root, "pkg/empty.py", "class Alpha:\n    pass\n")
+    _observe(root, store, updater, ["pkg/empty.py"])
+
+    # A DIFFERENT empty class, declared lower down: not a rename of Alpha.
+    _write(root, "pkg/empty.py", "# a new file entirely\n\nclass Beta:\n    pass\n")
+    delta = _observe(root, store, updater, ["pkg/empty.py"])
+
+    assert delta["symbols"]["renamed"] == []
+    assert _qn("pkg.empty.Alpha") in delta["symbols"]["removed"]
+    assert _qn("pkg.empty.Beta") in delta["symbols"]["added"]
+
+
+def test_an_empty_class_rename_is_reported_when_the_caller_DECLARES_it(
+    indexed: tuple[Path, _StatefulIngestor, GraphUpdater],
+) -> None:
+    # The control. The snapshots cannot tell this from the replacement above
+    # -- they are the same edit -- so the only difference is that the
+    # operation says which pair it applied. Without this test, refusing every
+    # empty-container pairing would pass the test above while silently
+    # dropping every real empty-class rename.
+    root, store, updater = indexed
+    _write(root, "pkg/empty.py", "class Alpha:\n    pass\n")
+    _observe(root, store, updater, ["pkg/empty.py"])
+
+    _write(root, "pkg/empty.py", "class Renamed:\n    pass\n")
+    delta = _observe(
+        root,
+        store,
+        updater,
+        ["pkg/empty.py"],
+        declared_renames=frozenset(
+            {(_qn("pkg.empty.Alpha"), _qn("pkg.empty.Renamed"))}
+        ),
+    )
+
+    assert delta["symbols"]["renamed"] == [
+        {
+            "old": _qn("pkg.empty.Alpha"),
+            "new": _qn("pkg.empty.Renamed"),
+            "path": "pkg/empty.py",
+        }
+    ]
+    assert delta["symbols"]["added"] == []
+    assert delta["symbols"]["removed"] == []
+
+
+def test_an_undeclared_empty_class_rename_is_a_removal_plus_an_addition(
+    indexed: tuple[Path, _StatefulIngestor, GraphUpdater],
+) -> None:
+    # The plain-write path (a file edited outside a rename operation) has no
+    # declaration, and the snapshots hold no evidence, so the honest answer
+    # is that one class went and another arrived.
+    root, store, updater = indexed
+    _write(root, "pkg/empty.py", "class Alpha:\n    pass\n")
+    _observe(root, store, updater, ["pkg/empty.py"])
+
+    _write(root, "pkg/empty.py", "class Renamed:\n    pass\n")
+    delta = _observe(root, store, updater, ["pkg/empty.py"])
+
+    assert delta["symbols"]["renamed"] == []
+    assert _qn("pkg.empty.Alpha") in delta["symbols"]["removed"]
+    assert _qn("pkg.empty.Renamed") in delta["symbols"]["added"]
+
+
+def test_two_declared_empty_class_renames_in_one_file_are_both_reported(
+    indexed: tuple[Path, _StatefulIngestor, GraphUpdater],
+) -> None:
+    # Issue #1836, fixed in #1880 -- this is the regression guard for it.
+    # The three tests above each rename ONE empty class, so the candidate
+    # sets are unique and a uniqueness precondition never fires. Renaming two
+    # empty classes in the same file is the case that broke: each candidate
+    # then has a peer, so a guard that ranks uniqueness ahead of `declared`
+    # drops a pairing the operation explicitly named, and the contract sees
+    # two removals plus two additions instead of two renames -- rolling back
+    # a correct edit. Verified sensitive: reinstating that precondition on
+    # main reddens this test and the one below, and no other.
+    root, store, updater = indexed
+    _write(root, "pkg/empty.py", "class Alpha:\n    pass\n\n\nclass Beta:\n    pass\n")
+    _observe(root, store, updater, ["pkg/empty.py"])
+
+    _write(root, "pkg/empty.py", "class Gamma:\n    pass\n\n\nclass Delta:\n    pass\n")
+    delta = _observe(
+        root,
+        store,
+        updater,
+        ["pkg/empty.py"],
+        declared_renames=frozenset(
+            {
+                (_qn("pkg.empty.Alpha"), _qn("pkg.empty.Gamma")),
+                (_qn("pkg.empty.Beta"), _qn("pkg.empty.Delta")),
+            }
+        ),
+    )
+
+    assert sorted(delta["symbols"]["renamed"], key=lambda r: r["old"]) == [
+        {
+            "old": _qn("pkg.empty.Alpha"),
+            "new": _qn("pkg.empty.Gamma"),
+            "path": "pkg/empty.py",
+        },
+        {
+            "old": _qn("pkg.empty.Beta"),
+            "new": _qn("pkg.empty.Delta"),
+            "path": "pkg/empty.py",
+        },
+    ]
+
+
+def test_an_undeclared_pair_is_still_refused_when_two_are_renamed(
+    indexed: tuple[Path, _StatefulIngestor, GraphUpdater],
+) -> None:
+    # The known-positive for the test above: admitting a declared pair past
+    # the uniqueness guard must NOT admit an undeclared one alongside it.
+    # Only Alpha->Gamma is declared, so Beta and Delta stay a removal plus an
+    # addition even though both sit in the same ambiguous group.
+    root, store, updater = indexed
+    _write(root, "pkg/empty.py", "class Alpha:\n    pass\n\n\nclass Beta:\n    pass\n")
+    _observe(root, store, updater, ["pkg/empty.py"])
+
+    _write(root, "pkg/empty.py", "class Gamma:\n    pass\n\n\nclass Delta:\n    pass\n")
+    delta = _observe(
+        root,
+        store,
+        updater,
+        ["pkg/empty.py"],
+        declared_renames=frozenset({(_qn("pkg.empty.Alpha"), _qn("pkg.empty.Gamma"))}),
+    )
+
+    assert delta["symbols"]["renamed"] == [
+        {
+            "old": _qn("pkg.empty.Alpha"),
+            "new": _qn("pkg.empty.Gamma"),
+            "path": "pkg/empty.py",
+        }
+    ]
+    assert _qn("pkg.empty.Beta") in delta["symbols"]["removed"]
+    assert _qn("pkg.empty.Delta") in delta["symbols"]["added"]
+
+
+def test_two_declared_nested_class_renames_are_both_reported(
+    indexed: tuple[Path, _StatefulIngestor, GraphUpdater],
+) -> None:
+    # The nested shape, which is what issue #1836 actually describes. The
+    # test above renames two MODULE-LEVEL empty classes, so a regression
+    # specific to nested qualified names would pass it (CodeRabbit on
+    # #1945). Here both renamed classes sit inside a stable enclosing
+    # class, so their qualified names carry the enclosing scope.
+    root, store, updater = indexed
+    _write(
+        root,
+        "pkg/empty.py",
+        "class Outer:\n    class Alpha:\n        pass\n\n"
+        "    class Beta:\n        pass\n",
+    )
+    _observe(root, store, updater, ["pkg/empty.py"])
+
+    _write(
+        root,
+        "pkg/empty.py",
+        "class Outer:\n    class Gamma:\n        pass\n\n"
+        "    class Delta:\n        pass\n",
+    )
+    delta = _observe(
+        root,
+        store,
+        updater,
+        ["pkg/empty.py"],
+        declared_renames=frozenset(
+            {
+                (_qn("pkg.empty.Outer.Alpha"), _qn("pkg.empty.Outer.Gamma")),
+                (_qn("pkg.empty.Outer.Beta"), _qn("pkg.empty.Outer.Delta")),
+            }
+        ),
+    )
+
+    assert sorted(delta["symbols"]["renamed"], key=lambda r: r["old"]) == [
+        {
+            "old": _qn("pkg.empty.Outer.Alpha"),
+            "new": _qn("pkg.empty.Outer.Gamma"),
+            "path": "pkg/empty.py",
+        },
+        {
+            "old": _qn("pkg.empty.Outer.Beta"),
+            "new": _qn("pkg.empty.Outer.Delta"),
+            "path": "pkg/empty.py",
+        },
+    ]

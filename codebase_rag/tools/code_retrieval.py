@@ -1,0 +1,183 @@
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+
+from loguru import logger
+from pydantic_ai import Tool
+
+from .. import logs as ls
+from .. import tool_errors as te
+from ..cypher_queries import CYPHER_FIND_BY_QUALIFIED_NAME, CYPHER_LIST_PROJECTS
+from ..schemas import CodeSnippet
+from ..services import QueryProtocol
+from ..taint import ReadContentRecord
+from ..utils.path_utils import (
+    SourceMiss,
+    locate_node_source,
+    project_roots_from_rows,
+)
+from ..utils.source_encoding import source_codec
+from . import tool_descriptions as td
+
+
+class CodeRetriever:
+    __slots__ = ("project_root", "ingestor", "_project_roots")
+
+    def __init__(self, project_root: str, ingestor: QueryProtocol):
+        self.project_root = Path(project_root).resolve()
+        self.ingestor = ingestor
+        # ponytail: session-lifetime cache; a project indexed after the first
+        # lookup is treated as unknown (permissive) until a new retriever.
+        self._project_roots: dict[str, str | None] | None = None
+        logger.info(ls.CODE_RETRIEVER_INIT.format(root=self.project_root))
+
+    async def _get_project_roots(self) -> dict[str, str | None]:
+        """Return the indexed projects' roots, caching after the first query."""
+        if self._project_roots is None:
+            self._project_roots = project_roots_from_rows(
+                await asyncio.to_thread(self.ingestor.fetch_all, CYPHER_LIST_PROJECTS)
+            )
+        return self._project_roots
+
+    async def find_code_snippet(self, qualified_name: str) -> CodeSnippet:
+        """Look up a qualified name in the graph and read back its source."""
+        logger.info(ls.CODE_RETRIEVER_SEARCH.format(name=qualified_name))
+
+        params = {"qn": qualified_name}
+        try:
+            results = await asyncio.to_thread(
+                self.ingestor.fetch_all, CYPHER_FIND_BY_QUALIFIED_NAME, params
+            )
+
+            if not results:
+                return CodeSnippet(
+                    qualified_name=qualified_name,
+                    source_code="",
+                    file_path="",
+                    line_start=0,
+                    line_end=0,
+                    found=False,
+                    error_message=te.CODE_ENTITY_NOT_FOUND,
+                )
+
+            res = results[0]
+            file_path_str = res.get("path")
+            start_line = res.get("start")
+            end_line = res.get("end")
+            if not isinstance(file_path_str, str):
+                file_path_str = ""
+
+            if (
+                not file_path_str.strip()
+                or type(start_line) is not int
+                or type(end_line) is not int
+                or start_line < 1
+                or end_line < start_line
+            ):
+                return CodeSnippet(
+                    qualified_name=qualified_name,
+                    source_code="",
+                    file_path=file_path_str,
+                    line_start=0,
+                    line_end=0,
+                    found=False,
+                    error_message=te.CODE_MISSING_LOCATION,
+                )
+
+            # The recorded absolute_path is authoritative: a same-named file
+            # in the active repo must not shadow a cross-project node. The
+            # relative join covers stale node paths and old graphs without
+            # the property (issue #425), but must stay inside the node's
+            # known project root too: a missing foreign source is not local.
+            project_roots = await self._get_project_roots()
+            absolute_path = res.get("absolute_path")
+            located = locate_node_source(
+                qualified_name,
+                absolute_path if isinstance(absolute_path, str) else None,
+                file_path_str,
+                project_roots,
+                self.project_root,
+            )
+            if located.path is None:
+                if located.miss == SourceMiss.STALE_ROOT:
+                    error_message = te.CODE_STALE_PROJECT_ROOT.format(
+                        project=located.project, root=located.root
+                    )
+                elif located.miss == SourceMiss.OUTSIDE_ROOT:
+                    error_message = te.CODE_MISSING_LOCATION
+                else:
+                    error_message = te.CODE_SOURCE_FILE_MISSING.format(
+                        path=file_path_str
+                    )
+                return CodeSnippet(
+                    qualified_name=qualified_name,
+                    source_code="",
+                    file_path=file_path_str,
+                    line_start=0,
+                    line_end=0,
+                    found=False,
+                    error_message=error_message,
+                )
+            full_path = located.path
+            # The recorded lines are lines of the text the indexer parsed,
+            # in the encoding a Python file declares (issue #2901).
+            with full_path.open("r", encoding=source_codec(full_path)) as f:
+                all_lines = f.readlines()
+
+            if end_line > len(all_lines):
+                return CodeSnippet(
+                    qualified_name=qualified_name,
+                    source_code="",
+                    file_path=file_path_str,
+                    line_start=0,
+                    line_end=0,
+                    found=False,
+                    error_message=te.CODE_MISSING_LOCATION,
+                )
+
+            snippet_lines = all_lines[start_line - 1 : end_line]
+            source_code = "".join(snippet_lines)
+            docstring = res.get("docstring")
+
+            return CodeSnippet(
+                qualified_name=qualified_name,
+                source_code=source_code,
+                file_path=file_path_str,
+                line_start=start_line,
+                line_end=end_line,
+                docstring=docstring if isinstance(docstring, str) else None,
+            )
+        except Exception as e:
+            logger.exception(ls.CODE_RETRIEVER_ERROR.format(error=e))
+            return CodeSnippet(
+                qualified_name=qualified_name,
+                source_code="",
+                file_path="",
+                line_start=0,
+                line_end=0,
+                found=False,
+                error_message=str(e),
+            )
+
+
+def create_code_retrieval_tool(
+    code_retriever: CodeRetriever, read_record: ReadContentRecord | None = None
+) -> Tool:
+    """Build the `get_code_snippet` tool, recording returned source in
+    `read_record` so it feeds the egress taint gate (issue #1128)."""
+
+    async def get_code_snippet(qualified_name: str) -> CodeSnippet:
+        """Fetch the source for a qualified name, recording what it returns."""
+        logger.info(ls.CODE_TOOL_RETRIEVE.format(name=qualified_name))
+        snippet = await code_retriever.find_code_snippet(qualified_name)
+        if read_record is not None and snippet.found:
+            # Feed the egress taint gate (issue #1128).
+            read_record.record(snippet.source_code)
+        return snippet
+
+    return Tool(
+        function=get_code_snippet,
+        name=td.AgenticToolName.GET_CODE_SNIPPET,
+        description=td.CODE_RETRIEVAL,
+    )

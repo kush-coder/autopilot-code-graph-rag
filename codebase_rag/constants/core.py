@@ -1,0 +1,496 @@
+# Cross-cutting kernel constants: separators, chars, paths, misc keys.
+
+from enum import StrEnum
+
+INIT_PY = "__init__.py"
+INIT_PYI = "__init__.pyi"
+# The files that name their PACKAGE rather than themselves: a stub-only
+# package ships `__init__.pyi` in place of `__init__.py` (issue #2445).
+PY_PACKAGE_INIT_FILES: tuple[str, ...] = (INIT_PY, INIT_PYI)
+
+ENCODING_UTF8 = "utf-8"
+ENCODING_UTF8_SIG = "utf-8-sig"
+# BOM-aware: decoding picks the byte order from the mark and drops it.
+ENCODING_UTF16 = "utf-16"
+ENCODING_UTF32 = "utf-32"
+# One byte order each, for the text after a BOM: writing that text back in
+# one of these, behind the same mark, gives the file's own bytes.
+ENCODING_UTF16_LE = "utf-16-le"
+ENCODING_UTF16_BE = "utf-16-be"
+ENCODING_UTF32_LE = "utf-32-le"
+ENCODING_UTF32_BE = "utf-32-be"
+ENCODING_ASCII = "ascii"
+# Codec names (as `codecs.lookup` normalises them) whose bytes the grammar
+# already reads as they are, so a source declaring one needs no transcoding.
+UTF8_CODEC_NAMES: frozenset[str] = frozenset({ENCODING_UTF8, ENCODING_UTF8_SIG})
+# PEP 263's declaration pattern, over bytes: the declaration is ASCII by
+# definition, and matching bytes lets a line that is not valid UTF-8 still be
+# searched. Only line 1, or line 2 under a blank or comment-only line 1, is
+# read, which is where CPython's tokenizer looks.
+PY_CODING_COOKIE_PATTERN = rb"^[ \t\f]*#.*?coding[:=][ \t]*([-\w.]+)"
+PY_CODING_BLANK_LINE_PATTERN = rb"^[ \t\f]*(?:[#\r\n]|$)"
+# Every 7-bit byte. PEP 263 admits only encodings that read these as ASCII: a
+# declaration is itself ASCII, so an encoding that reads it differently (UTF-16,
+# EBCDIC) cannot have been what the author meant, and CPython rejects the file.
+ASCII_BYTES = bytes(range(128))
+# Longest UTF-8 sequence, so a window this size either side of a name spans
+# any single character that could legitimately sit next to it.
+UTF8_MAX_SEQUENCE_BYTES = 4
+# Sigils an ingestor prepends to a synthesized symbol name (a C# destructor
+# is stored as `~Greeter` while the source leaf is `Greeter`).
+SYNTHETIC_NAME_PREFIXES = "~"
+# What `errors="replace"` substitutes for an undecodable byte. Its presence
+# in an extracted symbol name means the name is damaged.
+UNICODE_REPLACEMENT_CHAR = "\ufffd"
+# Line endings a text file can use. Text-mode reading maps each one to "\n",
+# so an editor that writes back what it read must read and write with
+# newline="" (no translation) to keep the file's own endings.
+LINE_FEED = "\n"
+CARRIAGE_RETURN = "\r"
+CRLF = "\r\n"
+NEWLINE_UNTRANSLATED = ""
+
+ARG_TARGET_CODE = "target_code"
+ARG_REPLACEMENT_CODE = "replacement_code"
+ARG_FILE_PATH = "file_path"
+ARG_CONTENT = "content"
+ARG_COMMAND = "command"
+ARG_PATTERN = "pattern"
+ARG_REWRITE = "rewrite"
+ARG_LANGUAGE = "language"
+ARG_DRY_RUN = "dry_run"
+
+SEPARATOR_DOT = "."
+SEPARATOR_SLASH = "/"
+SEPARATOR_BACKSLASH = "\\"
+# Splits "provider:model" both in user-supplied settings and in the model
+# names pydantic-ai enumerates.
+MODEL_STRING_SEPARATOR = ":"
+# `derive_project_name` builds "<name>__<8-hex-digest>", so this marker is
+# what distinguishes a project-qualified name from free text that merely
+# contains dots (a docstring, a file path).
+PROJECT_NAME_DIGEST_MARKER = "__"
+# Hex digits after the marker. Shared so `derive_project_name` and the
+# scoping filter that recognises its output cannot drift apart.
+PROJECT_NAME_DIGEST_LEN = 8
+# Qualified names are `<project>.<package path>.<module>.<symbol>` and nodes
+# merge on them, so a `.` in a project name aliases another project's package
+# (issue #2412).
+ERR_PROJECT_NAME_HAS_SEPARATOR = (
+    "Project name '{name}' contains '.', which separates the parts of a "
+    "qualified name: its nodes would merge with those of a package at the "
+    "same path in another project. Use a name without '.', e.g. '{suggestion}'."
+)
+# Disambiguates definitions that share one qualified name (if/else import
+# fallbacks, typing.overload, try/except fallbacks): "<qn>@<start_line>".
+DUP_QN_MARKER = "@"
+# Joined after the line when a same-named definition already holds that line,
+# so same-line twins stay distinct (issue #1071). Every consumer splits on
+# DUP_QN_MARKER and keeps the base, so nothing reads the suffix back.
+DUP_QN_COLUMN_MARKER = "_"
+# The CLR metadata spelling of a generic arity (`Foo`1` for `Foo<T>`). C#
+# overloads a type name by arity, so a generic type declared beside a
+# same-named type of another arity carries it in its qn (issue #2579), and a
+# stored C# type reference carries its written arity the same way.
+CSHARP_GENERIC_ARITY_MARKER = "`"
+
+PATH_CURRENT_DIR = "."
+PATH_PARENT_DIR = ".."
+GLOB_ALL = "*"
+
+TRIE_TYPE_KEY = "__type__"
+TRIE_QN_KEY = "__qn__"
+TRIE_INTERNAL_PREFIX = "__"
+
+BYTES_PER_MB = 1024 * 1024
+
+EMPTY_PARENS = "()"
+DOCSTRING_STRIP_CHARS = "'\" \n"
+
+INLINE_MODULE_PATH_PREFIX = "inline_module_"
+
+# Method name constants for getattr/hasattr
+METHOD_FIND_WITH_PREFIX = "find_with_prefix"
+METHOD_ITEMS = "items"
+
+JSON_INDENT = 2
+
+
+class EventType(StrEnum):
+    MODIFIED = "modified"
+    CREATED = "created"
+    DELETED = "deleted"
+    MOVED = "moved"
+    CLOSED = "closed"
+
+
+# `opened` and `closed_no_write` are reads, and `closed` only ends a write
+# whose `modified` normally came first, so none of them is re-ingested alone.
+CONTENT_EVENT_TYPES = frozenset(
+    {EventType.MODIFIED, EventType.CREATED, EventType.DELETED}
+)
+
+# The events that can change an ignore rule's input. A read cannot, and
+# re-reading the rules reads those very files: a watcher that followed reads
+# re-read `.gitignore` forever after one `git status` (issue #3583).
+RULE_INPUT_EVENT_TYPES = CONTENT_EVENT_TYPES | {EventType.MOVED, EventType.CLOSED}
+
+
+WATCHER_SLEEP_INTERVAL = 1
+LOG_LEVEL_INFO = "INFO"
+LOG_LEVEL_ERROR = "ERROR"
+ENV_LOGURU_LEVEL = "LOGURU_LEVEL"
+# Where a refused setting came from, as its error message names it.
+SETTING_ORIGIN_ENVIRONMENT = "the environment"
+SETTING_ORIGIN_DOTENV = "./.env"
+# python-dotenv's switch for not loading `.env`, and the values that turn it on,
+# honoured as `load_dotenv` honours them.
+ENV_PYTHON_DOTENV_DISABLED = "PYTHON_DOTENV_DISABLED"
+PYTHON_DOTENV_DISABLED_VALUES = frozenset({"1", "true", "t", "yes", "y"})
+LOGURU_DEFAULT_HANDLER_ID = 0
+
+# Debounce settings for the real-time watcher (`cgr watch`)
+DEFAULT_DEBOUNCE_SECONDS = 5
+DEFAULT_MAX_WAIT_SECONDS = 30
+
+CHAR_HYPHEN = "-"
+CHAR_UNDERSCORE = "_"
+CHAR_EQUALS = "="
+
+CHAR_SEMICOLON = ";"
+CHAR_COMMA = ","
+CHAR_COLON = ":"
+CHAR_ANGLE_OPEN = "<"
+CHAR_ANGLE_CLOSE = ">"
+CHAR_EQUALS = "="
+CHAR_PAREN_OPEN = "("
+CHAR_PAREN_CLOSE = ")"
+CHAR_QUESTION_MARK = "?"
+
+CHAR_SPACE = " "
+SEPARATOR_COMMA_SPACE = ", "
+SEPARATOR_SEMICOLON_SPACE = "; "
+PUNCTUATION_TYPES = (CHAR_PAREN_OPEN, CHAR_PAREN_CLOSE, CHAR_COMMA)
+
+REGEX_METHOD_CHAIN_SUFFIX = r"\)\.[^)]*$"
+# Receiver chains longer than this many hops stay unresolved. Every call in a
+# chain re-reads its whole receiver, so resolving an n-hop chain cost O(n^2):
+# a 20 KB file of `.m()` hops took minutes and gigabytes (#2262). Hand-written
+# fluent chains are far shorter.
+MAX_RECEIVER_CHAIN_HOPS = 64
+REGEX_FINAL_METHOD_CAPTURE = r"\.([^.()]+)$"
+
+DEFAULT_NAME = "Unknown"
+TEXT_UNKNOWN = "unknown"
+
+TMP_EXTENSION = ".tmp"
+
+# Filenames whose module IS their directory, PER LANGUAGE: an importer writes
+# the directory name, never the file's own stem. The extension is part of the
+# rule, not decoration -- `index.py` and `mod.py` are ordinary Python modules
+# imported by those names, and a language-blind stem set silently gives them no
+# importable name at all. `lib.rs`/`main.rs` are crate roots named by the
+# manifest rather than the directory, so they are deliberately absent.
+DIRECTORY_MODULE_STEM_BY_EXT: dict[str, str] = {
+    ".py": "__init__",
+    ".pyi": "__init__",
+    ".rs": "mod",
+    ".js": "index",
+    ".jsx": "index",
+    ".mjs": "index",
+    ".cjs": "index",
+    ".ts": "index",
+    ".tsx": "index",
+    # `.mts`/`.cts` are TypeScript's ESM/CJS forms and are directory entry
+    # points exactly as `.mjs`/`.cjs` are. They belong to `TS_EXTENSIONS` and
+    # to `JS_TS_MODULE_EXTENSIONS`, which is the set cgr's own directory-index
+    # resolution already searches, so omitting them here made `pkg/index.mts`
+    # derive `pkg.index` instead of `pkg` and the unresolved-importer query
+    # asked for a name no waiter had written (issue #1682 review).
+    ".mts": "index",
+    ".cts": "index",
+}
+MOD_RS = "mod.rs"
+LIB_RS = "lib.rs"
+MAIN_RS = "main.rs"
+SEPARATOR_DOUBLE_COLON = "::"
+SEPARATOR_PROTOTYPE = ".prototype."
+RUST_CRATE_KEYWORD = "crate"
+# A Rust crate path whose module is backed by a file the qn scheme cannot key
+# (an unrepresentable `#[path]` target: absolute, Windows-separated, or a climb
+# above the repository root) has no referent in the graph. The resolvers return
+# this qn so the path binds nothing and callers treat it as a decided drop
+# rather than falling back to a name-derived shadow file (issue #1082). The NUL
+# byte keeps it distinct from every real qn while remaining an ordinary str.
+RUST_UNRESOLVABLE_QN = "\x00unrepresentable"
+BUILTIN_PREFIX = "builtin"
+IIFE_FUNC_PREFIX = "iife_func_"
+IIFE_ARROW_PREFIX = "iife_arrow_"
+OPERATOR_PREFIX = "operator"
+KEYWORD_SUPER = "super"
+KEYWORD_SELF = "self"
+KEYWORD_CONSTRUCTOR = "constructor"
+# Receivers that name the enclosing type rather than an ordinary value, so
+# `self.Inner()` and `cls.Inner()` are real nested-class constructions.
+# Membership is not sufficient on its own: `self` is also a legal Go receiver
+# name, and a spelling test alone accepted `self.Error()` for a module-level
+# `Error`. The caller pairs this with a nesting check against the enclosing
+# type, which is what actually distinguishes the two (issue #1641).
+SELF_RECEIVER_KEYWORDS = frozenset({"self", "cls", "this"})
+
+# Incremental update hash cache
+HASH_CACHE_FILENAME = ".cgr-hash-cache.json"
+# The cache entry of a file the run could not read: never a real digest, so
+# the next run hashes the file whatever its mtime and, finding no match,
+# re-parses it with the delete-before-reparse a KNOWN file gets (issue #1983).
+HASH_CACHE_UNREADABLE = "unreadable"
+DIR_MTIMES_FILENAME = ".cgr-dir-mtimes.json"
+# `cgr index` keeps a run's sync state in a throwaway directory with this
+# prefix instead of the repository (issue #2401).
+INDEX_STATE_DIR_PREFIX = "cgr-index-state-"
+# Present while an EXPOSES cleanup the last run skipped (its project registry
+# was unreadable) is still owed; the in-sync fast path refuses until a batch
+# run has done it (issue #2193).
+EXPOSES_CLEANUP_PENDING_FILENAME = ".cgr-exposes-cleanup-pending"
+# Present while an orphan prune the last run cut short is still owed: a path
+# read failed, or the project registry was unreadable and rows whose owner it
+# could not establish were left (issue #1985). Unchanged files would otherwise
+# take the in-sync fast path, which never prunes, and keep those rows forever.
+PRUNE_PENDING_FILENAME = ".cgr-prune-pending"
+# Present while an embeddings pass a run left incomplete is still owed by the
+# project the file names: a symbol's point was not stored and verified, or a
+# stale point was not removed. Unchanged files would otherwise take the in-sync
+# fast path, which never embeds, and an edited function whose new point the
+# store refused stayed unsearchable until another file changed (review of PR
+# #2550). One file per project, `{digest}` the SHA-256 of its name, so that
+# projects syncing one checkout at once never rewrite each other's (review of
+# PR #3358). Not in CGR_STATE_FILENAMES: no cgr ever wrote one into the tree,
+# so there is nothing to move out of it.
+EMBEDDINGS_PENDING_PROJECT_TEMPLATE = ".cgr-embeddings-pending-{digest}"
+# The vector store backend a project's points were last settled in, one file
+# per project for the same reason; likewise never written into the tree.
+EMBEDDINGS_STORE_PROJECT_TEMPLATE = ".cgr-embeddings-store-{digest}"
+# The marker an earlier build shared between every project of a checkout: a
+# JSON list of the projects owing a pass, or an empty file. Read so that each
+# still retries once, then split into the per-project files above.
+EMBEDDINGS_PENDING_FILENAME = ".cgr-embeddings-pending"
+PARSER_FINGERPRINT_FILENAME = ".cgr-parser-fingerprint"
+# The parser fingerprint asks each active toolchain for its version (`go
+# version`, `javac -version`, `dotnet --version`) on every sync. A probe that
+# misses the first timeout, or whose process the OS could not start for want
+# of a resource, is asked once more, for longer, unless an earlier process
+# already got an answer from the same binary under the same pins.
+TOOL_VERSION_PROBE_TIMEOUT = 10.0
+TOOL_VERSION_PROBE_RETRY_TIMEOUT = 30.0
+# A toolchain that could not be asked in either attempt. It is not `absent`
+# (no binary, or one that exits non-zero): a slow machine is not a missing
+# compiler, so this value compares as unchanged rather than forcing a re-parse.
+TOOL_VERSION_UNKNOWN = "unknown"
+# Files that select a toolchain from the probe's working directory or one of
+# its parents: `go.work` and `go.mod` (its `go` and `toolchain` lines) for Go,
+# `global.json` for .NET. A remembered answer stands only while they do.
+TOOLCHAIN_PIN_FILENAMES: tuple[str, ...] = ("go.work", "go.mod", "global.json")
+# The last answer each probe gave, keyed by the binary's path and stat
+# identity, the argument, the working directory and its pins; at most
+# TOOL_VERSION_PROBE_CACHE_MAX_ENTRIES of them, the most recent kept.
+TOOL_VERSION_PROBE_CACHE_FILENAME = ".cgr-tool-version-probes.json"
+TOOL_VERSION_PROBE_CACHE_MAX_ENTRIES = 16
+# The tool versions the checkout's last parser fingerprint hashed, which an
+# `unknown` answer stands in for.
+TOOL_VERSIONS_HASHED_FILENAME = ".cgr-tool-versions.json"
+DELOMBOK_STATE_FILENAME = ".cgr-delombok-state.json"
+# The exclusion set the last run indexed under, covering both the excludes and
+# the unignores (which come from `!` lines in .cgrignore/.gitignore and from
+# interactive setup; there is no --unignore flag). Nothing on disk changes when
+# only the CLI --exclude flags do, so without this the sync check cannot tell
+# that the eligible set moved (issue #1606).
+EXCLUSION_STATE_FILENAME = ".cgr-exclusion-state.json"
+# Each project's own stamp inside the exclusion state file, keyed by project
+# name. The top-level keys stay the LAST run's stamp, which is what the
+# repository-wide hash cache belongs to; this map is what lets every project
+# indexed from one tree read its own scope back (issue #1987).
+EXCLUSION_STATE_PROJECTS_KEY = "projects"
+# Recorded edit transactions for `cgr edits show|undo` (issue #1528).
+EDIT_HISTORY_FILENAME = ".cgr-edit-history.json"
+EDIT_LOCK_FILENAME = ".cgr-edit-lock"
+# Held by the one writer syncing the checkout (issue #2441), in the
+# checkout's state directory under CGR_HOME like the edit lock (issue #2427).
+SYNC_LOCK_FILENAME = ".cgr-sync-lock"
+# How often a scoped reingest re-checks a lock a running sync holds.
+SYNC_LOCK_POLL_SECONDS = 0.2
+# How long, and how often, a sync that is refused rather than queued retries
+# a lock whose recorded holder has exited: Windows releases a dead process's
+# byte-range locks asynchronously, "depending upon available system
+# resources" (LockFileEx), so a sync rerun right after one was killed can
+# find its lock still held.
+SYNC_LOCK_RELEASE_GRACE_SECONDS = 2.0
+SYNC_LOCK_RELEASE_POLL_SECONDS = 0.05
+# The byte a Windows sync locks, far past the holder's pid and project at
+# the start of the file: a byte-range lock there also blocks other
+# processes' reads, and a refused writer must read whom it waits for.
+SYNC_LOCK_REGION_OFFSET = 1 << 20
+# A refused writer reads at most this much of the holder's name, well short
+# of the locked byte above.
+SYNC_LOCK_HOLDER_MAX_BYTES = 4096
+# The ids of edit history entries taken from the tree, or that left the
+# history (undone or aged out), which are never added from a history in the
+# tree again (issue #2427).
+EDIT_HISTORY_LEDGER_FILENAME = ".cgr-edit-history-ledger.json"
+PLATFORM_WINDOWS = "win32"
+# Permission bits copied onto a replacement file (rwx for u/g/o, setuid etc.).
+EDIT_MODE_MASK = 0o7777
+# Mode of the exclusively created temp sibling before the target's mode is
+# copied onto it: owner-only, so nothing reads staged bytes mid-write.
+EDIT_TEMP_FILE_MODE = 0o600
+# Approvals of repositories' .cgr.md files, under CGR_HOME (issue #3456).
+TRUSTED_INSTRUCTIONS_FILENAME = "trusted_instructions.json"
+ENV_CGR_HOME = "CGR_HOME"
+CGR_HOME_DIRNAME = ".cgr"
+TRUST_STORE_FILE_MODE = 0o600
+TRUST_STORE_DIR_MODE = 0o700
+# Between ~/.cgr.md and the repository's .cgr.md in the system prompt.
+CGR_INSTRUCTIONS_SEPARATOR = "\n\n---\n\n"
+# Read only from the environment cgr starts with, never from `.env` in the
+# working directory, which usually belongs to the repository being analysed.
+ENVIRONMENT_ONLY_SETTINGS = frozenset(
+    {
+        "CGR_TRUST_PROJECT_INSTRUCTIONS",
+        "CGR_ALLOW_SENSITIVE_READS",
+        "CGR_ALLOW_SENSITIVE_WRITES",
+    }
+)
+# Every file cgr keeps about one checkout. They live in that checkout's
+# directory under CGR_HOME / CGR_STATE_DIRNAME rather than in the working
+# tree, and a copy an older cgr left in the tree is moved there, so a name
+# added here is kept out of the tree and migrated with no code of its own
+# (issue #2427); a lock is registered in CGR_STATE_LOCK_FILENAMES as well.
+CGR_STATE_FILENAMES: frozenset[str] = frozenset(
+    {
+        HASH_CACHE_FILENAME,
+        DIR_MTIMES_FILENAME,
+        EXPOSES_CLEANUP_PENDING_FILENAME,
+        PRUNE_PENDING_FILENAME,
+        EMBEDDINGS_PENDING_FILENAME,
+        PARSER_FINGERPRINT_FILENAME,
+        TOOL_VERSION_PROBE_CACHE_FILENAME,
+        TOOL_VERSIONS_HASHED_FILENAME,
+        DELOMBOK_STATE_FILENAME,
+        EXCLUSION_STATE_FILENAME,
+        EDIT_HISTORY_FILENAME,
+        EDIT_HISTORY_LEDGER_FILENAME,
+        EDIT_LOCK_FILENAME,
+        SYNC_LOCK_FILENAME,
+    }
+)
+# The state files that are locks. One an older cgr left in the tree is never
+# moved, copied or removed: another process may hold it, or be about to open
+# it by that path, so replacing it would let two holders run at once.
+# Instead it stays. The edit lock's tree copy is taken along with the lock
+# under CGR_HOME for as long as it is there (issue #2427); no released cgr
+# took a sync lock in the tree, so a sync takes only the one under CGR_HOME
+# and leaves a tree copy alone (issue #2441).
+CGR_STATE_LOCK_FILENAMES: frozenset[str] = frozenset(
+    {EDIT_LOCK_FILENAME, SYNC_LOCK_FILENAME}
+)
+CGR_STATE_DIRNAME = "state"
+# Edit transactions (issue #1528).
+EDIT_HISTORY_LIMIT = 50
+
+# What a TransactionConflict means for a rename's rollback. Absence from the
+# history is only evidence of an undo while the history has not reached its
+# retention limit; at the limit an entry can have been EVICTED with its
+# rename still on disk.
+RENAME_UNDO_STACKED = "stacked"
+RENAME_UNDO_UNDONE = "undone"
+RENAME_UNDO_UNKNOWN = "unknown"
+EDIT_TRANSACTION_ID_LENGTH = 12
+EDIT_STAGING_PREFIX = "cgr-edit-"
+DIFF_DEV_NULL = "/dev/null"
+EDIT_KEY_ID = "id"
+EDIT_KEY_AT = "at"
+EDIT_KEY_FILES = "files"
+EDIT_KEY_BEFORE = "before"
+EDIT_KEY_AFTER = "after"
+EDIT_KEY_VERIFICATION = "verification"
+EDIT_KEY_OK = "ok"
+EDIT_KEY_MESSAGE = "message"
+EDIT_KEY_MODE = "mode"
+
+# Inputs to the parser fingerprint: everything that changes how source files
+# become graph nodes and edges, plus the installed grammar wheels. Paths are
+# relative to the codebase_rag package root.
+# `analyzers` holds the ast-grep finding analyzer: it decides which finding
+# nodes a file gets and how they are keyed, exactly as a parser decides edges.
+PARSER_FINGERPRINT_SOURCE_DIRS: tuple[str, ...] = ("parsers", "constants", "analyzers")
+PARSER_FINGERPRINT_SOURCE_FILES: tuple[str, ...] = (
+    "graph_updater.py",
+    "function_registry.py",
+    "ast_cache.py",
+    "language_spec.py",
+    "parser_loader.py",
+    # `base_module_qn` lives here, and the whole graph keys on the names it
+    # derives: change the rule and every module node should be re-keyed. It
+    # was absent, so a change touching ONLY this file left existing indexes on
+    # the old identities with no staleness warning, and `utils/` is in neither
+    # of the directory globs above (issue #1720 review).
+    "utils/path_utils.py",
+    # Decides which bytes the grammar reads for a Python source, so every name
+    # in a declared-encoding file depends on it (issue #2445).
+    "utils/source_encoding.py",
+)
+PY_SOURCE_GLOB = "*.py"
+# The bundled Roslyn C# frontend tool is parser code too, though .cs/.csproj
+# rather than Python: an edit changes the semantic edges it produces, so its
+# sources are folded into the parser fingerprint.
+PARSER_FINGERPRINT_TOOL_DIR = "parsers/csharp_frontend/roslyn"
+PARSER_FINGERPRINT_TOOL_GLOBS: tuple[str, ...] = ("*.cs", "*.csproj")
+# Bundled semantic-frontend tool sources (per (dir, globs)): parser code that
+# is not Python, so an edit must still trip the staleness fingerprint.
+PARSER_FINGERPRINT_TOOL_SOURCES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("parsers/csharp_frontend/roslyn", ("*.cs", "*.csproj")),
+    ("parsers/go_frontend/gotypes", ("*.go", "*.mod", "*.sum")),
+    ("parsers/java_frontend/javac", ("**/*.java",)),
+    # The ast-grep YAML is data, not code, but it decides what unchanged
+    # sources produce: the finding rules which Pattern/CodeSmell/SecurityIssue
+    # nodes exist, the tier patterns which definitions do. A rule change with
+    # unchanged sources otherwise kept the old rules' findings on the in-sync
+    # fast path (review of #2533).
+    ("analyzers/ast_grep_rules", ("**/*.yaml",)),
+    ("parsers/ast_grep_patterns", ("*.yaml",)),
+)
+GRAMMAR_DIST_PREFIX = "tree-sitter"
+GRAMMAR_VERSION_FMT = "{name}=={version}"
+GIT_DIR_NAME = ".git"
+ROOT_DIR_KEY = "."
+JSON_EMPTY_OBJECT = "{}"
+
+STR_NONE = "None"
+
+ENTITY_CLASS = "Class"
+ENTITY_FUNCTION = "Function"
+ENTITY_METHOD = "Method"
+
+PREFIX_LAMBDA = "lambda_"
+PREFIX_ANONYMOUS = "anonymous_"
+PREFIX_IIFE = "iife_"
+PREFIX_IIFE_DIRECT = "iife_direct_"
+PREFIX_ARROW = "arrow"
+PREFIX_FUNC = "func"
+
+# JSON keys for stdlib introspection subprocess responses
+JSON_KEY_HAS_ENTITY = "hasEntity"
+JSON_KEY_ENTITY_TYPE = "entityType"
+
+IMPORT_DEFAULT_SUFFIX = ".default"
+# The simple name of a JS/TS module's default export: an unnamed
+# `export default class {...}` registers under it, so the `<module>.default`
+# target a default import is mapped to (IMPORT_DEFAULT_SUFFIX) is a real node.
+JS_DEFAULT_EXPORT_NAME = "default"
+IMPORT_STD_PREFIX = "std."
+CPP_STD_PREFIX = "std"
+IMPORT_MODULE_LABEL = "Module"
+IMPORT_QUALIFIED_NAME = "qualified_name"
+IMPORT_RELATIONSHIP = "IMPORTS"
+
+# Delimiter tokens for argument parsing
+DELIMITER_TOKENS = frozenset({"(", ")", ","})

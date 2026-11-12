@@ -1,0 +1,207 @@
+from typing import NamedTuple, NotRequired, TypedDict
+
+from codebase_rag.types_defs import JsonValue, PropertyValue
+
+
+class NodeKey(NamedTuple):
+    kind: str
+    file: str
+    start_line: int
+
+
+class DefNode(NamedTuple):
+    key: NodeKey
+    name: str
+    end_line: int
+
+
+class EdgeKey(NamedTuple):
+    rel_type: str
+    parent: NodeKey
+    child: NodeKey
+
+
+class NameEdge(NamedTuple):
+    rel_type: str
+    source: NodeKey
+    target_name: str
+
+
+class ColGrepEdges(NamedTuple):
+    edges: set[NameEdge]
+    # (symbol, stderr) of the search that failed, which ends the arm early;
+    # None when every search ran.
+    failure: tuple[str, str] | None
+
+
+class GraphData(NamedTuple):
+    nodes: dict[NodeKey, DefNode]
+    edges: set[EdgeKey]
+    name_edges: set[NameEdge]
+
+
+class GraphState(NamedTuple):
+    # A flat, comparable snapshot of a captured graph: node identities
+    # (label, unique-id) and directed edges (from_label, from_id, rel,
+    # to_label, to_id). Used to diff an incremental update against a clean
+    # re-index, which serves as the oracle.
+    nodes: frozenset[tuple[str, str]]
+    edges: frozenset[tuple[str, str, str, str, str]]
+
+
+class ScoreRow(TypedDict):
+    category: str
+    label: str
+    tp: int
+    fp: int
+    fn: int
+    precision: float
+    recall: float
+    f1: float
+
+
+class LocationStats(NamedTuple):
+    matched: int
+    end_exact: int
+    end_within_one: int
+    mean_abs_delta: float
+    max_abs_delta: int
+
+
+class DiffBucket(TypedDict):
+    missing: list[str]
+    extra: list[str]
+
+
+class ScoreResult(NamedTuple):
+    rows: list[ScoreRow]
+    location: LocationStats
+    diff: dict[str, DiffBucket]
+
+
+class OracleRecord(TypedDict):
+    kind: str
+    file: str
+    line: int
+    name: str
+    # Optional so oracles without span emission keep working (records_to_nodes
+    # falls back to the start line).
+    end_line: NotRequired[int]
+
+
+class OracleNodeRef(TypedDict):
+    kind: str
+    file: str
+    line: int
+
+
+class OracleEdge(TypedDict):
+    rel: str
+    parent: OracleNodeRef
+    child: OracleNodeRef
+
+
+class OracleNameEdge(TypedDict):
+    rel: str
+    source: OracleNodeRef
+    target_name: str
+
+
+class OracleCall(TypedDict):
+    file: str
+    name: str
+
+
+# One first-party call site at file granularity: (caller_file, callee_simple_name).
+CallEdge = tuple[str, str]
+
+
+class CallOracle(NamedTuple):
+    edges: set[CallEdge]
+    # The first-party name universe, so the cgr side is held to the same names.
+    declared: frozenset[str]
+    # The files the oracle parsed cleanly, for oracles that silently skip what
+    # they cannot parse; None when it covers every file.
+    covered: frozenset[str] | None = None
+
+
+class OraclePayload(TypedDict):
+    nodes: list[OracleRecord]
+    edges: list[OracleEdge]
+    name_edges: list[OracleNameEdge]
+    # Optional: only call-aware oracles (Go multi-language retrieval) emit call
+    # sites; structure-only oracles omit this key.
+    calls: NotRequired[list[OracleCall]]
+    # Optional: only an oracle that skips unparseable files (scalameta) lists
+    # the ones it parsed cleanly.
+    covered: NotRequired[list[str]]
+
+
+class IndexingStats(TypedDict):
+    corpus: str
+    commit: str
+    parser_load_s: float
+    build_s: float
+    peak_rss_mib: float | None
+    nodes: int
+    edges: int
+    modules: int
+    files: int
+    python: str
+    platform: str
+
+
+class QAGrade(TypedDict):
+    f1: float
+    exact: bool
+    answered: list[str]
+    expected: list[str]
+
+
+class QARecord(TypedDict):
+    condition: str
+    name: str
+    f1: float
+    exact: bool
+    seconds: float
+    input_tokens: int
+    output_tokens: int
+    answered: list[str]
+    expected: list[str]
+    error: str
+
+
+# --- graph backend parity (issue #386) ---------------------------------------
+class ParityQueryRecording(TypedDict, total=False):
+    """One read query's outcome on one backend: its rows, or its error."""
+
+    columns: list[str]
+    rows: list[list[JsonValue]]
+    ms: float
+    error: str
+
+
+class ParityRecording(TypedDict, total=False):
+    engine: str
+    load_s: float
+    results: dict[str, ParityQueryRecording]
+
+
+class ParityRelationship(TypedDict):
+    from_label: str
+    from_props: dict[str, PropertyValue]
+    type: str
+    props: dict[str, PropertyValue]
+    to_label: str
+    to_props: dict[str, PropertyValue]
+
+
+class ParityNode(TypedDict):
+    labels: list[str]
+    props: dict[str, PropertyValue]
+
+
+class ParityDump(TypedDict):
+    nodes: list[ParityNode]
+    rels: list[ParityRelationship]
+    params: dict[str, PropertyValue]

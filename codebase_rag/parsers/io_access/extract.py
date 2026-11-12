@@ -1,0 +1,1326 @@
+from __future__ import annotations
+
+import re
+from collections.abc import Iterator, Mapping
+from enum import Enum, auto
+
+from tree_sitter import Node
+
+from ... import constants as cs
+from ..utils import cpp_declarator_name, python_import_bound_names
+from .constants import DYNAMIC_TARGET, PY_SCOPE_BOUNDARIES
+from .descriptor import LanguageDescriptor
+from .models import RenderedText
+
+# Definition nodes whose BODY is a separate scope but whose HEADER (default arg
+# values, annotations, base classes, decorators) executes in the enclosing scope at
+# definition time.
+_PY_DEFINITION_TYPES = (
+    cs.TS_PY_FUNCTION_DEFINITION,
+    cs.TS_PY_CLASS_DEFINITION,
+    cs.TS_PY_DECORATED_DEFINITION,
+)
+
+
+# Statements that hand a name to another scope's bindings.
+_PY_SCOPE_DECLARATIONS = frozenset(
+    {cs.TS_PY_GLOBAL_STATEMENT, cs.TS_PY_NONLOCAL_STATEMENT}
+)
+
+
+def _definition_body(node: Node) -> Node | None:
+    if node.type == cs.TS_PY_DECORATED_DEFINITION:
+        inner = node.child_by_field_name(cs.FIELD_DEFINITION)
+        return _definition_body(inner) if inner is not None else None
+    if node.type in (cs.TS_PY_FUNCTION_DEFINITION, cs.TS_PY_CLASS_DEFINITION):
+        return node.child_by_field_name(cs.FIELD_BODY)
+    return None
+
+
+def scope_seed_nodes(caller_node: Node) -> list[Node]:
+    # The top-level nodes of the caller's OWN scope. For a function/class the own
+    # scope is just its body block; its header (params/decorators/bases) belongs to
+    # the enclosing scope. For a module it is every child.
+    body = _definition_body(caller_node)
+    return list(body.children) if body is not None else list(caller_node.children)
+
+
+def _binding_identifiers(target: Node) -> set[str]:
+    # The identifiers a Python binding target actually binds: the target itself,
+    # or every identifier nested in a destructuring pattern (`os, v = ...` /
+    # `[os, v] = ...` / `for os, v in ...`). An attribute or subscript target
+    # (`os.environ['K'] = v`, `a.b = v`) binds NO plain name -- its identifiers
+    # are loads, not stores -- so those subtrees are skipped entirely.
+    out: set[str] = set()
+    stack = [target]
+    while stack:
+        node = stack.pop()
+        if node.type == cs.TS_PY_IDENTIFIER and node.text is not None:
+            out.add(node.text.decode(cs.ENCODING_UTF8))
+        elif node.type not in (cs.TS_PY_ATTRIBUTE, cs.TS_PY_SUBSCRIPT):
+            stack.extend(node.children)
+    return out
+
+
+def _python_parameter_names(scope_node: Node) -> set[str]:
+    # A function's parameter names are local for the whole function (their scope
+    # IS the body), so `def leak(os):` shadows a module-level `import os` for the
+    # entire body like any assignment (CodeRabbit review on PR #1325). A typed /
+    # default parameter binds only its `name` field -- its annotation / default
+    # expressions are loads in the ENCLOSING scope, never bindings here.
+    names: set[str] = set()
+    for param in _python_parameter_nodes(scope_node):
+        names |= _python_parameter_bindings(param)
+    return names
+
+
+def _python_parameter_nodes(scope_node: Node) -> list[Node]:
+    if scope_node.type == cs.TS_PY_DECORATED_DEFINITION:
+        inner = scope_node.child_by_field_name(cs.FIELD_DEFINITION)
+        if inner is not None:
+            scope_node = inner
+    if scope_node.type != cs.TS_PY_FUNCTION_DEFINITION:
+        return []
+    params = scope_node.child_by_field_name(cs.FIELD_PARAMETERS)
+    return list(params.named_children) if params is not None else []
+
+
+def _python_parameter_bindings(param: Node) -> set[str]:
+    if param.type in (
+        cs.TS_PY_DEFAULT_PARAMETER,
+        cs.TS_PY_TYPED_DEFAULT_PARAMETER,
+    ):
+        name = param.child_by_field_name(cs.TS_FIELD_NAME)
+        if name is not None and name.type == cs.TS_PY_IDENTIFIER and name.text:
+            return {name.text.decode(cs.ENCODING_UTF8)}
+        return set()
+    if param.type == cs.TS_PY_TYPED_PARAMETER:
+        # A typed parameter has no `name` field: the binding identifier is the
+        # DIRECT child before the `type` field (`os: int` -> os); the
+        # annotation identifier sits inside the type field and is never a
+        # binding here.
+        name = next(
+            (c for c in param.children if c.type == cs.TS_PY_IDENTIFIER),
+            None,
+        )
+        if name is not None and name.text is not None:
+            return {name.text.decode(cs.ENCODING_UTF8)}
+        return set()
+    return _binding_identifiers(param)
+
+
+def _global_declared_names(scope_node: Node) -> set[str]:
+    # Identifiers declared `global` in this scope's OWN body (nested
+    # defs/classes pruned): `global os` makes EVERY `os` use here resolve to
+    # the module-level binding, so a same-named assignment is a GLOBAL rebind,
+    # not a local -- the whole-scope locality rule must not treat it as a
+    # shadowing local (CodeRabbit review on PR #1325). A module scope is never
+    # `global`-affected (there it is a legal no-op and the assignment still
+    # rebinds the module name), so callers apply this only for non-module
+    # scopes.
+    names: set[str] = set()
+    stack = list(scope_seed_nodes(scope_node))
+    while stack:
+        node = stack.pop()
+        if node.type in PY_SCOPE_BOUNDARIES:
+            continue
+        if node.type == cs.TS_PY_GLOBAL_STATEMENT:
+            for child in node.children:
+                if child.type == cs.TS_PY_IDENTIFIER and child.text is not None:
+                    names.add(child.text.decode(cs.ENCODING_UTF8))
+        stack.extend(node.children)
+    return names
+
+
+def _binding_target(node: Node) -> Node | None:
+    # The LHS target of a Python binding node: the `left` field of an
+    # assignment / augmented assignment / for statement, the alias name of an
+    # as_pattern (`with x as f:` / `except E as e:`), or the `name` field of a
+    # named_expression (walrus `(os := v)`).
+    if node.type in (
+        cs.TS_PY_ASSIGNMENT,
+        cs.TS_PY_AUGMENTED_ASSIGNMENT,
+        cs.TS_PY_FOR_STATEMENT,
+    ):
+        return node.child_by_field_name(cs.FIELD_LEFT)
+    if node.type == cs.TS_PY_AS_PATTERN:
+        alias = next(
+            (c for c in node.children if c.type == cs.TS_PY_AS_PATTERN_TARGET),
+            None,
+        )
+        return alias.children[0] if alias and alias.children else None
+    if node.type == cs.TS_PY_NAMED_EXPRESSION:
+        return node.child_by_field_name(cs.FIELD_NAME)
+    return None
+
+
+def _global_rebind_positions(scope_node: Node, name: str) -> list[int]:
+    # Source-order END offsets of statements that REBIND a `global`-declared
+    # name in this scope's OWN body (nested defs/classes pruned). `global os`
+    # keeps `os` module-scoped, so `os = Fake()` writes the MODULE binding: a
+    # subscript AFTER that offset reads the rebound value, not the imported
+    # module, while one BEFORE it still sees the module (CodeRabbit review on
+    # PR #1325). Augmented (`os += v`) and walrus (`(os := v)`) rebindings
+    # replace the binding just like a plain assignment (Greptile review on
+    # PR #1325). The end offset is used because the target is bound only
+    # AFTER the RHS evaluates: in `os = os.environ['K']` the RHS subscript
+    # still reads through the module (CodeRabbit review on PR #1325).
+    positions: list[int] = []
+    stack = list(scope_seed_nodes(scope_node))
+    while stack:
+        node = stack.pop()
+        if node.type in PY_SCOPE_BOUNDARIES:
+            continue
+        if node.type in (
+            cs.TS_PY_ASSIGNMENT,
+            cs.TS_PY_AUGMENTED_ASSIGNMENT,
+            cs.TS_PY_NAMED_EXPRESSION,
+        ):
+            target = _binding_target(node)
+            if (
+                target is not None
+                and target.type == cs.TS_PY_IDENTIFIER
+                and target.text is not None
+                and target.text.decode(cs.ENCODING_UTF8) == name
+            ):
+                positions.append(node.end_byte or 0)
+        stack.extend(node.children)
+    return sorted(positions)
+
+
+def python_globally_rebound_before(scope_node: Node, name: str, at_byte: int) -> bool:
+    # True when a `global`-declared name was REBOUND at or before `at_byte` in
+    # this scope's OWN body: the module binding is already replaced, so a use
+    # after the rebind reads the rebound value, while a use before it still
+    # sees the module (CodeRabbit review on PR #1325). A module scope is never
+    # `global`-affected (the rebind is an ordinary local assignment), so it is
+    # rejected here.
+    if scope_node.type == cs.TS_PY_MODULE or name not in _global_declared_names(
+        scope_node
+    ):
+        return False
+    return any(
+        offset <= at_byte for offset in _global_rebind_positions(scope_node, name)
+    )
+
+
+def python_name_shadowed_at(scope_node: Node, name: str, at_byte: int) -> bool:
+    # Whether `name` is shadowed at source offset `at_byte` within the scope:
+    # True when it is a whole-scope local (bound anywhere in the body,
+    # parameters included -- Python makes the name local for the whole
+    # function), or when a `global`-declared name was REBOUND at or before
+    # `at_byte` in source order.
+    if name in python_locally_assigned_names(scope_node):
+        return True
+    return python_globally_rebound_before(scope_node, name, at_byte)
+
+
+def python_locally_assigned_names(scope_node: Node) -> set[str]:
+    # Plain identifiers bound anywhere in this scope's OWN body (nested
+    # defs/classes pruned): assignment / augmented assignment / walrus / with-as
+    # / for targets, including destructuring forms, plus a function's parameter
+    # names. Python makes a name bound anywhere in a function local for the
+    # WHOLE function, so any such name shadows a same-named module import even
+    # before the assignment (a use before it is UnboundLocalError). A `global`
+    # declaration removes the name from this scope's locals: its uses resolve to
+    # the module binding, so an assignment is a global rebind, not a shadowing
+    # local.
+    names = _python_parameter_names(scope_node)
+    stack = list(scope_seed_nodes(scope_node))
+    while stack:
+        node = stack.pop()
+        if node.type in PY_SCOPE_BOUNDARIES:
+            continue
+        if (target := _binding_target(node)) is not None:
+            names |= _binding_identifiers(target)
+        stack.extend(node.children)
+    if scope_node.type != cs.TS_PY_MODULE:
+        names -= _global_declared_names(scope_node)
+    return names
+
+
+def python_names_bound_by(node: Node) -> set[str]:
+    """The plain names this one node binds, whatever the binding form.
+
+    Assignment-like targets, comprehension variables, parameters of a def
+    or lambda, def/class names and import aliases. Counting these over a
+    whole module tells a name bound once from one bound again somewhere.
+    """
+    if (target := _binding_target(node)) is not None:
+        return _binding_identifiers(target)
+    if node.type == cs.TS_PY_FOR_IN_CLAUSE:
+        left = node.child_by_field_name(cs.FIELD_LEFT)
+        return _binding_identifiers(left) if left is not None else set()
+    if node.type in (cs.TS_PY_FUNCTION_DEFINITION, cs.TS_PY_CLASS_DEFINITION):
+        names = _python_parameter_names(node)
+        name = node.child_by_field_name(cs.TS_FIELD_NAME)
+        if name is not None and name.text is not None:
+            names.add(name.text.decode(cs.ENCODING_UTF8))
+        return names
+    if node.type == cs.TS_PY_LAMBDA:
+        params = node.child_by_field_name(cs.FIELD_PARAMETERS)
+        lambda_names: set[str] = set()
+        for param in params.named_children if params is not None else ():
+            lambda_names |= _python_parameter_bindings(param)
+        return lambda_names
+    if node.type in (cs.TS_PY_IMPORT_STATEMENT, cs.TS_PY_IMPORT_FROM_STATEMENT):
+        return _python_import_bindings(node)
+    return set()
+
+
+def _python_import_bindings(node: Node) -> set[str]:
+    # `import a.b` binds `a`, `from m import b` binds `b`, and an alias binds
+    # the alias; the `module_name` of a from-import binds nothing.
+    names: set[str] = set()
+    plain_import = node.type == cs.TS_PY_IMPORT_STATEMENT
+    for imported in node.children_by_field_name(cs.TS_FIELD_NAME):
+        if imported.type == cs.TS_PY_ALIASED_IMPORT:
+            bound = imported.child_by_field_name(cs.FIELD_ALIAS)
+        elif imported.named_children:
+            bound = imported.named_children[0 if plain_import else -1]
+        else:
+            bound = None
+        if bound is not None and bound.text is not None:
+            names.add(bound.text.decode(cs.ENCODING_UTF8))
+    return names
+
+
+def _declares_name(node: Node, name: str) -> bool:
+    return any(
+        child.type == cs.TS_PY_IDENTIFIER
+        and child.text is not None
+        and child.text.decode(cs.ENCODING_UTF8) == name
+        for child in node.children
+    )
+
+
+class _PyRef(Enum):
+    # How one identifier occurrence relates to the name it spells.
+    READ = auto()  # a read, or no reference at all (an attribute or keyword)
+    BINDING = auto()  # the target of a plain `name = value`
+    UNKNOWN = auto()  # any other position, which may bind the name
+
+
+# Python binds names in many forms (unpacking, `as` targets, match captures,
+# imports, type parameters, ...), so the scan lists READ positions instead:
+# an occurrence anywhere else may bind the name and makes it unknown. Parents
+# that read in any position:
+_PY_READ_PARENTS = frozenset(
+    {
+        cs.TS_ARGUMENT_LIST,
+        cs.TS_PY_SUBSCRIPT,
+        cs.TS_PY_SLICE,
+        cs.TS_PY_BINARY_OPERATOR,
+        cs.TS_PY_BOOLEAN_OPERATOR,
+        cs.TS_PY_COMPARISON_OPERATOR,
+        cs.TS_PY_NOT_OPERATOR,
+        cs.TS_PY_UNARY_OPERATOR,
+        cs.TS_PY_CONDITIONAL_EXPRESSION,
+        cs.TS_PY_PAIR,
+        cs.TS_PY_SET,
+        cs.TS_PY_RETURN_STATEMENT,
+        cs.TS_PY_EXPRESSION_STATEMENT,
+        cs.TS_PY_ASSERT_STATEMENT,
+        cs.TS_PY_RAISE_STATEMENT,
+        cs.TS_PY_AWAIT,
+        cs.TS_PY_YIELD,
+        cs.TS_PY_DICTIONARY_SPLAT,
+        cs.TS_PY_DECORATOR,
+        cs.TS_PY_IF_CLAUSE,
+        cs.TS_PY_FORMAT_EXPRESSION,
+    }
+)
+# Parents that read only in some fields (the others bind, or name an
+# attribute or keyword rather than the variable).
+_PY_READ_FIELDS: dict[str, frozenset[str]] = {
+    cs.TS_PY_ATTRIBUTE: frozenset({cs.FIELD_OBJECT, cs.TS_PY_FIELD_ATTRIBUTE}),
+    cs.TS_PY_KEYWORD_ARGUMENT: frozenset({cs.FIELD_NAME, cs.FIELD_VALUE}),
+    cs.TS_PY_CALL: frozenset({cs.FIELD_FUNCTION}),
+    cs.TS_PY_ASSIGNMENT: frozenset({cs.FIELD_RIGHT}),
+    cs.TS_PY_AUGMENTED_ASSIGNMENT: frozenset({cs.FIELD_RIGHT}),
+    cs.TS_PY_NAMED_EXPRESSION: frozenset({cs.FIELD_VALUE}),
+    cs.TS_PY_FOR_STATEMENT: frozenset({cs.FIELD_RIGHT}),
+    cs.TS_PY_FOR_IN_CLAUSE: frozenset({cs.FIELD_RIGHT}),
+    cs.TS_PY_IF_STATEMENT: frozenset({cs.TS_FIELD_CONDITION}),
+    cs.TS_PY_ELIF_CLAUSE: frozenset({cs.TS_FIELD_CONDITION}),
+    cs.TS_PY_WHILE_STATEMENT: frozenset({cs.TS_FIELD_CONDITION}),
+    cs.TS_PY_EXCEPT_CLAUSE: frozenset({cs.FIELD_VALUE}),
+    cs.TS_PY_WITH_ITEM: frozenset({cs.FIELD_VALUE}),
+    cs.TS_PY_INTERPOLATION: frozenset({cs.TS_PY_FIELD_EXPRESSION}),
+    cs.TS_PY_LAMBDA: frozenset({cs.FIELD_BODY}),
+    cs.TS_PY_LIST_COMPREHENSION: frozenset({cs.FIELD_BODY}),
+    cs.TS_PY_SET_COMPREHENSION: frozenset({cs.FIELD_BODY}),
+    cs.TS_PY_DICTIONARY_COMPREHENSION: frozenset({cs.FIELD_BODY}),
+    cs.TS_PY_GENERATOR_EXPRESSION: frozenset({cs.FIELD_BODY}),
+}
+# Displays that hold either reads or, inside a target, bindings
+# (`with c as (a, b)`): the first ancestor outside them decides.
+_PY_TRANSPARENT = frozenset(
+    {
+        cs.TS_PY_LIST,
+        cs.TS_PY_TUPLE,
+        cs.TS_PY_PARENTHESIZED_EXPRESSION,
+        cs.TS_PY_EXPRESSION_LIST,
+        cs.TS_PY_LIST_SPLAT,
+    }
+)
+# A `type` node's wrappers inside an annotation (`list[str]`, `Optional[str]`).
+_PY_TYPE_WRAPPERS = frozenset({cs.TS_PY_TYPE, cs.TS_TYPE_PARAMETER, cs.TS_GENERIC_TYPE})
+# Where a `type` node is an annotation, which only reads; a type alias name or
+# a PEP 695 type parameter binds instead.
+_PY_ANNOTATION_SLOTS = frozenset(
+    {
+        (cs.TS_PY_TYPED_PARAMETER, cs.FIELD_TYPE),
+        (cs.TS_PY_TYPED_DEFAULT_PARAMETER, cs.FIELD_TYPE),
+        (cs.TS_PY_FUNCTION_DEFINITION, cs.FIELD_RETURN_TYPE),
+        (cs.TS_PY_ASSIGNMENT, cs.FIELD_TYPE),
+    }
+)
+_PY_IMPORTS = frozenset({cs.TS_PY_IMPORT_STATEMENT, cs.TS_PY_IMPORT_FROM_STATEMENT})
+
+
+def _child_field(parent: Node, child: Node) -> str | None:
+    for index, sibling in enumerate(parent.children):
+        if sibling.id == child.id:
+            return parent.field_name_for_child(index)
+    return None
+
+
+def _python_annotation_reference(type_node: Node) -> _PyRef:
+    node = type_node
+    while node.parent is not None and node.parent.type in _PY_TYPE_WRAPPERS:
+        node = node.parent
+    parent = node.parent
+    if (
+        node.type == cs.TS_PY_TYPE
+        and parent is not None
+        and (parent.type, _child_field(parent, node)) in _PY_ANNOTATION_SLOTS
+    ):
+        return _PyRef.READ
+    return _PyRef.UNKNOWN
+
+
+def _python_reference(ident: Node) -> _PyRef:
+    child, parent = ident, ident.parent
+    while parent is not None and parent.type in _PY_TRANSPARENT:
+        child, parent = parent, parent.parent
+    if parent is None:
+        return _PyRef.UNKNOWN
+    field = _child_field(parent, child)
+    if child is ident and parent.type == cs.TS_PY_ASSIGNMENT and field == cs.FIELD_LEFT:
+        return _PyRef.BINDING
+    if parent.type == cs.TS_PY_TYPE:
+        return _python_annotation_reference(parent)
+    if parent.type in _PY_READ_PARENTS or field in _PY_READ_FIELDS.get(
+        parent.type, frozenset()
+    ):
+        return _PyRef.READ
+    return _PyRef.UNKNOWN
+
+
+def _python_mentions(node: Node, name: str, types: frozenset[str]) -> bool:
+    # Whether any node of `types` under `node` names `name` directly.
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        if current.type in types and _declares_name(current, name):
+            return True
+        stack.extend(current.children)
+    return False
+
+
+def _python_header_values(definition: Node) -> list[Node]:
+    # What a nested definition's header evaluates in the ENCLOSING scope:
+    # defaults, annotations, the return annotation and base classes, never
+    # the parameter names, which bind in the definition's own scope.
+    values: list[Node] = []
+    params = definition.child_by_field_name(cs.FIELD_PARAMETERS)
+    for param in params.named_children if params is not None else ():
+        values.extend(
+            value
+            for field in (cs.FIELD_VALUE, cs.FIELD_TYPE)
+            if (value := param.child_by_field_name(field)) is not None
+        )
+    values.extend(
+        value
+        for field in (cs.FIELD_RETURN_TYPE, cs.FIELD_SUPERCLASSES)
+        if (value := definition.child_by_field_name(field)) is not None
+    )
+    return values
+
+
+def _python_nested_definition_step(node: Node, name: str) -> list[Node] | None:
+    # A nested def/class binds its NAME in this scope and evaluates its
+    # header here; its body is its own scope, except that a `global` /
+    # `nonlocal` there rebinds this scope's name.
+    decorators = [c for c in node.children if c.type == cs.TS_PY_DECORATOR]
+    definition = node.child_by_field_name(cs.FIELD_DEFINITION) or node
+    label = definition.child_by_field_name(cs.FIELD_NAME)
+    if (label is not None and label.text == name.encode(cs.ENCODING_UTF8)) or (
+        _python_mentions(definition, name, _PY_SCOPE_DECLARATIONS)
+    ):
+        return None
+    return decorators + _python_header_values(definition)
+
+
+def _python_import_step(node: Node, name: str, sites: list[Node]) -> list[Node] | None:
+    # An import binds the names it lists; `from m import *` may bind any.
+    if any(child.type == cs.TS_WILDCARD_IMPORT for child in node.children):
+        return None
+    if name in python_import_bound_names(node):
+        sites.append(node)
+    return []
+
+
+def _python_binding_step(node: Node, name: str, sites: list[Node]) -> list[Node] | None:
+    # One node of the binding scan: the nodes to scan next (recording any
+    # binding site of `name`), or None when the node may bind `name` in a way
+    # the scan cannot judge.
+    if node.type in PY_SCOPE_BOUNDARIES:
+        return _python_nested_definition_step(node, name)
+    if node.type in _PY_IMPORTS:
+        return _python_import_step(node, name, sites)
+    if node.type in _PY_SCOPE_DECLARATIONS:
+        return None if _declares_name(node, name) else []
+    if node.type != cs.TS_PY_IDENTIFIER or node.text != name.encode(cs.ENCODING_UTF8):
+        return node.children
+    reference = _python_reference(node)
+    if reference is _PyRef.BINDING and node.parent is not None:
+        sites.append(node.parent)
+    return None if reference is _PyRef.UNKNOWN else []
+
+
+def python_name_binding_sites(scope_node: Node, name: str) -> list[Node] | None:
+    # Every node that binds `name` in this scope: the parameter declaring it,
+    # each plain `name = value` assignment and each import of it. None when
+    # an occurrence may bind it in any other way (unpacking, `+=`, a walrus,
+    # a for / with / except target, a match capture, a nested def or class,
+    # `del`, a type parameter or alias, a `global` / `nonlocal` declaration
+    # here or in a nested scope, a star import): the caller then knows
+    # nothing about what the name holds.
+    type_parameters = scope_node.child_by_field_name(cs.TS_FIELD_TYPE_PARAMETERS)
+    if type_parameters is not None and _python_mentions(
+        type_parameters, name, frozenset({cs.TS_PY_TYPE})
+    ):
+        return None
+    sites = [
+        param
+        for param in _python_parameter_nodes(scope_node)
+        if name in _python_parameter_bindings(param)
+    ]
+    stack = list(scope_seed_nodes(scope_node))
+    while stack:
+        following = _python_binding_step(stack.pop(), name, sites)
+        if following is None:
+            return None
+        stack.extend(following)
+    return sites
+
+
+def definition_header_nodes(node: Node) -> list[Node]:
+    # The parts of a nested definition that execute in the ENCLOSING scope at
+    # definition time: default arg values, return/parameter annotations, base
+    # classes, and decorators. The body block (own scope) is excluded, so the
+    # enclosing DFS descends into these but never the nested body.
+    if node.type == cs.TS_PY_DECORATED_DEFINITION:
+        out = [c for c in node.children if c.type == cs.TS_PY_DECORATOR]
+        inner = node.child_by_field_name(cs.FIELD_DEFINITION)
+        if inner is not None:
+            out.extend(definition_header_nodes(inner))
+        return out
+    if node.type == cs.TS_PY_FUNCTION_DEFINITION:
+        return [
+            n
+            for n in (
+                node.child_by_field_name(cs.FIELD_PARAMETERS),
+                node.child_by_field_name(cs.FIELD_RETURN_TYPE),
+            )
+            if n is not None
+        ]
+    if node.type == cs.TS_PY_CLASS_DEFINITION:
+        supers = node.child_by_field_name(cs.FIELD_SUPERCLASSES)
+        return [supers] if supers is not None else []
+    return []
+
+
+def rust_unwrap_result(node: Node) -> Node:
+    # Rust Result unwrapping: `File::open(p)?` (try_expression) and
+    # `File::create(p).unwrap()` / `.expect(..)` all yield the inner handle. The
+    # node shapes are Rust-specific, so this is inert elsewhere (issue #1204).
+    while True:
+        if node.type in (cs.TS_RS_TRY_EXPRESSION, cs.TS_PARENTHESIZED_EXPRESSION):
+            # `File::create(p)?` (try) and `(File::create(p).unwrap())` (parens)
+            # both wrap the inner handle expression; peel to it.
+            inner = next(
+                (c for c in node.named_children if c.type != cs.TS_COMMENT), None
+            )
+            if inner is None:
+                return node
+            node = inner
+            continue
+        fn = node.child_by_field_name(cs.TS_FIELD_FUNCTION)
+        if fn is not None and fn.type == cs.TS_RS_FIELD_EXPRESSION:
+            field = fn.child_by_field_name(cs.RS_FIELD_FIELD)
+            receiver = fn.child_by_field_name(cs.FIELD_VALUE)
+            if (
+                field is not None
+                and field.text is not None
+                and field.text.decode(cs.ENCODING_UTF8) in cs.RS_RESULT_UNWRAP_METHODS
+                and receiver is not None
+                and receiver.type == cs.TS_RS_CALL_EXPRESSION
+            ):
+                node = receiver
+                continue
+        return node
+
+
+def lean_definition_header_nodes(
+    node: Node, descriptor: LanguageDescriptor
+) -> list[Node]:
+    # Definition-time header expressions of a lean (non-Python) nested-scope node
+    # that execute in the ENCLOSING scope: a TS parameter decorator (`m(@inject(t) x)`),
+    # whose `@inject(t)` call runs at the owning class's definition time. Collect only
+    # decorators that are DIRECT children of the node's OWN parameters -- never
+    # descending into a parameter's default value/type nor any nested scope, so a
+    # decorated class in a default initializer (`x = class { n(@dec(t) y){} }`) or a
+    # concise arrow body (`() => class { ... }`) -- which run in that inner/call-time
+    # scope, not this one -- can never surface as a false enclosing-scope flow. The
+    # default parameter value likewise runs in the callee and is never collected.
+    header_types = descriptor.nested_header_types
+    if not header_types:
+        return []
+    params = node.child_by_field_name(descriptor.params_field)
+    if params is None:
+        return []
+    out: list[Node] = []
+    for param in params.named_children:
+        out.extend(c for c in param.named_children if c.type in header_types)
+    return out
+
+
+def call_name(call_node: Node) -> str | None:
+    fn = call_node.child_by_field_name(cs.TS_FIELD_FUNCTION)
+    if fn is not None:
+        return fn.text.decode(cs.ENCODING_UTF8) if fn.text is not None else None
+    # Java `method_invocation` has no `function` field: it exposes `object` (the
+    # receiver, absent for an unqualified/static-imported call) and `name`.
+    # Reconstruct the dotted callee (`System.out.println`) so it matches the registry
+    # keys, as the `function` field's text would for other langs.
+    name = call_node.child_by_field_name(cs.TS_FIELD_NAME)
+    if name is None or name.text is None:
+        return None
+    method = name.text.decode(cs.ENCODING_UTF8)
+    obj = call_node.child_by_field_name(cs.FIELD_OBJECT)
+    if obj is not None and obj.text is not None:
+        return f"{obj.text.decode(cs.ENCODING_UTF8)}{cs.SEPARATOR_DOT}{method}"
+    return method
+
+
+def is_require_alias(declarator: Node, call_type: str) -> bool:
+    # A `const fs = require('fs')` declarator binds an import alias (the genuine
+    # module), not a shadowing local, so it must not count as a local shadow, unlike
+    # `const fs = {}`, which does. Detected by a `require(...)` value.
+    value = declarator.child_by_field_name(cs.FIELD_VALUE)
+    if value is None or value.type != call_type:
+        return False
+    fn = value.child_by_field_name(cs.TS_FIELD_FUNCTION)
+    return (
+        fn is not None
+        and fn.text is not None
+        and fn.text.decode(cs.ENCODING_UTF8) == cs.JS_REQUIRE_KEYWORD
+    )
+
+
+def normalise(name: str | None, import_map: dict[str, str]) -> str | None:
+    if name is None:
+        return None
+    head, _, rest = name.partition(cs.SEPARATOR_DOT)
+    base = import_map.get(head)
+    if base is None:
+        return name
+    return f"{base}{cs.SEPARATOR_DOT}{rest}" if rest else base
+
+
+def default_export_collapsed(name: str) -> str | None:
+    # A JS default import maps the local name to `<module>.default` (and a node:
+    # builtin to `node:<module>.default`), but sink registries are keyed by the
+    # module's own dotted API (`fs.readFileSync`). Collapse the default-export
+    # segment and scheme for a lookup candidate; a local-module base keeps its
+    # project-qualified prefix, so its collapsed form can never collide with a sink
+    # key. Returns None when nothing collapsed.
+    collapsed = name.removeprefix(cs.NODE_BUILTIN_PREFIX).replace(
+        ".default.", cs.SEPARATOR_DOT, 1
+    )
+    return collapsed if collapsed != name else None
+
+
+def registry_match[T](
+    mapping: dict[str, T], raw_name: str | None, import_map: dict[str, str]
+) -> T | None:
+    # Match a call against an I/O registry keyed by canonical dotted names
+    # (`sqlite3.connect`, `os.getenv`). Try the import-normalised name first; if
+    # that misses AND the raw callee is module-qualified (has a dot), fall back to
+    # the raw name. That recovers a stdlib module re-exported under its own name
+    # (`from .utils import sqlite3`, which remaps the head off `sqlite3`), common in
+    # real projects. A bare callee gets NO raw fallback: a remapped bare name
+    # (`from .myio import open`) must stay shadowed rather than hit the `open` sink.
+    if raw_name is None:
+        return None
+    name = normalise(raw_name, import_map)
+    if name is not None and (hit := mapping.get(name)) is not None:
+        return hit
+    if (
+        name is not None
+        and (collapsed := default_export_collapsed(name)) is not None
+        and (hit := mapping.get(collapsed)) is not None
+    ):
+        return hit
+    if cs.SEPARATOR_DOT in raw_name:
+        return mapping.get(raw_name)
+    return None
+
+
+def head_is_genuine_module(base: str | None, head: str) -> bool:
+    # True when `head` names the genuine imported module (so its raw dotted call may
+    # match a sink). None base = an unimported global. Otherwise the import base's
+    # module identity must equal head: drop any member suffix and node: scheme. A
+    # local `import fs from './fake'` resolves elsewhere and is rejected. Path-based
+    # (Go) imports are handled separately by package-name matching.
+    if base is None:
+        return True
+    return base.split(cs.SEPARATOR_DOT)[0].removeprefix(cs.NODE_BUILTIN_PREFIX) == head
+
+
+def match_normalised[T](
+    raw: str, import_map: dict[str, str], mapping: dict[str, T]
+) -> T | None:
+    # Match a call's import-normalised name against a registry, also trying the
+    # node:-stripped form so a `node:fs` named/destructured import (which maps a
+    # local to `node:fs.writeFileSync`) resolves to the bare `fs.writeFileSync`
+    # entry. Used for JS/TS shadow-aware sink matching (issue #714).
+    normalised = normalise(raw, import_map)
+    if normalised is None:
+        return None
+    hit = mapping.get(normalised)
+    if hit is None and normalised.startswith(cs.NODE_BUILTIN_PREFIX):
+        hit = mapping.get(normalised.removeprefix(cs.NODE_BUILTIN_PREFIX))
+    if hit is None and (collapsed := default_export_collapsed(normalised)) is not None:
+        hit = mapping.get(collapsed)
+    return hit
+
+
+# A `/` inside a placeholder reads as a path-segment split downstream, and
+# `?` / `#` change where urlparse cuts query and fragment.
+_URL_STRUCTURE_DELIMITERS = "/?#"
+OPAQUE_PLACEHOLDER = "{*}"
+# `{`, the expression, `}` (`${`, ..., `}` in a JS template).
+_BARE_SUBSTITUTION_CHILDREN = 3
+
+# Go fmt verbs (`%d`, `%-8.2f`, `%v`, `%[2]s`, `%[3]*.[2]*[1]f`, ...); `%%`
+# is a literal percent. One charset covers every spec character (flags,
+# width, precision, argument indexes) and excludes the verb letter, so the
+# scan is unambiguous and linear; malformed specs simply stay literal, as
+# fmt itself would render them as `%!` errors.
+_FORMAT_VERB_RE = re.compile(r"%(?:%|[0-9#+\-. *\[\]]*[a-zA-Z])")
+
+
+def _dot_import_format_call(
+    raw: str | None, import_map: dict[str, str], names: frozenset[str]
+) -> str | None:
+    # `import . "fmt"` puts Sprintf itself in scope with no package qualifier;
+    # the import processor records the dot import under a `.`-prefixed sentinel
+    # (identifiers cannot contain a dot), so a bare callee re-qualifies through
+    # each dot-imported package's path.
+    if raw is None or cs.SEPARATOR_DOT in raw:
+        return None
+    for local, base in import_map.items():
+        if local.startswith(cs.SEPARATOR_DOT):
+            candidate = f"{base}{cs.SEPARATOR_DOT}{raw}"
+            if candidate in names:
+                return candidate
+    return None
+
+
+def format_call_target(
+    arg: Node | None, descriptor: LanguageDescriptor, import_map: dict[str, str]
+) -> str | None:
+    """The placeholder-marked value of a format-call sink target.
+
+    ``http.Get(fmt.Sprintf("...products/%d", id))`` reads the literal format
+    string and renders each verb as an opaque placeholder. None when the
+    argument is not a recognised format call; dynamic when its format string
+    is not a literal.
+    """
+    if arg is None or arg.type != descriptor.call_type:
+        return None
+    normalised = normalise(call_name(arg), import_map)
+    if (
+        normalised not in descriptor.format_call_names
+        and (
+            normalised := _dot_import_format_call(
+                call_name(arg), import_map, descriptor.format_call_names
+            )
+        )
+        is None
+    ):
+        return None
+    format_string = literal_target(
+        arg,
+        0,
+        string_type=descriptor.string_type,
+        content_type=descriptor.string_content_type,
+        keyword_arg_type=descriptor.keyword_arg_type,
+    )
+    if format_string == DYNAMIC_TARGET and descriptor.raw_string_type is not None:
+        # Go backtick strings are format strings too, in a distinct node type.
+        format_string = literal_target(
+            arg,
+            0,
+            string_type=descriptor.raw_string_type,
+            content_type=descriptor.raw_string_content_type or "",
+            keyword_arg_type=descriptor.keyword_arg_type,
+        )
+    if format_string == DYNAMIC_TARGET:
+        return DYNAMIC_TARGET
+    return _FORMAT_VERB_RE.sub(
+        lambda m: "%" if m.group(0) == "%%" else OPAQUE_PLACEHOLDER, format_string
+    )
+
+
+def placeholder(expression: str) -> str:
+    """A non-literal URL part as a `{expr}` placeholder.
+
+    An expression containing a path or URL-parse delimiter would fabricate
+    segment structure, so it collapses to the opaque `{*}`.
+    """
+    if any(delim in expression for delim in _URL_STRUCTURE_DELIMITERS):
+        return OPAQUE_PLACEHOLDER
+    return f"{{{expression}}}"
+
+
+def _folded_constant(part: Node, constants: Mapping[str, str] | None) -> str | None:
+    # `${BASE}` / `{BASE}` over a module-level string constant is literal
+    # text the reader can see (issue #2521). Only a bare name between the
+    # delimiters folds: a conversion, format spec or `=` (`{BASE!r}`,
+    # `{BASE:>9}`, `{BASE=}`) changes the text.
+    if not constants or len(part.children) != _BARE_SUBSTITUTION_CHILDREN:
+        return None
+    children = part.named_children
+    if len(children) != 1 or children[0].type != cs.TS_PY_IDENTIFIER:
+        return None
+    name = children[0].text
+    return constants.get(name.decode(cs.ENCODING_UTF8)) if name else None
+
+
+def _template_parts(
+    arg: Node,
+    content_type: str,
+    substitution_type: str,
+    constants: Mapping[str, str] | None,
+) -> RenderedText:
+    # A JS/TS template literal: fragments stay verbatim and each
+    # `${expr}` substitution renders as a `{expr}` placeholder, mirroring
+    # the Python f-string treatment (issue #884). An escape sequence is
+    # literal text like any fragment, so it both survives into the identity
+    # and counts as identity (issue #944).
+    parts: list[str] = []
+    literal = False
+    static = True
+    for child in arg.named_children:
+        if child.text is None:
+            continue
+        if child.type in (content_type, cs.TS_ESCAPE_SEQUENCE):
+            literal = True
+            parts.append(child.text.decode(cs.ENCODING_UTF8))
+        elif child.type == substitution_type:
+            folded = _folded_constant(child, constants)
+            if folded is not None:
+                literal = True
+                parts.append(folded)
+            else:
+                static = False
+                parts.append(placeholder(child.text.decode(cs.ENCODING_UTF8)[2:-1]))
+    return RenderedText("".join(parts), literal, static)
+
+
+def _joined_string_parts(
+    arg: Node, content_type: str, constants: Mapping[str, str] | None
+) -> RenderedText:
+    parts: list[str] = []
+    literal = False
+    static = True
+    for child in arg.named_children:
+        if child.text is None:
+            continue
+        if child.type in (content_type, cs.TS_ESCAPE_SEQUENCE):
+            literal = True
+            parts.append(child.text.decode(cs.ENCODING_UTF8))
+        elif child.type == cs.TS_PY_INTERPOLATION:
+            folded = _folded_constant(child, constants)
+            if folded is not None:
+                literal = True
+                parts.append(folded)
+                continue
+            static = False
+            text = child.text.decode(cs.ENCODING_UTF8)
+            safe = not any(delim in text for delim in _URL_STRUCTURE_DELIMITERS)
+            parts.append(text if safe else OPAQUE_PLACEHOLDER)
+    return RenderedText("".join(parts), literal, static)
+
+
+def _childless_string_text(text: str) -> str:
+    # A childless string node (Scala `string`) carries its content only in
+    # node.text; strip the surrounding delimiters, triple quotes before the
+    # ordinary quote so a raw literal ("""x""") never keeps quote residue.
+    # A bare delimiter pair is an empty literal, which carries no identity.
+    for delim in ('"""', '"'):
+        if (
+            text.startswith(delim)
+            and text.endswith(delim)
+            and len(text) >= 2 * len(delim)
+        ):
+            stripped = text[len(delim) : -len(delim)]
+            return stripped if stripped else DYNAMIC_TARGET
+    return DYNAMIC_TARGET
+
+
+def string_parts(
+    arg: Node,
+    string_type: str,
+    content_type: str,
+    *,
+    template_type: str | None = None,
+    substitution_type: str | None = None,
+    constants: Mapping[str, str] | None = None,
+) -> RenderedText | None:
+    """A string or template literal rendered as identity text.
+
+    None when ``arg`` is not a string node. ``constants`` folds a bare
+    module-constant substitution into literal text.
+    """
+    if (
+        template_type is not None
+        and substitution_type is not None
+        and arg.type == template_type
+    ):
+        return _template_parts(arg, content_type, substitution_type, constants)
+    if arg.type != string_type:
+        return None
+    if not arg.children and arg.text is not None:
+        text = _childless_string_text(arg.text.decode(cs.ENCODING_UTF8))
+        literal = text != DYNAMIC_TARGET
+        return RenderedText(text if literal else "", literal, True)
+    # An f-string is a `string` node whose content is split around
+    # `interpolation` children; keep every fragment and render each
+    # interpolation as its literal `{expr}` source so the identity stays a
+    # placeholder-marked whole rather than a truncated prefix (issue #876).
+    # An escape sequence IS literal text (issue #944), and in the grammars
+    # that expose it as a sibling of the fragments it is joined back in as
+    # written, so raw and interpreted spellings of one path render alike (as
+    # they already did in Python). An expression containing a path or
+    # URL-parse delimiter would fabricate segment structure, so it collapses
+    # to `{*}`.
+    return _joined_string_parts(arg, content_type, constants)
+
+
+def string_literal(
+    arg: Node | None,
+    string_type: str = cs.TS_PY_STRING,
+    content_type: str = cs.TS_PY_STRING_CONTENT,
+    *,
+    template_type: str | None = None,
+    substitution_type: str | None = None,
+) -> str:
+    if arg is None:
+        return DYNAMIC_TARGET
+    rendered = string_parts(
+        arg,
+        string_type,
+        content_type,
+        template_type=template_type,
+        substitution_type=substitution_type,
+    )
+    if rendered is None or not rendered.literal:
+        return DYNAMIC_TARGET
+    return rendered.text
+
+
+def iter_token_tree_calls(
+    token_tree: Node,
+    scope_separator: str,
+    identifier_type: str,
+    token_tree_type: str,
+) -> Iterator[tuple[str, Node]]:
+    # tree-sitter flattens a Rust macro body to a token_tree of raw tokens, so an
+    # inlined scoped call (`std::env::var("X")`) is a run of `identifier` joined by
+    # the scope token (whose node type IS the separator, e.g. "::") followed by its
+    # args token_tree, with no call_expression node. Yield (reconstructed dotted
+    # name, args token_tree) for each such run, recursing into nested groups. Shared
+    # by the io walk (sink emission) and the flow walk (taint into a macro sink).
+    path: list[str] = []
+    expect_sep = False
+    for child in token_tree.children:
+        if child.type == identifier_type and not expect_sep and child.text:
+            path.append(child.text.decode(cs.ENCODING_UTF8))
+            expect_sep = True
+        elif child.type == scope_separator and expect_sep:
+            expect_sep = False
+        elif child.type == token_tree_type:
+            if path:
+                yield scope_separator.join(path), child
+            path, expect_sep = [], False
+            yield from iter_token_tree_calls(
+                child, scope_separator, identifier_type, token_tree_type
+            )
+        else:
+            path, expect_sep = [], False
+
+
+def first_token_arg_string(args: Node, string_type: str, content_type: str) -> str:
+    # arg0 of a flattened call's token_tree: the tokens before the first top-level
+    # comma. A resource path only when it is a lone string literal (`write(path,
+    # "x")` has a variable arg0 -> <dynamic>, not "x").
+    arg0: list[Node] = []
+    for child in args.children:
+        if child.type in (cs.CHAR_PAREN_OPEN, cs.CHAR_PAREN_CLOSE):
+            continue
+        if child.type == cs.CHAR_COMMA:
+            break
+        arg0.append(child)
+    if len(arg0) == 1 and arg0[0].type == string_type:
+        return string_literal(arg0[0], string_type, content_type)
+    return DYNAMIC_TARGET
+
+
+def lean_binding_targets(
+    node: Node, descriptor: LanguageDescriptor
+) -> list[str | None]:
+    # LHS name(s) of a lean binding: a bare identifier, or a Go expression_list
+    # of them. A non-identifier target (JS destructuring, a field/index write)
+    # yields None so its RHS position is still consumed but no var is bound.
+    # Shared by the flow taint walk and the I/O handle walk (issue #714).
+    if node.type == descriptor.identifier_type:
+        return [node.text.decode(cs.ENCODING_UTF8) if node.text else None]
+    if node.type == cs.TS_GO_EXPRESSION_LIST:
+        return [
+            c.text.decode(cs.ENCODING_UTF8)
+            if c.type == descriptor.identifier_type and c.text
+            else None
+            for c in node.named_children
+            if c.type != cs.TS_COMMENT
+        ]
+    return [None]
+
+
+def lean_binding_values(
+    node: Node | None, descriptor: LanguageDescriptor
+) -> list[Node]:
+    del descriptor
+    if node is None:
+        return []
+    if node.type == cs.TS_GO_EXPRESSION_LIST:
+        return [c for c in node.named_children if c.type != cs.TS_COMMENT]
+    return [node]
+
+
+def _deconstruction_children(
+    node: Node, descriptor: LanguageDescriptor
+) -> tuple[Node, Node] | None:
+    # A deconstructing declarator (`var (a, b) = (x, y)`) carries neither a
+    # `name` nor a `value` field, only a pattern child and a tuple child.
+    pattern = next(
+        (c for c in node.named_children if c.type == descriptor.tuple_pattern_type),
+        None,
+    )
+    value = next(
+        (c for c in node.named_children if c.type == descriptor.tuple_value_type),
+        None,
+    )
+    return None if pattern is None or value is None else (pattern, value)
+
+
+def _is_tuple_assignment(
+    left: Node, right: Node | None, descriptor: LanguageDescriptor
+) -> bool:
+    # `(string a, int b) = (x, y)` is an ASSIGNMENT whose left is a tuple rather
+    # than a declarator, so it never reaches the deconstruction branch that
+    # handles `var (a, b) = ...`.
+    return (
+        descriptor.tuple_value_type is not None
+        and left.type == descriptor.tuple_value_type
+        and right is not None
+        and right.type == descriptor.tuple_value_type
+    )
+
+
+def _deconstruction_slot(target: Node, descriptor: LanguageDescriptor) -> Node:
+    # One pattern slot, unwrapped to the node that actually names the binding:
+    # both SIDES wrap their elements (a C# tuple wraps each slot in an
+    # `argument`, pattern side as well as value side), and an explicitly typed
+    # slot (`string a`) wraps its name one level deeper again.
+    target = unwrap_argument(target, descriptor.argument_wrapper_type)
+    if (
+        descriptor.declaration_expression_type is not None
+        and target.type == descriptor.declaration_expression_type
+        and target.named_children
+    ):
+        return target.named_children[-1]
+    return target
+
+
+def _deconstruction_pairs(
+    pattern: Node, value: Node, descriptor: LanguageDescriptor
+) -> tuple[list[str | None], list[Node]]:
+    # Walk the pattern and the tuple in LOCKSTEP so each name is paired with the
+    # element at its own position, descending together where both sides nest
+    # (`var (a, (b, c)) = (x, (y, z))`). A discard or an unrecognised position
+    # yields None, which consumes the slot without binding anything -- the miss
+    # direction, never a wrong binding.
+    names: list[str | None] = []
+    values: list[Node] = []
+    targets = list(pattern.named_children)
+    elements = [
+        unwrap_argument(child, descriptor.argument_wrapper_type)
+        for child in value.named_children
+    ]
+    for index, target in enumerate(targets):
+        element = elements[index] if index < len(elements) else None
+        if element is None:
+            continue
+        target = _deconstruction_slot(target, descriptor)
+        nested_pattern = target.type in (
+            descriptor.tuple_pattern_type,
+            descriptor.tuple_value_type,
+        )
+        if nested_pattern and element.type == descriptor.tuple_value_type:
+            sub_names, sub_values = _deconstruction_pairs(target, element, descriptor)
+            names.extend(sub_names)
+            values.extend(sub_values)
+            continue
+        bound = lean_binding_targets(target, descriptor)
+        names.append(bound[0] if bound else None)
+        values.append(element)
+    return names, values
+
+
+def _declarator_field_targets(
+    node: Node, name_field: str, descriptor: LanguageDescriptor
+) -> list[str | None]:
+    field_node = node.child_by_field_name(name_field)
+    if field_node is None:
+        return [None]
+    targets = lean_binding_targets(field_node, descriptor)
+    # C++ `int *x = ..`: the name hides behind pointer/reference declarators.
+    return [cpp_declarator_name(field_node)] if targets == [None] else targets
+
+
+def _container_targets_values(
+    node: Node, descriptor: LanguageDescriptor
+) -> tuple[list[str | None], list[Node]]:
+    # Lua's `assignment_statement` wraps its targets in a `variable_list`
+    # (each a `name` field) and its values in an `expression_list` (each a
+    # `value` field); a multi-assign `a, b = f(), g()` pairs them by position.
+    targets: list[str | None] = []
+    values: list[Node] = []
+    for child in node.named_children:
+        if child.type == descriptor.binding_target_container_type:
+            for name in child.children_by_field_name(cs.TS_FIELD_NAME):
+                targets.extend(lean_binding_targets(name, descriptor))
+        elif child.type == descriptor.binding_value_container_type:
+            values.extend(child.children_by_field_name(cs.FIELD_VALUE))
+    return targets, values
+
+
+def binding_targets_values(
+    node: Node, descriptor: LanguageDescriptor
+) -> tuple[list[str | None], list[Node]]:
+    # The (LHS names, RHS value nodes) of one binding node across the lean grammars:
+    # JS uses `name`/`value` (declarator) or `left`/`right` (assignment); Go uses
+    # `left`/`right` expression_lists (`:=`, `=`) or `name`/`value` (`var`/`const`);
+    # Rust `let` binds via `pattern`, C++ `int x = ..` via a nested `declarator`
+    # (unwrapped through pointer/reference declarators).
+    left = node.child_by_field_name(cs.FIELD_LEFT)
+    if left is not None:
+        right = node.child_by_field_name(cs.FIELD_RIGHT)
+        if right is not None and _is_tuple_assignment(left, right, descriptor):
+            return _deconstruction_pairs(left, right, descriptor)
+        return (
+            lean_binding_targets(left, descriptor),
+            lean_binding_values(right, descriptor),
+        )
+    if (
+        descriptor.declarator_name_field is not None
+        and node.type == descriptor.declarator_type
+    ):
+        return _declarator_field_targets(
+            node, descriptor.declarator_name_field, descriptor
+        ), lean_binding_values(node.child_by_field_name(cs.FIELD_VALUE), descriptor)
+    if (
+        descriptor.tuple_pattern_type is not None
+        and descriptor.tuple_value_type is not None
+        and node.type == descriptor.declarator_type
+    ):
+        # A deconstructing declarator (`var (a, b) = (x, y)`) has neither a
+        # `name` nor a `value` field, so the branches above find nothing and the
+        # binding is skipped entirely -- every deconstructed name stays untainted.
+        # Pattern names and tuple elements pair BY POSITION, which is exactly
+        # what the caller already does for a multi-target binding.
+        pair = _deconstruction_children(node, descriptor)
+        if pair is not None:
+            return _deconstruction_pairs(pair[0], pair[1], descriptor)
+
+    if (
+        descriptor.binding_target_container_type is not None
+        and node.type == descriptor.declarator_type
+    ):
+        return _container_targets_values(node, descriptor)
+    targets: list[str | None] = []
+    for name in node.children_by_field_name(cs.TS_FIELD_NAME):
+        targets.extend(lean_binding_targets(name, descriptor))
+    value = node.child_by_field_name(cs.FIELD_VALUE)
+    if (
+        value is None
+        and descriptor.declarator_value_is_last_child
+        and node.type == descriptor.declarator_type
+    ):
+        value = _last_named_declarator_value(node)
+    return targets, lean_binding_values(value, descriptor)
+
+
+def _last_named_declarator_value(node: Node) -> Node | None:
+    # C# `variable_declarator` = `name = <expr>` with the initialiser as an
+    # unfielded child: its value is the last named child. An uninitialised
+    # declaration has a single named child (the name identifier), so require at
+    # least two: robust even when the `name` field is absent under parser error
+    # recovery (a lone child is never a real initialiser).
+    if node.named_child_count < 2:
+        return None
+    return node.named_child(node.named_child_count - 1)
+
+
+def keyword_value(args: Node, keyword: str) -> Node | None:
+    for child in args.named_children:
+        if child.type != cs.TS_PY_KEYWORD_ARGUMENT:
+            continue
+        name = child.child_by_field_name(cs.TS_FIELD_NAME)
+        if name is not None and name.text is not None:
+            if name.text.decode(cs.ENCODING_UTF8) == keyword:
+                return child.child_by_field_name(cs.FIELD_VALUE)
+    return None
+
+
+def _wrapper_arg_name(node: Node, wrapper_type: str | None) -> str | None:
+    # The parameter name of a C# named argument (`path: "x"` -> "path"), read
+    # from the `argument` wrapper's `name` field; None for a positional arg.
+    if wrapper_type is None or node.type != wrapper_type:
+        return None
+    name = node.child_by_field_name(cs.TS_FIELD_NAME)
+    if name is not None and name.text is not None:
+        return name.text.decode(cs.ENCODING_UTF8)
+    return None
+
+
+def unwrap_argument(node: Node, wrapper_type: str | None) -> Node:
+    # C# wraps each call arg in an `argument` node; the real expression is its last
+    # named child (a named arg's `name` identifier is an earlier named child).
+    # Unwrap so the string reader sees the literal. No-op elsewhere.
+    if (
+        wrapper_type is not None
+        and node.type == wrapper_type
+        and node.named_child_count
+    ):
+        return node.named_child(node.named_child_count - 1) or node
+    return node
+
+
+def _wrapper_keyword_value(args: Node, keyword: str, wrapper_type: str) -> Node | None:
+    # Find a C# named argument (`variable: "X"`) by its parameter name and return
+    # its value expression, so a reordered named arg resolves to the right resource
+    # identity regardless of position.
+    for child in args.named_children:
+        if _wrapper_arg_name(child, wrapper_type) == keyword:
+            return unwrap_argument(child, wrapper_type)
+    return None
+
+
+def positional_arg_node(
+    call_node: Node, arg_index: int, wrapper_type: str | None
+) -> Node | None:
+    # The unwrapped expression node at a positional argument index, excluding
+    # comments and C# named-argument wrappers (so the index maps to a real
+    # positional arg). Resolves a handle passed as an argument
+    # (`new SqlCommand(sql, conn)` -> conn at index 1).
+    args = call_node.child_by_field_name(cs.TS_FIELD_ARGUMENTS)
+    if args is None:
+        return None
+    positional = [
+        c
+        for c in args.named_children
+        if c.type != cs.TS_COMMENT and _wrapper_arg_name(c, wrapper_type) is None
+    ]
+    if arg_index < len(positional):
+        return unwrap_argument(positional[arg_index], wrapper_type)
+    return None
+
+
+def target_arg_node(
+    call_node: Node,
+    arg_index: int | None,
+    arg_keyword: str | None = None,
+    *,
+    keyword_arg_type: str | None = cs.TS_PY_KEYWORD_ARGUMENT,
+    wrapper_type: str | None = None,
+) -> Node | None:
+    """The argument expression a sink reads its target from, if present."""
+    if arg_index is None and arg_keyword is None:
+        return None
+    args = call_node.child_by_field_name(cs.TS_FIELD_ARGUMENTS)
+    if args is None:
+        return None
+    # A C# named argument (`path: "x"`) is matched by name FIRST: named args can be
+    # reordered, so they must not count toward the positional index.
+    if arg_keyword is not None and wrapper_type is not None:
+        named = _wrapper_keyword_value(args, arg_keyword, wrapper_type)
+        if named is not None:
+            return named
+    # Exclude keyword args, comment nodes (tree-sitter keeps comments as named
+    # children), and C# named-argument wrappers so the positional index maps to the
+    # real positional argument.
+    positional = [
+        c
+        for c in args.named_children
+        if c.type not in (keyword_arg_type, cs.TS_COMMENT)
+        and _wrapper_arg_name(c, wrapper_type) is None
+    ]
+    if arg_index is not None and arg_index < len(positional):
+        return unwrap_argument(positional[arg_index], wrapper_type)
+    if arg_keyword is not None:
+        return keyword_value(args, arg_keyword)
+    return None
+
+
+def literal_target(
+    call_node: Node,
+    arg_index: int | None,
+    arg_keyword: str | None = None,
+    *,
+    string_type: str = cs.TS_PY_STRING,
+    content_type: str = cs.TS_PY_STRING_CONTENT,
+    keyword_arg_type: str | None = cs.TS_PY_KEYWORD_ARGUMENT,
+    wrapper_type: str | None = None,
+    template_type: str | None = None,
+    substitution_type: str | None = None,
+) -> str:
+    return string_literal(
+        target_arg_node(
+            call_node,
+            arg_index,
+            arg_keyword,
+            keyword_arg_type=keyword_arg_type,
+            wrapper_type=wrapper_type,
+        ),
+        string_type,
+        content_type,
+        template_type=template_type,
+        substitution_type=substitution_type,
+    )

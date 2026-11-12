@@ -1,0 +1,4183 @@
+import asyncio
+import functools
+import itertools
+import json
+import sys
+import uuid
+from collections.abc import Callable, Collection
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+from loguru import logger
+from mcp.types import ToolAnnotations
+from pydantic_ai import Agent, DeferredToolRequests, Tool
+from pydantic_ai.tools import ToolFuncPlain
+
+from codebase_rag import constants as cs
+from codebase_rag import cypher_queries as cq
+from codebase_rag import gloss, graph_query
+from codebase_rag import logs as lg
+from codebase_rag import structural_delta as sd
+from codebase_rag import tool_errors as te
+from codebase_rag.config import load_ignore_patterns, settings
+from codebase_rag.gloss_anchor import ParsedSource, SourceReader, parse_source
+from codebase_rag.graph_updater import GraphUpdater, ReingestAborted
+from codebase_rag.models import ToolMetadata
+from codebase_rag.parser_loader import load_parsers
+from codebase_rag.services import QueryProtocol
+from codebase_rag.services.gloss_cleanup import prune_orphaned_glosses
+from codebase_rag.services.graph_service import MemgraphIngestor
+from codebase_rag.services.llm import (
+    CypherQueryGenerator,
+    create_rag_orchestrator,
+    run_to_text_answer,
+)
+from codebase_rag.services.provenance import head_commit
+from codebase_rag.sync_guard import retire_stranded_runs, run_owner, stranded_runs
+from codebase_rag.sync_lock import repo_sync_lock
+from codebase_rag.tools import tool_descriptions as td
+from codebase_rag.tools.ast_grep_service import AstGrepService
+from codebase_rag.tools.code_retrieval import (
+    CodeRetriever,
+    create_code_retrieval_tool,
+)
+from codebase_rag.tools.codebase_query import create_query_tool
+from codebase_rag.tools.directory_lister import (
+    DirectoryLister,
+    create_directory_lister_tool,
+)
+from codebase_rag.tools.duplicate_detection import create_find_duplicates_tool
+from codebase_rag.tools.file_editor import FileEditor, create_file_editor_tool
+from codebase_rag.tools.file_reader import (
+    FileReader,
+    create_file_reader_tool,
+    read_file_text,
+)
+from codebase_rag.tools.file_writer import FileWriter, create_file_writer_tool
+from codebase_rag.tools.semantic_search import (
+    create_get_function_source_tool,
+    semantic_code_search,
+)
+from codebase_rag.tools.shell_command import ShellCommander, create_shell_command_tool
+from codebase_rag.tools.structural_editor import create_structural_editor_tool
+from codebase_rag.tools.structural_search import create_structural_search_tool
+from codebase_rag.types_defs import (
+    CodeSnippetResultDict,
+    DeleteProjectErrorResult,
+    DeleteProjectResult,
+    DeleteProjectSuccessResult,
+    ListProjectsErrorResult,
+    ListProjectsResult,
+    ListProjectsSuccessResult,
+    MCPHandlerType,
+    MCPInputSchema,
+    MCPInputSchemaProperty,
+    MCPToolSchema,
+    PropertyValue,
+    QueryResultDict,
+    ReingestReport,
+    ReingestToolResult,
+    SemanticSearchResult,
+    StructuralReplaceChange,
+)
+from codebase_rag.utils.dependencies import has_ast_grep, has_semantic_dependencies
+from codebase_rag.utils.path_utils import derive_project_name, nested_project_names
+from codebase_rag.utils.terminal_console import terminal_aware_console
+from codebase_rag.vector_store import clear_all_embeddings, delete_project_embeddings
+from codebase_rag.workspaces import WorkspaceConfig
+
+if TYPE_CHECKING:
+    from codebase_rag.crash_correlation import (
+        FrameResolutionRate,
+        RootCauseReport,
+        TracebackReport,
+    )
+
+
+def _found_nothing(result: object) -> bool:
+    """An empty walk, or a lookup that answered `found: false`."""
+    return result == [] or (
+        isinstance(result, dict) and result.get(cs.MCP_KEY_FOUND) is False
+    )
+
+
+def _read_file_slice(
+    full_path: Path, start: int, limit: int | None, file_path: str
+) -> str:
+    with open(full_path, encoding=cs.ENCODING_UTF8) as f:
+        # islice() refuses a count past sys.maxsize; no file has that many
+        # lines, so the clamped skip reads to the same end.
+        skipped_count = sum(1 for _ in itertools.islice(f, min(start, sys.maxsize)))
+
+        if limit is not None:
+            sliced_lines = [line for _, line in zip(range(limit), f)]
+        else:
+            sliced_lines = list(f)
+
+        paginated_content = "".join(sliced_lines)
+        remaining_lines_count = sum(1 for _ in f)
+
+    total_lines = skipped_count + len(sliced_lines) + remaining_lines_count
+    # Offset 0 is the start even of an empty file; any other offset must
+    # land on a line.
+    if start >= total_lines and start > 0:
+        return te.failure(
+            cs.MCP_READ_PAST_END.format(offset=start, path=file_path, total=total_lines)
+        )
+    header = cs.MCP_PAGINATION_HEADER.format(
+        start=start + 1,
+        end=start + len(sliced_lines),
+        total=total_lines,
+    )
+    return header + paginated_content
+
+
+# The read-only tools routed through `_graph_query`. Listed rather than
+# inferred: `rename` shares that path for the ingestor lock but is a WRITE,
+# and refusing it here would replace its own refusal payload (which carries
+# `ambiguous`/`unlocatable`) with a generic error.
+#
+# This set only governs the `_graph_query` dispatcher. Seven other handlers
+# (flow_verdict, explain_traceback, rank_root_causes, semantic_search,
+# find_duplicate_code, get_function_source, get_code_snippet) do not go
+# through that dispatcher at all -- which is exactly why they went unguarded
+# until PR #1547 -- and call `_incomplete_refusal` directly instead.
+#
+# An explicit inventory fails OPEN: a tool nobody adds here is simply not
+# guarded, silently. `_GRAPH_READING_TOOLS` below closes that by naming the
+# NON-readers instead, so a new tool is guarded by default and
+# `test_every_graph_reader_is_guarded` fails if one is neither.
+# The tools that do NOT read the code graph: lifecycle and project
+# management, plain file and text operations, and the agent passthrough.
+# Named this way round deliberately. The graph readers are then everything
+# else, so a tool added to `MCPToolName` counts as a reader until someone
+# says otherwise, and `test_every_graph_reader_is_guarded` fails until it is
+# either guarded or listed here. The previous shape -- an explicit list of
+# readers -- failed OPEN, which is how seven readers went unguarded from the
+# day the incomplete-graph refusal was written (PR #1547).
+_NOT_GRAPH_READERS = frozenset(
+    {
+        cs.MCPToolName.LIST_PROJECTS,
+        cs.MCPToolName.DELETE_PROJECT,
+        cs.MCPToolName.WIPE_DATABASE,
+        cs.MCPToolName.INDEX_REPOSITORY,
+        cs.MCPToolName.UPDATE_REPOSITORY,
+        cs.MCPToolName.REINGEST,
+        cs.MCPToolName.RENAME,
+        cs.MCPToolName.CHANGE_SIGNATURE,
+        # An EDIT like RENAME and CHANGE_SIGNATURE above: it runs its own
+        # re-ingest behind the incomplete-run marker and holds the result to
+        # the postcondition contract, so refusing up front on a partial graph
+        # would block the operation that repairs it (issue #1534).
+        cs.MCPToolName.MOVE,
+        cs.MCPToolName.SURGICAL_REPLACE_CODE,
+        cs.MCPToolName.READ_FILE,
+        cs.MCPToolName.WRITE_FILE,
+        cs.MCPToolName.LIST_DIRECTORY,
+        cs.MCPToolName.STRUCTURAL_SEARCH,
+        cs.MCPToolName.STRUCTURAL_REPLACE,
+        cs.MCPToolName.ASK_AGENT,
+    }
+)
+
+# Every graph reader, derived. `_READS_THE_GRAPH` below is the subset routed
+# through `_graph_query`; the rest call `_incomplete_refusal` themselves.
+_GRAPH_READING_TOOLS = frozenset(cs.MCPToolName) - _NOT_GRAPH_READERS
+
+_READS_THE_GRAPH = frozenset(
+    {
+        cs.MCPToolName.RESOLVE,
+        cs.MCPToolName.DEFINITION,
+        cs.MCPToolName.CALLERS,
+        cs.MCPToolName.CALLEES,
+        cs.MCPToolName.IMPLEMENTORS,
+        cs.MCPToolName.OVERRIDES,
+        cs.MCPToolName.IMPORTERS,
+        cs.MCPToolName.TESTS_REACHING,
+        cs.MCPToolName.ENDPOINTS,
+        cs.MCPToolName.ENDPOINT_CALLERS,
+        cs.MCPToolName.REMOTE_DEPENDENCIES,
+        # `annotate` writes, but it READS first: the subject is resolved
+        # against the graph, and on a partial graph a missing sibling makes
+        # an ambiguous name look unique, so the note lands on the wrong
+        # definition with no refusal. Guarded like the readers (#1808).
+        cs.MCPToolName.ANNOTATE,
+        cs.MCPToolName.GLOSSES,
+        # A pure READER, unlike the edit operations in `_NOT_GRAPH_READERS`:
+        # it ranks and excerpts, and writes nothing. It is routed through
+        # `_graph_query` like the deterministic readers above, so it belongs
+        # here rather than being exempted -- a partial graph would silently
+        # drop callers, callees and reaching tests from the slice, and the
+        # budget would be spent on a context that is quietly incomplete
+        # (issue #1536).
+        cs.MCPToolName.CONTEXT,
+    }
+)
+
+# The relationships each cross-service tool needs for a non-empty answer:
+# every one its queries MATCH, not the ones they only count or optionally
+# join. All sit in the opt-in `io` group, so on a project synced without one
+# an empty answer means "never recorded", not "none" (issue #2521).
+_CAPTURE_READ_BY: dict[cs.MCPToolName, frozenset[cs.RelationshipType]] = {
+    cs.MCPToolName.ENDPOINTS: frozenset({cs.RelationshipType.EXPOSES}),
+    # A caller reaches the handler's EXPOSES through its own READS_FROM or
+    # WRITES_TO, by way of RESOLVES_TO for a URL: with any of them left out
+    # some callers could never have been recorded (bot review on PR #2596).
+    cs.MCPToolName.ENDPOINT_CALLERS: frozenset(
+        {
+            cs.RelationshipType.EXPOSES,
+            cs.RelationshipType.READS_FROM,
+            cs.RelationshipType.WRITES_TO,
+            cs.RelationshipType.RESOLVES_TO,
+        }
+    ),
+    cs.MCPToolName.REMOTE_DEPENDENCIES: frozenset(
+        {cs.RelationshipType.READS_FROM, cs.RelationshipType.WRITES_TO}
+    ),
+}
+
+
+async def _run_in_thread[**P, T](
+    fn: Callable[P, T], /, *args: P.args, **kwargs: P.kwargs
+) -> T:
+    """`asyncio.to_thread` that a cancelled request cannot outrun.
+
+    Cancelling a request cancels its handler, but no thread can be stopped:
+    with a bare `to_thread` the handler unwound at once, its `async with
+    self._ingestor_lock` released, and the next mutating call ran while the
+    thread was still writing. A `delete_project` under a cancelled
+    `index_repository` left 13,404 orphan nodes that every later sync and
+    delete missed (issue #2920). The cancellation is delivered once the
+    thread has ended, so a lock taken around this call is held as long as
+    the work it guards runs.
+    """
+    work = asyncio.ensure_future(asyncio.to_thread(fn, *args, **kwargs))
+    cancelled = False
+    while True:
+        try:
+            result = await asyncio.shield(work)
+        except asyncio.CancelledError:
+            if work.cancelled():
+                raise
+            cancelled = True
+            continue
+        except Exception as exc:
+            if cancelled:
+                # The caller was cancelled and gets its cancellation, not the
+                # failure of work it no longer waits for (bot review on PR
+                # #2987); the failure stays attached as its cause.
+                raise asyncio.CancelledError from exc
+            raise
+        break
+    if cancelled:
+        raise asyncio.CancelledError
+    return result
+
+
+def _plain_function(tool: Tool) -> ToolFuncPlain[...]:
+    # pydantic-ai types `function` as taking a RunContext or not; every tool
+    # this registry calls directly is built without one, which this states
+    # once instead of at each call site.
+    return tool.function
+
+
+def _resolution_section(resolution: "FrameResolutionRate") -> dict:
+    # `rate` is a property, so `_asdict()` omits it; mapped explicitly
+    # because the ratio is the number the caller acts on (issue #227).
+    return {
+        "total": resolution.total,
+        "resolved": resolution.resolved,
+        "rate": resolution.rate,
+    }
+
+
+def _explained_section(report: "TracebackReport") -> dict:
+    """One exception of an explained traceback: the one that propagated, or
+    a member of an ExceptionGroup, with members of its own (issue #3235)."""
+    return {
+        "exception_type": report.exception_type,
+        "exception_message": report.exception_message,
+        "frames": [frame._asdict() for frame in report.frames],
+        "resolution": _resolution_section(report.resolution),
+        "note": report.note,
+        "members": [_explained_section(member) for member in report.members],
+        "omitted_members": report.omitted_members,
+    }
+
+
+def _ranked_section(report: "RootCauseReport") -> dict:
+    """One exception's ranking, as `_explained_section` lays it out."""
+    return {
+        "exception_type": report.exception_type,
+        "exception_message": report.exception_message,
+        "failing": report.failing,
+        "anchor_is_crash_site": report.anchor_is_crash_site,
+        "candidates": [candidate._asdict() for candidate in report.candidates],
+        "resolution": _resolution_section(report.resolution),
+        "note": report.note,
+        "members": [_ranked_section(member) for member in report.members],
+        "omitted_members": report.omitted_members,
+    }
+
+
+class MCPToolsRegistry:
+    # Class-level default so the read guard cannot raise AttributeError on a
+    # registry built through `__new__`. Tests construct it that way in a
+    # dozen places, and a guard that explodes on a half-built fixture reports
+    # a graph problem that is really a fixture problem -- which is exactly
+    # what happened when this field was added (PR #1547). `__init__` sets the
+    # real value; this only makes omission harmless.
+    _incomplete_project: str | None = None
+
+    # True when the unattributed flag covers MORE THAN ONE project: two named
+    # projects were damaged and the pair cannot fit in one field, or a wipe
+    # died part way and spans them all. As opposed to a flag that was simply
+    # never attributed to anyone.
+    #
+    # Both states leave `_incomplete_project` None and they mean opposite
+    # things to a clear. An unattributed flag in the single-project case is
+    # settled by the run that earned it; a flag spanning projects is the only
+    # record that another project is partial, and no single project's
+    # successful clear may retire it (4-55, PR #1547).
+    #
+    # Named for the PROPERTY rather than for the widening that first exposed
+    # it: three different sites reach this state, and a name describing one of
+    # them invites the next reader to think the other two are a different
+    # thing (they are not -- a failed wipe was missed exactly that way while
+    # this field was called `_incomplete_widened`).
+    #
+    # A separate field rather than a sentinel in `_incomplete_project`: every
+    # reader that treats None as "blocks every project" is already correct for
+    # both states, so redefining the field would have meant auditing all of
+    # them to preserve behaviour they already have. This adds a fact instead
+    # of changing the meaning of an existing one.
+    #
+    # It is a SET of the projects still outstanding, not a boolean. A boolean
+    # records that the damage spans projects and nothing ever retires it: no
+    # sequence of successful repairs can lower a flag that counts nothing, so
+    # every project -- including ones never damaged -- stays refused for the
+    # life of the process, with `wipe_database` the only escape. That is the
+    # mirror-image of the bug this field fixes, and the review caught it in
+    # the same commit (greptile-local, PR #1547). Repairing a project
+    # discards it; the flag settles when the set empties.
+    _incomplete_projects: Collection[str] = frozenset()
+
+    # A wipe damages every project at once, including ones this process has
+    # never named, so the outstanding set cannot enumerate it. This says "the
+    # damage is unbounded", and only a completed wipe retires it.
+    _incomplete_unbounded: bool = False
+    # The workspace served, if any (issue #1494). A class default so a
+    # registry built without __init__ (the test doubles do) still has it.
+    workspace: WorkspaceConfig | None = None
+
+    def __init__(
+        self,
+        project_root: str,
+        ingestor: MemgraphIngestor,
+        cypher_gen: CypherQueryGenerator,
+        workspace: WorkspaceConfig | None = None,
+    ) -> None:
+        self.project_root = project_root
+        self.ingestor = ingestor
+        self.cypher_gen = cypher_gen
+        # The workspace this server serves, if one was loaded (issue #1494):
+        # an allow-list on top of the graph's own project check, never a
+        # substitute for it, and the source root for each of its repos.
+        self.workspace = workspace
+        self._ingestor_lock = asyncio.Lock()
+        # The updater that last indexed this root, kept warm so reingest()
+        # resolves cross-file calls without re-reading the registry from the
+        # graph on every call (issue #1524).
+        self._live_updater: GraphUpdater | None = None
+        # True from the moment an index or update starts mutating the graph
+        # until it completes: a run that failed part way leaves a graph a
+        # scoped reingest must not hydrate from, because it would treat the
+        # missing and stale definitions as authoritative.
+        self._graph_incomplete = False
+        # The project whose FAILED MARKER CLEAR set `_graph_incomplete`, or
+        # None when the flag came from somewhere else (a failed wipe, delete
+        # or update, which set it while writing no marker for this project).
+        # Only a flag with this provenance may be healed by a marker
+        # recovery: a bare "a marker was recovered" boolean discards a flag
+        # an unrelated marker-less failure earned, whenever some recoverable
+        # marker happens to be pending at guard time (#1705 review).
+        self._flag_from_failed_clear: str | None = None
+        # This registry's identity in the durable marker. The ingestor lock is
+        # per INSTANCE, so two registries can index the same project at once;
+        # a marker keyed only by project meant the second run's clear deleted
+        # the first run's marker, and a partial graph then looked complete to
+        # a fresh process (issue #1709). Per registry rather than per call
+        # because the instance lock already serialises this registry's own
+        # runs, so its own marker can never overlap itself.
+        self._run_id: str = uuid.uuid4().hex
+        # WHICH project's damage `_graph_incomplete` records, when a marker
+        # does not say. The flag is registry-wide but every writer of it is
+        # project-scoped, so a successful clear for project B discarded a
+        # flag project A earned (issue #1774): `_require_marker_cleared` set
+        # it from one project's result with `self._graph_incomplete = not
+        # cleared`. The durable marker cannot cover that case, being per
+        # project -- a wipe that dies before the graph is gone writes no
+        # marker for A at all, leaving this flag the only record that A is
+        # partial, and an unrelated delete erased it.
+        #
+        # `None` means "spans every project, or owner unknown", which is what
+        # a WIPE leaves: no single project's clear may settle it. A named
+        # project means an operation on THAT project raised it and its own
+        # clear is entitled to settle it -- which is what keeps
+        # delete/index/update working, since each clears the flag it raised.
+        # The project `_graph_incomplete` is ABOUT, or None when the damage is
+        # not attributable to one (a wipe spans every project, and a failure
+        # before the name is known could have touched anything). A READ
+        # refuses only for the named project, or for everything when it is
+        # None: one project's failed recovery must not make every other
+        # project unreadable, and a healthy project's success must not clear
+        # the warning the damaged one earned (Greptile, PR #1547).
+        self._incomplete_project: str | None = None
+        self._incomplete_projects: set[str] = set()
+        self._incomplete_unbounded: bool = False
+
+        self.parsers, self.queries = load_parsers()
+
+        self.code_retriever = CodeRetriever(project_root, ingestor)
+        self.file_editor = FileEditor(project_root=project_root)
+        self.file_reader = FileReader(project_root=project_root)
+        self.file_writer = FileWriter(project_root=project_root)
+        self.directory_lister = DirectoryLister(project_root=project_root)
+        self.shell_commander = ShellCommander(project_root=project_root)
+        self.ast_grep_service = AstGrepService(project_root=project_root)
+
+        # Kept on self: a scoped request builds its own query tool per call,
+        # and that tool must print to the same console as the pre-built one.
+        self._stderr_console = terminal_aware_console(file=sys.stderr)
+        self._query_tool = create_query_tool(
+            ingestor=ingestor, cypher_gen=cypher_gen, console=self._stderr_console
+        )
+        self._code_tool = create_code_retrieval_tool(code_retriever=self.code_retriever)
+        self._file_editor_tool = create_file_editor_tool(file_editor=self.file_editor)
+        self._file_reader_tool = create_file_reader_tool(file_reader=self.file_reader)
+        self._file_writer_tool = create_file_writer_tool(file_writer=self.file_writer)
+        self._directory_lister_tool = create_directory_lister_tool(
+            directory_lister=self.directory_lister
+        )
+        self._shell_command_tool = create_shell_command_tool(
+            shell_commander=self.shell_commander
+        )
+        self._structural_search_tool = create_structural_search_tool(
+            service=self.ast_grep_service
+        )
+        # Files the last structural_replace wrote, for the structural delta.
+        self._structural_written: list[str] = []
+        self._structural_editor_tool = create_structural_editor_tool(
+            service=self.ast_grep_service, on_changes=self._note_structural_changes
+        )
+        self._structural_available = has_ast_grep()
+
+        # Both read-only, and both were CLI-only until issue #1342.
+        # `find_duplicate_code` was absent from MCP entirely;
+        # `get_function_source` existed here only inside the `ask_agent`
+        # toolset, so a client could not call it directly, only ask an LLM to
+        # decide to call it. Neither takes a ReadContentRecord: that gate
+        # exists to keep repository content out of `web_search`, and MCP
+        # exposes no web-reaching tool for it to guard.
+        self._find_duplicates_tool = create_find_duplicates_tool(self.ingestor)
+        self._function_source_tool = create_get_function_source_tool(self.ingestor)
+        # Held to the workspace ONCE, here, so the direct MCP handlers and
+        # the agent's tool list share the guard: wrapping only the agent's
+        # copies left the MCP client itself served source from outside the
+        # allow-list (local review P1 on PR #1972). No-ops without a
+        # workspace.
+        self._code_tool = self._workspace_scoped_by_name(self._code_tool)
+        self._function_source_tool = self._workspace_scoped_by_node(
+            self._function_source_tool
+        )
+
+        self._rag_agent: Agent[None, str | DeferredToolRequests] | None = None
+
+        self._semantic_search_tool = None
+        self._semantic_search_available = False
+
+        if has_semantic_dependencies():
+            from codebase_rag.tools.semantic_search import (
+                create_semantic_search_tool,
+            )
+
+            self._semantic_search_tool = create_semantic_search_tool(self.ingestor)
+            self._semantic_search_available = True
+        else:
+            logger.info(lg.MCP_SEMANTIC_NOT_AVAILABLE)
+
+        self._tools: dict[str, ToolMetadata] = {
+            cs.MCPToolName.LIST_PROJECTS: ToolMetadata(
+                name=cs.MCPToolName.LIST_PROJECTS,
+                description=td.MCP_TOOLS[cs.MCPToolName.LIST_PROJECTS],
+                input_schema=MCPInputSchema(
+                    type=cs.MCPSchemaType.OBJECT,
+                    properties={},
+                    required=[],
+                ),
+                handler=self.list_projects,
+                returns_json=True,
+            ),
+            cs.MCPToolName.DELETE_PROJECT: ToolMetadata(
+                name=cs.MCPToolName.DELETE_PROJECT,
+                description=td.MCP_TOOLS[cs.MCPToolName.DELETE_PROJECT],
+                input_schema=MCPInputSchema(
+                    type=cs.MCPSchemaType.OBJECT,
+                    properties={
+                        cs.MCPParamName.PROJECT_NAME: MCPInputSchemaProperty(
+                            type=cs.MCPSchemaType.STRING,
+                            description=td.MCP_PARAM_PROJECT_NAME,
+                        )
+                    },
+                    required=[cs.MCPParamName.PROJECT_NAME],
+                ),
+                handler=self.delete_project,
+                returns_json=True,
+            ),
+            cs.MCPToolName.WIPE_DATABASE: ToolMetadata(
+                name=cs.MCPToolName.WIPE_DATABASE,
+                description=td.MCP_TOOLS[cs.MCPToolName.WIPE_DATABASE],
+                input_schema=MCPInputSchema(
+                    type=cs.MCPSchemaType.OBJECT,
+                    properties={
+                        cs.MCPParamName.CONFIRM: MCPInputSchemaProperty(
+                            type=cs.MCPSchemaType.BOOLEAN,
+                            description=td.MCP_PARAM_CONFIRM,
+                        )
+                    },
+                    required=[cs.MCPParamName.CONFIRM],
+                ),
+                handler=self.wipe_database,
+                returns_json=False,
+            ),
+            cs.MCPToolName.INDEX_REPOSITORY: ToolMetadata(
+                name=cs.MCPToolName.INDEX_REPOSITORY,
+                description=td.MCP_TOOLS[cs.MCPToolName.INDEX_REPOSITORY],
+                input_schema=MCPInputSchema(
+                    type=cs.MCPSchemaType.OBJECT,
+                    properties={},
+                    required=[],
+                ),
+                handler=self.index_repository,
+                returns_json=False,
+            ),
+            cs.MCPToolName.UPDATE_REPOSITORY: ToolMetadata(
+                name=cs.MCPToolName.UPDATE_REPOSITORY,
+                description=td.MCP_TOOLS[cs.MCPToolName.UPDATE_REPOSITORY],
+                input_schema=MCPInputSchema(
+                    type=cs.MCPSchemaType.OBJECT,
+                    properties={},
+                    required=[],
+                ),
+                handler=self.update_repository,
+                returns_json=False,
+            ),
+            cs.MCPToolName.REINGEST: ToolMetadata(
+                name=cs.MCPToolName.REINGEST,
+                description=td.MCP_TOOLS[cs.MCPToolName.REINGEST],
+                input_schema=MCPInputSchema(
+                    type=cs.MCPSchemaType.OBJECT,
+                    properties={
+                        cs.MCPParamName.PATHS: MCPInputSchemaProperty(
+                            type=cs.MCPSchemaType.ARRAY,
+                            description=td.MCP_PARAM_REINGEST_PATHS,
+                            items={cs.MCPSchemaField.TYPE: cs.MCPSchemaType.STRING},
+                        ),
+                        cs.MCPParamName.DELETED: MCPInputSchemaProperty(
+                            type=cs.MCPSchemaType.ARRAY,
+                            description=td.MCP_PARAM_REINGEST_DELETED,
+                            items={cs.MCPSchemaField.TYPE: cs.MCPSchemaType.STRING},
+                        ),
+                    },
+                    required=[cs.MCPParamName.PATHS],
+                ),
+                handler=self.reingest,
+                returns_json=True,
+            ),
+            cs.MCPToolName.RESOLVE: self._graph_tool(
+                cs.MCPToolName.RESOLVE,
+                {cs.MCPParamName.TARGET: td.MCP_PARAM_TARGET},
+                [cs.MCPParamName.TARGET],
+                self.resolve,
+            ),
+            cs.MCPToolName.DEFINITION: self._graph_tool(
+                cs.MCPToolName.DEFINITION,
+                {cs.MCPParamName.QUALIFIED_NAME: td.MCP_PARAM_QUALIFIED_NAME},
+                [cs.MCPParamName.QUALIFIED_NAME],
+                self.definition,
+            ),
+            cs.MCPToolName.CALLERS: self._graph_tool(
+                cs.MCPToolName.CALLERS,
+                {
+                    cs.MCPParamName.QUALIFIED_NAME: td.MCP_PARAM_QUALIFIED_NAME,
+                    cs.MCPParamName.DEPTH: td.MCP_PARAM_DEPTH,
+                },
+                [cs.MCPParamName.QUALIFIED_NAME],
+                self.callers,
+                integer_params={cs.MCPParamName.DEPTH},
+            ),
+            cs.MCPToolName.CALLEES: self._graph_tool(
+                cs.MCPToolName.CALLEES,
+                {
+                    cs.MCPParamName.QUALIFIED_NAME: td.MCP_PARAM_QUALIFIED_NAME,
+                    cs.MCPParamName.DEPTH: td.MCP_PARAM_DEPTH,
+                },
+                [cs.MCPParamName.QUALIFIED_NAME],
+                self.callees,
+                integer_params={cs.MCPParamName.DEPTH},
+            ),
+            cs.MCPToolName.IMPLEMENTORS: self._graph_tool(
+                cs.MCPToolName.IMPLEMENTORS,
+                {
+                    cs.MCPParamName.QUALIFIED_NAME: td.MCP_PARAM_QUALIFIED_NAME,
+                    cs.MCPParamName.DEPTH: td.MCP_PARAM_DEPTH,
+                },
+                [cs.MCPParamName.QUALIFIED_NAME],
+                self.implementors,
+                integer_params={cs.MCPParamName.DEPTH},
+            ),
+            cs.MCPToolName.OVERRIDES: self._graph_tool(
+                cs.MCPToolName.OVERRIDES,
+                {
+                    cs.MCPParamName.QUALIFIED_NAME: td.MCP_PARAM_QUALIFIED_NAME,
+                    cs.MCPParamName.DEPTH: td.MCP_PARAM_DEPTH,
+                },
+                [cs.MCPParamName.QUALIFIED_NAME],
+                self.overrides,
+                integer_params={cs.MCPParamName.DEPTH},
+            ),
+            cs.MCPToolName.ANNOTATE: self._graph_tool(
+                cs.MCPToolName.ANNOTATE,
+                {
+                    cs.MCPParamName.TARGET: td.MCP_PARAM_TARGET,
+                    cs.MCPParamName.BODY: td.MCP_PARAM_GLOSS_BODY,
+                    cs.MCPParamName.KIND: td.MCP_PARAM_GLOSS_KIND,
+                    cs.MCPParamName.MENTIONS: td.MCP_PARAM_GLOSS_MENTIONS,
+                    cs.MCPParamName.AUTHOR: td.MCP_PARAM_GLOSS_AUTHOR,
+                },
+                [cs.MCPParamName.TARGET, cs.MCPParamName.BODY, cs.MCPParamName.KIND],
+                self.annotate,
+            ),
+            cs.MCPToolName.GLOSSES: self._graph_tool(
+                cs.MCPToolName.GLOSSES,
+                {cs.MCPParamName.TARGET: td.MCP_PARAM_TARGET},
+                [cs.MCPParamName.TARGET],
+                self.glosses,
+            ),
+            cs.MCPToolName.IMPORTERS: self._graph_tool(
+                cs.MCPToolName.IMPORTERS,
+                {
+                    cs.MCPParamName.MODULE_QN: td.MCP_PARAM_MODULE_QN,
+                    cs.MCPParamName.THROUGH_REEXPORTS: td.MCP_PARAM_THROUGH_REEXPORTS,
+                },
+                [cs.MCPParamName.MODULE_QN],
+                self.importers,
+                boolean_params={cs.MCPParamName.THROUGH_REEXPORTS},
+            ),
+            cs.MCPToolName.TESTS_REACHING: self._graph_tool(
+                cs.MCPToolName.TESTS_REACHING,
+                {cs.MCPParamName.QUALIFIED_NAME: td.MCP_PARAM_QUALIFIED_NAME},
+                [cs.MCPParamName.QUALIFIED_NAME],
+                self.tests_reaching,
+            ),
+            cs.MCPToolName.ENDPOINTS: self._graph_tool(
+                cs.MCPToolName.ENDPOINTS, {}, [], self.endpoints
+            ),
+            cs.MCPToolName.ENDPOINT_CALLERS: self._graph_tool(
+                cs.MCPToolName.ENDPOINT_CALLERS,
+                {cs.MCPParamName.TARGET: td.MCP_PARAM_ENDPOINT_TARGET},
+                [cs.MCPParamName.TARGET],
+                self.endpoint_callers,
+            ),
+            cs.MCPToolName.REMOTE_DEPENDENCIES: self._graph_tool(
+                cs.MCPToolName.REMOTE_DEPENDENCIES, {}, [], self.remote_dependencies
+            ),
+            cs.MCPToolName.RENAME: self._rename_tool(),
+            cs.MCPToolName.CHANGE_SIGNATURE: self._change_signature_tool(),
+            cs.MCPToolName.MOVE: self._move_tool(),
+            cs.MCPToolName.CONTEXT: self._context_tool(),
+            cs.MCPToolName.QUERY_CODE_GRAPH: ToolMetadata(
+                name=cs.MCPToolName.QUERY_CODE_GRAPH,
+                description=td.MCP_TOOLS[cs.MCPToolName.QUERY_CODE_GRAPH],
+                input_schema=MCPInputSchema(
+                    type=cs.MCPSchemaType.OBJECT,
+                    properties={
+                        cs.MCPParamName.NATURAL_LANGUAGE_QUERY: MCPInputSchemaProperty(
+                            type=cs.MCPSchemaType.STRING,
+                            description=td.MCP_PARAM_NATURAL_LANGUAGE_QUERY,
+                        ),
+                        # Declared as well as accepted: a client reads this
+                        # schema to learn what it may send, so omitting it
+                        # made per-request scoping undiscoverable (#1494).
+                        cs.MCPParamName.PROJECT: MCPInputSchemaProperty(
+                            type=cs.MCPSchemaType.STRING,
+                            description=td.MCP_PARAM_PROJECT,
+                        ),
+                    },
+                    required=[cs.MCPParamName.NATURAL_LANGUAGE_QUERY],
+                ),
+                handler=self.query_code_graph,
+                returns_json=True,
+            ),
+            cs.MCPToolName.GET_CODE_SNIPPET: ToolMetadata(
+                name=cs.MCPToolName.GET_CODE_SNIPPET,
+                description=td.MCP_TOOLS[cs.MCPToolName.GET_CODE_SNIPPET],
+                input_schema=MCPInputSchema(
+                    type=cs.MCPSchemaType.OBJECT,
+                    properties={
+                        cs.MCPParamName.QUALIFIED_NAME: MCPInputSchemaProperty(
+                            type=cs.MCPSchemaType.STRING,
+                            description=td.MCP_PARAM_QUALIFIED_NAME,
+                        )
+                    },
+                    required=[cs.MCPParamName.QUALIFIED_NAME],
+                ),
+                handler=self.get_code_snippet,
+                returns_json=True,
+            ),
+            cs.MCPToolName.SURGICAL_REPLACE_CODE: ToolMetadata(
+                name=cs.MCPToolName.SURGICAL_REPLACE_CODE,
+                description=td.MCP_TOOLS[cs.MCPToolName.SURGICAL_REPLACE_CODE],
+                input_schema=MCPInputSchema(
+                    type=cs.MCPSchemaType.OBJECT,
+                    properties={
+                        cs.MCPParamName.FILE_PATH: MCPInputSchemaProperty(
+                            type=cs.MCPSchemaType.STRING,
+                            description=td.MCP_PARAM_FILE_PATH,
+                        ),
+                        cs.MCPParamName.TARGET_CODE: MCPInputSchemaProperty(
+                            type=cs.MCPSchemaType.STRING,
+                            description=td.MCP_PARAM_TARGET_CODE,
+                        ),
+                        cs.MCPParamName.REPLACEMENT_CODE: MCPInputSchemaProperty(
+                            type=cs.MCPSchemaType.STRING,
+                            description=td.MCP_PARAM_REPLACEMENT_CODE,
+                        ),
+                    },
+                    required=[
+                        cs.MCPParamName.FILE_PATH,
+                        cs.MCPParamName.TARGET_CODE,
+                        cs.MCPParamName.REPLACEMENT_CODE,
+                    ],
+                ),
+                handler=self.surgical_replace_code,
+                returns_json=False,
+            ),
+            cs.MCPToolName.READ_FILE: ToolMetadata(
+                name=cs.MCPToolName.READ_FILE,
+                description=td.MCP_TOOLS[cs.MCPToolName.READ_FILE],
+                input_schema=MCPInputSchema(
+                    type=cs.MCPSchemaType.OBJECT,
+                    properties={
+                        cs.MCPParamName.FILE_PATH: MCPInputSchemaProperty(
+                            type=cs.MCPSchemaType.STRING,
+                            description=td.MCP_PARAM_FILE_PATH,
+                        ),
+                        cs.MCPParamName.OFFSET: MCPInputSchemaProperty(
+                            type=cs.MCPSchemaType.INTEGER,
+                            description=td.MCP_PARAM_OFFSET,
+                            minimum=cs.MCP_READ_OFFSET_MINIMUM,
+                        ),
+                        cs.MCPParamName.LIMIT: MCPInputSchemaProperty(
+                            type=cs.MCPSchemaType.INTEGER,
+                            description=td.MCP_PARAM_LIMIT,
+                            minimum=cs.MCP_READ_LIMIT_MINIMUM,
+                        ),
+                    },
+                    required=[cs.MCPParamName.FILE_PATH],
+                ),
+                handler=self.read_file,
+                returns_json=False,
+            ),
+            cs.MCPToolName.WRITE_FILE: ToolMetadata(
+                name=cs.MCPToolName.WRITE_FILE,
+                description=td.MCP_TOOLS[cs.MCPToolName.WRITE_FILE],
+                input_schema=MCPInputSchema(
+                    type=cs.MCPSchemaType.OBJECT,
+                    properties={
+                        cs.MCPParamName.FILE_PATH: MCPInputSchemaProperty(
+                            type=cs.MCPSchemaType.STRING,
+                            description=td.MCP_PARAM_FILE_PATH,
+                        ),
+                        cs.MCPParamName.CONTENT: MCPInputSchemaProperty(
+                            type=cs.MCPSchemaType.STRING,
+                            description=td.MCP_PARAM_CONTENT,
+                        ),
+                    },
+                    required=[
+                        cs.MCPParamName.FILE_PATH,
+                        cs.MCPParamName.CONTENT,
+                    ],
+                ),
+                handler=self.write_file,
+                returns_json=False,
+            ),
+            cs.MCPToolName.LIST_DIRECTORY: ToolMetadata(
+                name=cs.MCPToolName.LIST_DIRECTORY,
+                description=td.MCP_TOOLS[cs.MCPToolName.LIST_DIRECTORY],
+                input_schema=MCPInputSchema(
+                    type=cs.MCPSchemaType.OBJECT,
+                    properties={
+                        cs.MCPParamName.DIRECTORY_PATH: MCPInputSchemaProperty(
+                            type=cs.MCPSchemaType.STRING,
+                            description=td.MCP_PARAM_DIRECTORY_PATH,
+                            default=cs.MCP_DEFAULT_DIRECTORY,
+                        )
+                    },
+                    required=[],
+                ),
+                handler=self.list_directory,
+                returns_json=False,
+            ),
+        }
+        if self._semantic_search_available:
+            self._tools[cs.MCPToolName.SEMANTIC_SEARCH] = ToolMetadata(
+                name=cs.MCPToolName.SEMANTIC_SEARCH,
+                description=td.MCP_TOOLS[cs.MCPToolName.SEMANTIC_SEARCH],
+                input_schema=MCPInputSchema(
+                    type=cs.MCPSchemaType.OBJECT,
+                    properties={
+                        cs.MCPParamName.NATURAL_LANGUAGE_QUERY: MCPInputSchemaProperty(
+                            type=cs.MCPSchemaType.STRING,
+                            description=td.MCP_PARAM_NATURAL_LANGUAGE_QUERY,
+                        ),
+                        cs.MCPParamName.TOP_K: MCPInputSchemaProperty(
+                            type=cs.MCPSchemaType.INTEGER,
+                            description=td.MCP_PARAM_TOP_K,
+                            default=5,
+                        ),
+                        cs.MCPParamName.PROJECT: MCPInputSchemaProperty(
+                            type=cs.MCPSchemaType.STRING,
+                            description=td.MCP_PARAM_PROJECT,
+                        ),
+                    },
+                    required=[cs.MCPParamName.NATURAL_LANGUAGE_QUERY],
+                ),
+                handler=self.semantic_search,
+                returns_json=False,
+            )
+
+        if self._structural_available:
+            self._tools[cs.MCPToolName.STRUCTURAL_SEARCH] = ToolMetadata(
+                name=cs.MCPToolName.STRUCTURAL_SEARCH,
+                description=td.MCP_TOOLS[cs.MCPToolName.STRUCTURAL_SEARCH],
+                input_schema=MCPInputSchema(
+                    type=cs.MCPSchemaType.OBJECT,
+                    properties={
+                        cs.MCPParamName.PATTERN: MCPInputSchemaProperty(
+                            type=cs.MCPSchemaType.STRING,
+                            description=td.MCP_PARAM_PATTERN,
+                        ),
+                        cs.MCPParamName.LANGUAGE: MCPInputSchemaProperty(
+                            type=cs.MCPSchemaType.STRING,
+                            description=td.MCP_PARAM_LANGUAGE,
+                        ),
+                    },
+                    required=[cs.MCPParamName.PATTERN],
+                ),
+                handler=self.structural_search,
+                returns_json=False,
+            )
+            self._tools[cs.MCPToolName.STRUCTURAL_REPLACE] = ToolMetadata(
+                name=cs.MCPToolName.STRUCTURAL_REPLACE,
+                description=td.MCP_TOOLS[cs.MCPToolName.STRUCTURAL_REPLACE],
+                input_schema=MCPInputSchema(
+                    type=cs.MCPSchemaType.OBJECT,
+                    properties={
+                        cs.MCPParamName.PATTERN: MCPInputSchemaProperty(
+                            type=cs.MCPSchemaType.STRING,
+                            description=td.MCP_PARAM_PATTERN,
+                        ),
+                        cs.MCPParamName.REWRITE: MCPInputSchemaProperty(
+                            type=cs.MCPSchemaType.STRING,
+                            description=td.MCP_PARAM_REWRITE,
+                        ),
+                        cs.MCPParamName.LANGUAGE: MCPInputSchemaProperty(
+                            type=cs.MCPSchemaType.STRING,
+                            description=td.MCP_PARAM_LANGUAGE,
+                        ),
+                        cs.MCPParamName.DRY_RUN: MCPInputSchemaProperty(
+                            type=cs.MCPSchemaType.BOOLEAN,
+                            description=td.MCP_PARAM_DRY_RUN,
+                            default=True,
+                        ),
+                    },
+                    required=[cs.MCPParamName.PATTERN, cs.MCPParamName.REWRITE],
+                ),
+                handler=self.structural_replace,
+                returns_json=False,
+            )
+
+        # Unconditional: both read the graph only. get_function_source lives in
+        # semantic_search.py but touches none of the embedding machinery, so
+        # gating it on the semantic extra would hide a graph-only tool behind
+        # a dependency it never uses.
+        self._tools[cs.MCPToolName.FIND_DUPLICATE_CODE] = ToolMetadata(
+            name=cs.MCPToolName.FIND_DUPLICATE_CODE,
+            description=td.MCP_TOOLS[cs.MCPToolName.FIND_DUPLICATE_CODE],
+            input_schema=MCPInputSchema(
+                type=cs.MCPSchemaType.OBJECT,
+                properties={
+                    cs.MCPParamName.PROJECT: MCPInputSchemaProperty(
+                        type=cs.MCPSchemaType.STRING,
+                        description=td.MCP_PARAM_PROJECT,
+                    ),
+                    cs.MCPParamName.THRESHOLD: MCPInputSchemaProperty(
+                        type=cs.MCPSchemaType.NUMBER,
+                        description=td.MCP_PARAM_THRESHOLD,
+                        default=cs.DUPLICATES_DEFAULT_THRESHOLD,
+                    ),
+                    cs.MCPParamName.MIN_SIZE: MCPInputSchemaProperty(
+                        type=cs.MCPSchemaType.INTEGER,
+                        description=td.MCP_PARAM_MIN_SIZE,
+                        default=cs.DUPLICATES_DEFAULT_MIN_NODES,
+                    ),
+                    cs.MCPParamName.LIMIT: MCPInputSchemaProperty(
+                        type=cs.MCPSchemaType.INTEGER,
+                        description=td.MCP_PARAM_DUPLICATES_LIMIT,
+                        default=cs.DUPLICATES_DEFAULT_GROUP_LIMIT,
+                    ),
+                },
+                required=[],
+            ),
+            handler=self.find_duplicate_code,
+            returns_json=False,
+        )
+        self._tools[cs.MCPToolName.GET_FUNCTION_SOURCE] = ToolMetadata(
+            name=cs.MCPToolName.GET_FUNCTION_SOURCE,
+            description=td.MCP_TOOLS[cs.MCPToolName.GET_FUNCTION_SOURCE],
+            input_schema=MCPInputSchema(
+                type=cs.MCPSchemaType.OBJECT,
+                properties={
+                    cs.MCPParamName.NODE_ID: MCPInputSchemaProperty(
+                        type=cs.MCPSchemaType.INTEGER,
+                        description=td.MCP_PARAM_NODE_ID,
+                    )
+                },
+                required=[cs.MCPParamName.NODE_ID],
+            ),
+            handler=self.get_function_source,
+            returns_json=False,
+        )
+
+        self._tools[cs.MCPToolName.ASK_AGENT] = ToolMetadata(
+            name=cs.MCPToolName.ASK_AGENT,
+            description=td.MCP_TOOLS[cs.MCPToolName.ASK_AGENT],
+            input_schema=MCPInputSchema(
+                type=cs.MCPSchemaType.OBJECT,
+                properties={
+                    cs.MCPParamName.QUESTION: MCPInputSchemaProperty(
+                        type=cs.MCPSchemaType.STRING,
+                        description=td.MCP_PARAM_QUESTION,
+                    )
+                },
+                required=[cs.MCPParamName.QUESTION],
+            ),
+            handler=self.ask_agent,
+            returns_json=True,
+        )
+
+        self._tools[cs.MCPToolName.FLOW_VERDICT] = ToolMetadata(
+            name=cs.MCPToolName.FLOW_VERDICT,
+            description=td.MCP_TOOLS[cs.MCPToolName.FLOW_VERDICT],
+            input_schema=MCPInputSchema(
+                type=cs.MCPSchemaType.OBJECT,
+                properties={
+                    cs.MCPParamName.SOURCE_QN: MCPInputSchemaProperty(
+                        type=cs.MCPSchemaType.STRING,
+                        description=td.MCP_PARAM_SOURCE_QN,
+                    ),
+                    cs.MCPParamName.SINK_QN: MCPInputSchemaProperty(
+                        type=cs.MCPSchemaType.STRING,
+                        description=td.MCP_PARAM_SINK_QN,
+                    ),
+                },
+                required=[cs.MCPParamName.SOURCE_QN, cs.MCPParamName.SINK_QN],
+            ),
+            handler=self.flow_verdict,
+            returns_json=True,
+        )
+
+        traceback_schema = MCPInputSchema(
+            type=cs.MCPSchemaType.OBJECT,
+            properties={
+                cs.MCPParamName.TRACEBACK_TEXT: MCPInputSchemaProperty(
+                    type=cs.MCPSchemaType.STRING,
+                    description=td.MCP_PARAM_TRACEBACK_TEXT,
+                ),
+                cs.MCPParamName.PATH_PREFIX_MAP: MCPInputSchemaProperty(
+                    type=cs.MCPSchemaType.OBJECT,
+                    description=td.MCP_PARAM_PATH_PREFIX_MAP,
+                    additionalProperties={
+                        cs.MCPSchemaField.TYPE: cs.MCPSchemaType.STRING
+                    },
+                ),
+            },
+            required=[cs.MCPParamName.TRACEBACK_TEXT],
+        )
+        self._tools[cs.MCPToolName.EXPLAIN_TRACEBACK] = ToolMetadata(
+            name=cs.MCPToolName.EXPLAIN_TRACEBACK,
+            description=td.MCP_TOOLS[cs.MCPToolName.EXPLAIN_TRACEBACK],
+            input_schema=traceback_schema,
+            handler=self.explain_traceback,
+            returns_json=True,
+        )
+        self._tools[cs.MCPToolName.RANK_ROOT_CAUSES] = ToolMetadata(
+            name=cs.MCPToolName.RANK_ROOT_CAUSES,
+            description=td.MCP_TOOLS[cs.MCPToolName.RANK_ROOT_CAUSES],
+            input_schema=traceback_schema,
+            handler=self.rank_root_causes,
+            returns_json=True,
+        )
+
+    def _agent_query_tool(self) -> Tool:
+        """The graph-query tool the agent gets: the workspace's, if any.
+
+        The pre-built tool is bound to the project this server's root
+        derives to, which a workspace need not contain, so through
+        `ask_agent` it answered for a project outside the allow-list (bot
+        review on PR #1972). With a workspace the tool is bound to the
+        workspace default; without a default it refuses naming the choices,
+        the same answer `query_code_graph` gives a bare request.
+        """
+        if self.workspace is None:
+            return self._query_tool
+        default, scope_error = self._workspace_scope(None)
+        # The workspace allow-list says which projects are SERVED, not which
+        # are INDEXED. Every other project-taking tool meets the graph's own
+        # unknown-project check later; this one binds the query tool up
+        # front, so a served-but-unindexed default produced an empty answer
+        # where the others refuse (Copilot, PR #1972).
+        if scope_error is None and default is not None:
+            indexed = self.ingestor.list_projects()
+            if default not in indexed:
+                scope_error = self._unknown_project_error(default, sorted(indexed))
+                default = None
+        if scope_error is None and default is not None:
+            return create_query_tool(
+                ingestor=self.ingestor,
+                cypher_gen=self.cypher_gen,
+                console=self._stderr_console,
+                project_name=default,
+            )
+
+        def refuse(natural_language_query: str) -> str:
+            return str(scope_error)
+
+        return Tool(
+            refuse, name=td.AgenticToolName.QUERY_GRAPH, description=td.CODEBASE_QUERY
+        )
+
+    def _workspace_scoped_tool(self, tool: Tool) -> Tool:
+        """`tool` with its `project` argument held to the workspace allow-list
+        and default, for the agent; a no-op without a workspace. `wraps`
+        keeps the signature, which is the tool's schema."""
+        if self.workspace is None:
+            return tool
+        original = _plain_function(tool)
+
+        @functools.wraps(original)
+        async def scoped(*args: object, **kwargs: object) -> object:
+            requested = kwargs.get(cs.MCPParamName.PROJECT)
+            project, scope_error = self._workspace_scope(
+                requested if isinstance(requested, str) else None
+            )
+            if scope_error is not None:
+                return scope_error
+            kwargs[cs.MCPParamName.PROJECT] = project
+            return await original(*args, **kwargs)
+
+        return Tool(scoped, name=tool.name, description=tool.description)
+
+    def _workspace_name_refusal(
+        self, qualified_name: str, indexed: list[str] | None = None
+    ) -> str | None:
+        """Why a qualified name is refused under a workspace: it belongs to
+        no served project. The agent's source readers take a name, not a
+        project, so the allow-list is applied to the name's project prefix
+        (bot review on PR #1972). `indexed` is the graph's project list,
+        read by the caller off the event loop; absent, it is read here."""
+        if self.workspace is None:
+            return None
+        names = self.workspace.project_names()
+        if indexed is None:
+            indexed = self.ingestor.list_projects()
+        owner = self._name_owner(qualified_name, [*names, *indexed])
+        if owner is not None and owner in names:
+            return None
+        return cs.MCP_NAME_OUTSIDE_WORKSPACE.format(
+            name=qualified_name,
+            workspace=self.workspace.name,
+            known=cs.SEPARATOR_COMMA_SPACE.join(names),
+        )
+
+    @staticmethod
+    def _name_owner(qualified_name: str, projects: list[str]) -> str | None:
+        # The name's project is the LONGEST indexed or served project name
+        # it sits under, not the first served one that is a prefix: with
+        # `foo` served and `foo.bar` indexed outside the workspace,
+        # `foo.bar.pkg.fn` belongs to `foo.bar` (bot review on PR #1972,
+        # the dotted-prefix class of issue #1970).
+        owners = [
+            (len(candidate), candidate)
+            for candidate in set(projects)
+            if qualified_name == candidate
+            or qualified_name.startswith(f"{candidate}{cs.SEPARATOR_DOT}")
+        ]
+        return max(owners)[1] if owners else None
+
+    def _workspace_source_refusal(self, qualified_name: str) -> str | None:
+        """Why a source read of `qualified_name` is refused under a
+        workspace: the name is outside it, or its project is served but the
+        graph does not show it indexed from the workspace's checkout. The
+        source readers read the graph-stored path, or fall back to this
+        server's root, so a moved repo or a stale graph would otherwise serve
+        an allowed name from outside the workspace; `definition` applies the
+        same stored-root proof (Copilot, PR #1972). Reads the graph: call it
+        off the event loop."""
+        if self.workspace is None:
+            return None
+        indexed = self.ingestor.list_projects()
+        refusal = self._workspace_name_refusal(qualified_name, indexed)
+        if refusal is not None:
+            return refusal
+        names = self.workspace.project_names()
+        owner = self._name_owner(qualified_name, [*names, *indexed])
+        if owner is not None and self._source_root_for(owner) is not None:
+            return None
+        return cs.MCP_WORKSPACE_SOURCE_UNPROVEN.format(
+            name=qualified_name, project=owner, workspace=self.workspace.name
+        )
+
+    def _workspace_scoped_by_name(self, tool: Tool) -> Tool:
+        """`tool`, taking a qualified name, refusing one outside the
+        workspace; a no-op without a workspace."""
+        if self.workspace is None:
+            return tool
+        original = _plain_function(tool)
+
+        @functools.wraps(original)
+        async def scoped(
+            qualified_name: str, *args: object, **kwargs: object
+        ) -> object:
+            # The refusal reads the graph: off the event loop, which the
+            # direct handler holds under the ingestor lock (bot review).
+            refusal = await _run_in_thread(
+                self._workspace_source_refusal, qualified_name
+            )
+            if refusal is not None:
+                return refusal
+            return await original(qualified_name, *args, **kwargs)
+
+        return Tool(scoped, name=tool.name, description=tool.description)
+
+    def _workspace_scoped_by_node(self, tool: Tool) -> Tool:
+        """`tool`, taking a node id, refusing a node whose definition is
+        outside the workspace: the id is resolved to its qualified name first
+        (one read, only under a workspace); an id that resolves to nothing
+        is left to the tool, which reports it unavailable."""
+        if self.workspace is None:
+            return tool
+        original = _plain_function(tool)
+
+        @functools.wraps(original)
+        async def scoped(node_id: int, *args: object, **kwargs: object) -> object:
+            rows = await _run_in_thread(
+                self.ingestor.fetch_all,
+                cq.CYPHER_GET_FUNCTION_SOURCE_LOCATION,
+                {cs.KEY_NODE_ID: node_id},
+            )
+            name = rows[0].get(cs.KEY_QUALIFIED_NAME) if rows else None
+            if isinstance(name, str):
+                refusal = await _run_in_thread(self._workspace_source_refusal, name)
+                if refusal is not None:
+                    return refusal
+            return await original(node_id, *args, **kwargs)
+
+        return Tool(scoped, name=tool.name, description=tool.description)
+
+    @property
+    def rag_agent(self) -> Agent[None, str | DeferredToolRequests]:
+        if self._rag_agent is None:
+            tools = [
+                self._agent_query_tool(),
+                self._code_tool,
+                self._file_reader_tool,
+                self._file_writer_tool,
+                self._file_editor_tool,
+                self._shell_command_tool,
+                self._directory_lister_tool,
+                # The same instances the direct MCP tools use: a second copy
+                # would give the orchestrator its own roots cache and let the
+                # two routes disagree about a project indexed mid-session.
+                # Under a workspace the project-taking ones are wrapped so
+                # the agent cannot reach outside the allow-list (#1972).
+                self._function_source_tool,
+                self._workspace_scoped_tool(self._find_duplicates_tool),
+            ]
+            if self._semantic_search_tool is not None:
+                tools.append(self._workspace_scoped_tool(self._semantic_search_tool))
+            if self._structural_available:
+                tools.append(self._structural_search_tool)
+                tools.append(self._structural_editor_tool)
+            self._rag_agent, _ = create_rag_orchestrator(
+                tools=tools, project_root=Path(self.project_root)
+            )
+        return self._rag_agent
+
+    # Setter lets tests inject a mock agent without triggering LLM init
+    @rag_agent.setter
+    def rag_agent(self, value: Agent[None, str | DeferredToolRequests]) -> None:
+        self._rag_agent = value
+
+    async def flow_verdict(
+        self, source_qualified_name: str, sink_qualified_name: str
+    ) -> dict:
+        from codebase_rag.flow_verdict import flow_reachability_verdict
+
+        project, workspace_refusal = self._fixed_root_project()
+        if project is None:
+            return {cs.DICT_KEY_ERROR: workspace_refusal}
+        # The edge scan and coverage read must see one consistent graph:
+        # index/update handlers hold this lock while they delete and
+        # rebuild, and an interleaved read would mix generations. The guard
+        # is inside the lock for the same reason: a rebuild landing between
+        # the check and the read leaves an approved read running against the
+        # partial graph (Greptile, PR #1547).
+        async with self._ingestor_lock:
+            if refusal := await _run_in_thread(self._unindexed_refusal, project):
+                return {cs.DICT_KEY_ERROR: refusal}
+            if refusal := await _run_in_thread(
+                self._incomplete_refusal, project, cs.MCPToolName.FLOW_VERDICT
+            ):
+                return {cs.DICT_KEY_ERROR: refusal}
+            if refusal := await _run_in_thread(
+                self._flow_endpoint_refusal,
+                project,
+                source_qualified_name,
+                sink_qualified_name,
+            ):
+                return {cs.DICT_KEY_ERROR: refusal}
+            result = await _run_in_thread(
+                flow_reachability_verdict,
+                self.ingestor.fetch_all,
+                project,
+                source_qualified_name,
+                sink_qualified_name,
+            )
+        return {
+            "verdict": result.verdict,
+            "path": list(result.path),
+            "gaps": list(result.gaps),
+            # Where the path crosses a service boundary (issue #1603).
+            "remote_hops": [list(hop) for hop in result.remote_hops],
+        }
+
+    async def explain_traceback(
+        self, traceback_text: str, path_prefix_map: dict[str, str] | None = None
+    ) -> dict:
+        from codebase_rag.crash_correlation import explain_traceback
+
+        project, workspace_refusal = self._fixed_root_project()
+        if project is None:
+            return {cs.DICT_KEY_ERROR: workspace_refusal}
+        async with self._ingestor_lock:
+            if refusal := await _run_in_thread(self._unindexed_refusal, project):
+                return {cs.DICT_KEY_ERROR: refusal}
+            if refusal := await _run_in_thread(
+                self._incomplete_refusal, project, cs.MCPToolName.EXPLAIN_TRACEBACK
+            ):
+                return {cs.DICT_KEY_ERROR: refusal}
+            report = await _run_in_thread(
+                explain_traceback,
+                self.ingestor.fetch_all,
+                project,
+                Path(self.project_root),
+                traceback_text,
+                path_prefix_map,
+            )
+        return {
+            **_explained_section(report),
+            "flow_gaps": list(report.flow_gaps),
+            "inferred_checkout_root": report.inferred_root,
+        }
+
+    async def rank_root_causes(
+        self, traceback_text: str, path_prefix_map: dict[str, str] | None = None
+    ) -> dict:
+        from codebase_rag.crash_correlation import rank_root_causes
+
+        project, workspace_refusal = self._fixed_root_project()
+        if project is None:
+            return {cs.DICT_KEY_ERROR: workspace_refusal}
+        async with self._ingestor_lock:
+            if refusal := await _run_in_thread(self._unindexed_refusal, project):
+                return {cs.DICT_KEY_ERROR: refusal}
+            if refusal := await _run_in_thread(
+                self._incomplete_refusal, project, cs.MCPToolName.RANK_ROOT_CAUSES
+            ):
+                return {cs.DICT_KEY_ERROR: refusal}
+            report = await _run_in_thread(
+                rank_root_causes,
+                self.ingestor.fetch_all,
+                project,
+                Path(self.project_root),
+                traceback_text,
+                path_prefix_map,
+            )
+        return {
+            **_ranked_section(report),
+            "flow_used": report.flow_used,
+            "flow_gaps": list(report.flow_gaps),
+            "inferred_checkout_root": report.inferred_root,
+        }
+
+    async def list_projects(self) -> ListProjectsResult:
+        logger.info(lg.MCP_LISTING_PROJECTS)
+        try:
+            # Serialise against index/update, which delete and rebuild the
+            # graph under this lock; an interleaved read mixes generations.
+            async with self._ingestor_lock:
+                projects = await _run_in_thread(self.ingestor.list_projects)
+            # A workspace server lists the workspace's projects that are
+            # indexed: a workspace repo not yet in the graph is not a project
+            # a query can reach, and one outside the workspace is not served.
+            if self.workspace is not None:
+                allowed = set(self.workspace.project_names())
+                projects = [p for p in projects if p in allowed]
+            return ListProjectsSuccessResult(projects=projects, count=len(projects))
+        except Exception as e:
+            logger.error(lg.MCP_ERROR_LIST_PROJECTS.format(error=e))
+            return ListProjectsErrorResult(error=str(e), projects=[], count=0)
+
+    def _get_project_node_ids(self, project_name: str) -> list[int]:
+        rows = self.ingestor.fetch_all(
+            cs.CYPHER_QUERY_PROJECT_NODE_IDS,
+            {cs.KEY_PROJECT_NAME: project_name},
+        )
+        result: list[int] = []
+        for row in rows:
+            node_id = row.get(cs.KEY_NODE_ID)
+            if isinstance(node_id, int):
+                result.append(node_id)
+        return result
+
+    def _nested_projects(self, project_name: str) -> list[str]:
+        # A project nested under this one (`svc.v2` under `svc`) keeps its
+        # vectors, which the prefix-scoped node-id read also names.
+        return nested_project_names(project_name, self.ingestor.list_projects())
+
+    def _delete_project_sync(self, project_name: str) -> DeleteProjectResult:
+        projects = self.ingestor.list_projects()
+        if project_name not in projects:
+            return DeleteProjectErrorResult(
+                success=False,
+                error=te.MCP_PROJECT_NOT_FOUND.format(
+                    project_name=project_name, projects=projects
+                ),
+            )
+        # Before the first write, not after: a delete that fails part way
+        # has already removed graph data the retained updater still
+        # describes, and the project may still be listed, so only the
+        # incomplete flag stops the next reingest from resolving against
+        # those definitions over what is left. After a completed delete the
+        # project is gone and the not-indexed guard takes over.
+        self._live_updater = None
+        self._invalidate_graph_for(project_name)
+        # Invariant (a). Nothing has been touched yet, so refusing costs
+        # nothing; proceeding would leave a half-removed graph a fresh
+        # registry cannot tell from a completed delete.
+        # `writing=False` for the same reason as the index path: the
+        # embedding purge is not a graph write (#1705 review).
+        if (refusal := self._require_marker(project_name, writing=False)) is not None:
+            return DeleteProjectErrorResult(success=False, error=refusal)
+        self._cleanup_embeddings_then_begin_writing(project_name)
+        self.ingestor.delete_project(project_name)
+        # A Gloss is unreachable from the project-delete traversal by design:
+        # that is what lets it survive an index's delete-then-rebuild, which
+        # deletes and recreates the very symbols it annotates. So the orphan
+        # sweep belongs HERE, on the deliberate delete, and not inside
+        # `delete_project` itself -- `_index_repository_sync` calls that too,
+        # and a sweep there would destroy every gloss on each reindex
+        # (issue #1828; caught in review of #1856). Exactly the rule the
+        # incomplete-run marker follows two lines below.
+        if isinstance(self.ingestor, QueryProtocol):
+            prune_orphaned_glosses(self.ingestor, project_name)
+        # Invariant (b). The marker sits on its own node so `delete_project`
+        # cannot reach it -- which is what lets it survive an index's
+        # delete-then-rebuild -- so a deliberate delete must remove it. The
+        # data is gone either way; reporting success while the marker remains
+        # blocks every later reingest for a project that no longer exists.
+        if (stuck := self._require_marker_cleared(project_name)) is not None:
+            return DeleteProjectErrorResult(success=False, error=stuck)
+        return DeleteProjectSuccessResult(
+            success=True,
+            project=project_name,
+            message=cs.MCP_PROJECT_DELETED.format(project_name=project_name),
+        )
+
+    async def delete_project(self, project_name: str) -> DeleteProjectResult:
+        logger.info(lg.MCP_DELETING_PROJECT.format(project_name=project_name))
+        # A workspace server may delete only what it serves (bot review on
+        # PR #1972): the destructive path takes the same allow-list as the
+        # reads, before any lock or write.
+        _scoped, scope_error = self._workspace_scope(project_name)
+        if scope_error is not None:
+            return DeleteProjectErrorResult(success=False, error=scope_error)
+        try:
+            async with self._ingestor_lock:
+                return await _run_in_thread(self._delete_project_sync, project_name)
+        except Exception as e:
+            logger.error(lg.MCP_ERROR_DELETE_PROJECT.format(error=e))
+            return DeleteProjectErrorResult(success=False, error=str(e))
+
+    async def wipe_database(self, confirm: bool) -> str:
+        if not confirm:
+            return cs.MCP_WIPE_CANCELLED
+        logger.warning(lg.MCP_WIPING_DATABASE)
+        try:
+            async with self._ingestor_lock:
+                self._live_updater = None
+                self._graph_incomplete = True
+                # Not a stranded marker: this flag must not be healed by one.
+                self._flag_from_failed_clear = None
+                # A wipe spans EVERY project and writes no marker, so its
+                # damage is attributable to none of them and no single
+                # project's clear may settle it (issue #1774). The success
+                # path below clears the flag itself; the failure path widens
+                # it to unbounded.
+                self._incomplete_project = None
+                await _run_in_thread(self.ingestor.clean_database)
+                await _run_in_thread(clear_all_embeddings)
+                self._graph_incomplete = False
+                self._incomplete_project = None
+                # A completed wipe spans every project, so it settles damage
+                # to all of them -- the one clear that is entitled to retire a
+                # widened flag.
+                self._incomplete_projects = set()
+                self._incomplete_unbounded = False
+            return cs.MCP_WIPE_SUCCESS
+        except Exception as e:
+            # A wipe spans every project and writes no marker, so its damage
+            # cannot be recorded under one project's name: an attribution
+            # left over from an earlier failure would tell the guards every
+            # OTHER project is healthy (greptile-local, PR #1547).
+            self._incomplete_project = None
+            # A half-done wipe is the broadest damage there is: it spans every
+            # project and writes no marker, so the in-process flag is the only
+            # record and NO single project's successful clear may retire it.
+            self._incomplete_unbounded = True
+            logger.error(lg.MCP_ERROR_WIPE.format(error=e))
+            return cs.MCP_WIPE_ERROR.format(error=e)
+
+    def _ignore_sets(self) -> tuple[frozenset[str] | None, frozenset[str] | None]:
+        # The CLI resolves `.cgrignore` and the root `.gitignore` through
+        # `load_ignore_patterns` before every ingest; MCP omitted it entirely,
+        # so an MCP-driven run parsed what the ignore files exclude and built a
+        # different graph from the CLI for the same repo (#1616). MCP has no
+        # `--exclude` flag and no interactive setup, so that loader is the whole
+        # contract here -- the CLI's extra `cli_excludes` union and
+        # `prompt_for_unignored_directories` branch have no MCP counterpart.
+        # `or None` mirrors the CLI's own `... or None` idiom and the
+        # parameters' default. It is call-shape parity, not behaviour: every
+        # consumer gates on truthiness (`if exclude_paths and ...` in
+        # should_skip_path/should_skip_rel_file/should_keep_dir), so an empty
+        # frozenset and None are indistinguishable downstream.
+        patterns = load_ignore_patterns(Path(self.project_root))
+        return patterns.exclude or None, patterns.unignore or None
+
+    def _index_repository_sync(self) -> str:
+        # Same collision-resistant derivation as the CLI: a bare directory
+        # name would let two repos named alike delete each other's graphs.
+        project_name = derive_project_name(Path(self.project_root))
+        logger.info(lg.MCP_CLEARING_PROJECT.format(project_name=project_name))
+        # Before the first write, not after: the delete and the flushes are
+        # autocommit writes that can fail part way. From here until the
+        # rebuild completes, a later reingest must refuse rather than
+        # resolve against the retained updater's definitions or against
+        # whatever partial graph a failure left behind.
+        self._live_updater = None
+        self._invalidate_graph_for(project_name)
+        # Persisted BEFORE the delete, and on a node the delete cannot reach:
+        # this path removes the Project and rebuilds it, so a marker stored on
+        # the Project would be destroyed by the very operation whose failure it
+        # records. A crash between here and the final flush must still refuse
+        # the next process's reingest (#1705 review).
+        # A failed MARK aborts before anything destructive happens. The marker
+        # is the ONLY protection that survives a restart, so continuing into
+        # the delete and rebuild without it means a crash leaves a partial
+        # graph that a fresh registry cannot tell from a complete one, and it
+        # will happily hydrate a scoped reingest from it. Nothing is lost by
+        # stopping here: no graph state has changed yet. That is the opposite
+        # of a failed CLEAR, which must not fail a run that already succeeded
+        # (#1705 review).
+        #
+        # `writing=False`: the embedding purge that follows is not a graph
+        # write, so a failure or a crash in it leaves the graph as it was, and
+        # a marker saying so lets a fresh process clear it and carry on rather
+        # than refuse until a full update (#1705 review). The phase advances
+        # to writing immediately before `delete_project`.
+        #
+        # The runs whose markers this re-index supersedes are read first
+        # (review of PR #3493). It deletes the project before rebuilding it,
+        # so it is already the full rebuild they need.
+        stranded = stranded_runs(self.ingestor, project_name, self._run_id)
+        if (refusal := self._require_marker(project_name, writing=False)) is not None:
+            raise RuntimeError(refusal)
+        self._cleanup_embeddings_then_begin_writing(project_name)
+        self.ingestor.delete_project(project_name)
+
+        self.ingestor.ensure_constraints()
+        self.ingestor.flush_all()
+
+        exclude_paths, unignore_paths = self._ignore_sets()
+        updater = GraphUpdater(
+            ingestor=self.ingestor,
+            repo_path=Path(self.project_root),
+            parsers=self.parsers,
+            queries=self.queries,
+            unignore_paths=unignore_paths,
+            exclude_paths=exclude_paths,
+            project_name=project_name,
+        )
+        updater.run()
+        self.ingestor.flush_all()
+        # Cleared only after the flush: the marker must outlive any failure
+        # that leaves batches uncommitted.
+        #
+        # The in-process flag follows the DURABLE state, not the intention. If
+        # the clear failed, the graph still says incomplete, and reporting this
+        # run complete would leave a fresh registry refusing reingest forever
+        # while this one believed all was well. Staying incomplete locally
+        # keeps the two in agreement and makes the next update retry the clear
+        # (#1705 review).
+        if (stuck := self._require_marker_cleared(project_name)) is not None:
+            raise RuntimeError(stuck)
+        retire_stranded_runs(self.ingestor, project_name, stranded)
+        self._live_updater = updater
+
+        return cs.MCP_INDEX_SUCCESS_PROJECT.format(
+            path=self.project_root, project_name=project_name
+        )
+
+    async def _run_ingest(
+        self,
+        sync_fn: Callable[[], str],
+        start_log: str,
+        error_log: str,
+        error_message: str,
+    ) -> str:
+        # Indexing and updating differ only in their sync body and their three
+        # messages; the lock/thread/error protocol is one implementation.
+        logger.info(start_log.format(path=self.project_root))
+        try:
+            async with self._ingestor_lock:
+                return await _run_in_thread(self._under_sync_lock, sync_fn)
+        except Exception as e:
+            logger.error(error_log.format(error=e))
+            return error_message.format(error=e)
+
+    def _under_sync_lock(self, sync_fn: Callable[[], str]) -> str:
+        # Taken before the `:IncompleteRun` marker and the project delete, so
+        # a sync refused because another writer holds the checkout changes
+        # nothing, not even the marker (issue #2441). `GraphUpdater.run`
+        # re-enters it on this thread.
+        root = Path(self.project_root)
+        with repo_sync_lock(root, derive_project_name(root)):
+            return sync_fn()
+
+    async def index_repository(self) -> str:
+        return await self._run_ingest(
+            self._index_repository_sync,
+            lg.MCP_INDEXING_REPO,
+            lg.MCP_ERROR_INDEXING,
+            cs.MCP_INDEX_ERROR,
+        )
+
+    def _update_repository_sync(self) -> str:
+        project_name = derive_project_name(Path(self.project_root))
+
+        # Dropped and marked before the first write: the initial flush
+        # commits batches left by earlier calls and can fail part way, and
+        # the run itself mutates the graph before it can fail. Either way
+        # the retained updater would describe the graph as it was, and a
+        # later reingest would resolve against definitions the partial
+        # update has already replaced. The incomplete flag makes that
+        # reingest refuse until an update completes, since hydrating from
+        # the partial graph would be no better.
+        self._live_updater = None
+        self._invalidate_graph_for(project_name)
+        # The marker goes down BEFORE ensure_constraints, not after.
+        # `ensure_constraints` runs `_migrate_legacy_path_keys`, which drops
+        # constraints and can run purge queries -- autocommitted, destructive
+        # work. Writing the marker after it left a window where a crash
+        # during migration produced a damaged graph with nothing recording
+        # that a run had started (#1705 review, round 2).
+        #
+        # It MERGEs its own node, so it works before any Project exists: an
+        # earlier version set a property on the Project with MATCH, which
+        # updated zero rows on a first index and left a failed first run
+        # unmarked.
+        #
+        # Aborts on failure because the marker is the only protection that
+        # survives a restart; nothing has been touched yet, so stopping costs
+        # nothing.
+        #
+        # The runs whose markers this update supersedes are read first, and
+        # force a full re-index (review of PR #3493).
+        stranded = stranded_runs(self.ingestor, project_name, self._run_id)
+        if (refusal := self._require_marker(project_name)) is not None:
+            raise RuntimeError(refusal)
+        self.ingestor.ensure_constraints()
+        self.ingestor.flush_all()
+
+        exclude_paths, unignore_paths = self._ignore_sets()
+        updater = GraphUpdater(
+            ingestor=self.ingestor,
+            repo_path=Path(self.project_root),
+            parsers=self.parsers,
+            queries=self.queries,
+            unignore_paths=unignore_paths,
+            exclude_paths=exclude_paths,
+            project_name=project_name,
+        )
+        if stranded:
+            logger.warning(
+                lg.REBUILD_OVER_STRANDED_RUNS.format(
+                    project=project_name, count=len(stranded)
+                )
+            )
+        updater.run(force=bool(stranded))
+        self.ingestor.flush_all()
+        # Cleared only after the flush: the marker must outlive any failure
+        # that leaves batches uncommitted.
+        #
+        # The in-process flag follows the DURABLE state, not the intention. If
+        # the clear failed, the graph still says incomplete, and reporting this
+        # run complete would leave a fresh registry refusing reingest forever
+        # while this one believed all was well. Staying incomplete locally
+        # keeps the two in agreement and makes the next update retry the clear
+        # (#1705 review).
+        if (stuck := self._require_marker_cleared(project_name)) is not None:
+            raise RuntimeError(stuck)
+        retire_stranded_runs(self.ingestor, project_name, stranded)
+        self._live_updater = updater
+        return cs.MCP_UPDATE_SUCCESS.format(path=self.project_root)
+
+    # The incomplete-run invariant, stated once and applied by every mutating
+    # path (#1705 review, round 4). Three rounds of review each found the same
+    # shape next to the previous fix, because the rule was being re-derived per
+    # call site instead of written down:
+    #
+    #   (a) No destructive step starts unless the durable marker was
+    #       persisted. A failed persist aborts BEFORE any cleanup, embedding
+    #       purge, constraint migration or delete_project, and reports a
+    #       retryable failure. Nothing has changed yet, so aborting is free.
+    #   (b) Success is reported only after the marker is durably cleared. A
+    #       failed clear after a successful operation is a retryable failure,
+    #       never success with the marker retained -- that state blocks every
+    #       later reingest and the user cannot see why.
+    #   (c) The fresh scoped-reingest path is a destructive step too: its
+    #       `ensure_constraints` runs the same migration that drops
+    #       constraints and can purge, so it marks first like the others.
+    #
+    # `_require_marker` and `_require_marker_cleared` are the only two places
+    # that decide what a marker failure means; call sites choose the failure
+    # VALUE, not the policy.
+
+    def _persist_incomplete(
+        self, project_name: str, incomplete: bool, *, writing: bool = True
+    ) -> bool:
+        """Record (or clear) the incomplete-run marker on its own node.
+
+        `writing` is the marker's phase (see `CYPHER_MARK_PROJECT_INCOMPLETE`):
+        False while the run is still doing read-only or graph-external work,
+        True from its first graph write. Ignored when clearing.
+
+        `_graph_incomplete` lives on this registry, so it only ever covered
+        the process that ran the failed update. A crash or an MCP restart
+        left a fresh registry seeing a project that looks whole, hydrating a
+        scoped updater from the partial graph and treating its missing
+        definitions as authoritative (issue #1679). The marker survives that.
+
+        Returns whether the write reached the store, and never raises itself;
+        the CALLER decides what a failure means, because the two directions
+        are not symmetric (#1705 review):
+
+        * A failed MARK must abort before any destructive work. The marker is
+          the only protection that survives a restart, so proceeding without
+          it means a crash leaves a partial graph indistinguishable from a
+          complete one. Nothing is lost by stopping: no state has changed.
+        * A failed CLEAR must NOT fail a run that already succeeded. It
+          leaves the graph marked incomplete, so the local flag follows the
+          durable state and the next update retries the clear.
+
+        Logged as well as returned, because a marker that never persists
+        degrades this guard back to the old in-process behaviour and only the
+        log would show it.
+        """
+        # Both the mark and the clear carry this registry's run id, so a
+        # clear removes only the marker this registry wrote (issue #1709).
+        # The READ deliberately does not: it asks whether ANY run is
+        # outstanding, which is the same boolean question it always asked.
+        params: dict[str, PropertyValue] = {
+            cs.KEY_PROJECT_NAME: project_name,
+            cs.KEY_RUN_ID: self._run_id,
+        }
+        if incomplete:
+            # Naming this process lets a full rebuild retire the marker once
+            # it has exited without clearing it (review of PR #3496).
+            query = cq.CYPHER_MARK_RUN_INCOMPLETE
+            params |= run_owner()
+            params[cs.KEY_WRITING] = writing
+        else:
+            query = cq.CYPHER_CLEAR_PROJECT_INCOMPLETE
+        try:
+            self.ingestor.execute_write(query, params)
+        except Exception as error:  # noqa: BLE001 -- see docstring
+            logger.warning(
+                lg.MCP_INCOMPLETE_MARKER_FAILED.format(
+                    project=project_name, incomplete=incomplete, error=error
+                )
+            )
+            return False
+        if not incomplete:
+            # A marker written before run ids existed has no `run_id`, so the
+            # run-scoped clear above cannot match it while the read still sees
+            # it -- the project would stay blocked forever after an upgrade
+            # (#1850 review). A run completing for this project has
+            # established the graph is whole, so clearing the legacy marker is
+            # the same statement its own clear makes.
+            #
+            # BEST EFFORT, and deliberately outside the try above: this run's
+            # own clear has already succeeded by here, so the run IS complete.
+            # Letting a failure in optional compatibility cleanup return False
+            # reported a completed operation as incomplete and raised the flag
+            # for a graph that is whole (#1850 review, second finding). The
+            # legacy marker simply stays for the next run to clear.
+            try:
+                self.ingestor.execute_write(
+                    cq.CYPHER_CLEAR_LEGACY_PROJECT_INCOMPLETE,
+                    {cs.KEY_PROJECT_NAME: project_name},
+                )
+            except Exception as error:  # noqa: BLE001 -- best effort; see above
+                logger.warning(
+                    lg.MCP_INCOMPLETE_MARKER_FAILED.format(
+                        project=project_name, incomplete=False, error=error
+                    )
+                )
+        return True
+
+    def _recover_stranded_markers(self, project_name: str) -> bool:
+        """Clear EVERY outstanding marker for the project, not just this run's.
+
+        The ordinary clear is run-scoped so a concurrent run's marker outlives
+        it (issue #1709). Recovery is the opposite case by definition: it
+        clears a marker some OTHER run stranded, so a run-scoped delete would
+        match nothing and leave the project blocked until a full update.
+
+        Safe only because the caller has already established that EVERY
+        outstanding marker says `writing=false` -- the graph is as those runs
+        found it. Returns whether the write reached the store.
+        """
+        try:
+            self.ingestor.execute_write(
+                cq.CYPHER_RECOVER_PROJECT_INCOMPLETE,
+                {cs.KEY_PROJECT_NAME: project_name},
+            )
+        except Exception as error:  # noqa: BLE001 -- same contract as _persist_incomplete
+            logger.warning(
+                lg.MCP_INCOMPLETE_MARKER_FAILED.format(
+                    project=project_name, incomplete=False, error=error
+                )
+            )
+            return False
+        return True
+
+    def _require_marker(self, project_name: str, *, writing: bool = True) -> str | None:
+        """Invariant (a): mark before destructive work, or refuse to start.
+
+        Returns None when the marker is down, or the message to fail with.
+        `writing=False` marks a run that has not yet reached a graph write;
+        it must call `_require_writing` before its first one.
+        """
+        if self._persist_incomplete(project_name, True, writing=writing):
+            return None
+        return cs.MCP_INCOMPLETE_MARKER_REQUIRED.format(project=project_name)
+
+    def _require_writing(self, project_name: str) -> str | None:
+        """Invariant (a), second half: say WRITING before the first graph write.
+
+        A run marked `writing=False` has told a fresh process it may clear the
+        marker and carry on. Once this run is about to change the graph that
+        is no longer true, and it must be recorded durably BEFORE the change:
+        if the record cannot be written the run stops here, with the graph
+        untouched and the marker still honest. Returns None or the refusal.
+        """
+        return self._require_marker(project_name, writing=True)
+
+    def _abandon_before_writing(self, project_name: str) -> None:
+        """A run stopped before its first graph write: take its marker off.
+
+        Nothing was written, so the marker is a lie about a run that changed
+        nothing, and left in place it refuses every later scoped reingest
+        until a full update runs. Best effort, never raising: the caller's
+        own error stays primary. A clear that FAILS is logged rather than
+        discarded, and leaves a `writing=False` marker that a later process
+        clears for itself (`_persisted_incomplete`).
+
+        This run wrote NOTHING, so it must not touch the in-process flag or
+        its attribution at all -- neither to set them nor to clear them. It
+        deliberately does not go through `_require_marker_cleared`, which
+        assigns both unconditionally:
+
+        * setting them relabels damage another failure recorded. A failed
+          wipe leaves `_graph_incomplete=True` with NO attribution, because
+          no marker records it; a later run that stops before writing then
+          stamped its own project onto that flag, and the next reingest
+          healed it against a recoverable marker -- discarding the wipe's
+          refusal and hydrating over a half-wiped graph (#1705 review).
+        * clearing them outright is the same bug from the other side: it
+          would discard an earlier run's damage just as readily.
+
+        So the flag is restored to whatever it was on entry.
+
+        The captured values are read HERE rather than saved by each caller:
+        a caller-side save is defeated by the next caller that forgets one,
+        which leaves a stale value in the slot and restores something
+        arbitrary. Capturing at entry cannot be bypassed that way.
+
+        The scenario needs the abandoning run to name the SAME project as the
+        later reingest -- that is what makes `recoverable_here` true at the
+        guard. A run abandoning a DIFFERENT project reads as a near-miss and
+        refuses correctly, so a test written that way passes with or without
+        this fix (measured both ways).
+        """
+        flag_before = self._graph_incomplete
+        attributed_before = self._flag_from_failed_clear
+        incomplete_project_before = self._incomplete_project
+        cleared = self._persist_incomplete(project_name, False)
+        # A failed clear strands a marker, so the flag must go up: this
+        # process has to know later reingests will refuse. But the
+        # ATTRIBUTION -- the licence to heal that flag from the marker -- is
+        # only this run's to grant when the flag is this run's to explain.
+        #
+        # If the flag was ALREADY set on entry it records damage some earlier
+        # failure found, and a wipe records damage no marker can describe.
+        # Claiming it here is what let a recoverable marker lift a wipe's
+        # refusal (#1705 review). So attribute only when this run raised the
+        # flag from clean; otherwise leave the earlier owner in place, and
+        # the stranded marker stays unhealable until a full update clears it.
+        if not cleared:
+            self._graph_incomplete = True
+            # The attribution narrows the same way the flag setters do: a
+            # broader owner already in place (unattributed, or a different
+            # project) still describes damage this run did not cause, and
+            # replacing it would tell the guards those projects are healthy.
+            if not flag_before:
+                self._incomplete_project = project_name
+                self._flag_from_failed_clear = project_name
+            elif incomplete_project_before not in (None, project_name):
+                self._incomplete_project = None
+                # Widened for the same reason as `_invalidate_graph_for`, so
+                # it must be recorded the same way: BOTH names go in, because
+                # both are outstanding and the flag settles when the last one
+                # is repaired.
+                self._note_outstanding(incomplete_project_before, project_name)
+        else:
+            self._graph_incomplete = flag_before
+            self._incomplete_project = incomplete_project_before
+            self._flag_from_failed_clear = attributed_before
+        if not cleared:
+            logger.warning(
+                lg.MCP_INCOMPLETE_MARKER_STUCK_AFTER_ABORT.format(project=project_name)
+            )
+
+    def _cleanup_embeddings_then_begin_writing(self, project_name: str) -> None:
+        """The step between a `writing=False` mark and the first destructive write.
+
+        The embedding purge has a READ half and a DELETE half, and the phase
+        advances between them (#1705 review, both directions):
+
+        * Reading the project's node ids touches nothing. A failure there
+          leaves graph and vectors as they were, so the marker comes off (or,
+          failing that, stays `writing=False`) rather than strand a fresh
+          process behind a marker for a run that never changed anything.
+        * Deleting the vectors IS destructive: a scoped reingest restores
+          vectors only for its own paths, so a crash mid-purge followed by a
+          fresh process clearing a `writing=False` marker would leave every
+          unselected path without embeddings. The phase therefore says
+          WRITING before the first vector goes, and a refusal there stops the
+          run with nothing deleted.
+        """
+        try:
+            node_ids = self._get_project_node_ids(project_name)
+            nested = self._nested_projects(project_name)
+        except Exception:
+            self._abandon_before_writing(project_name)
+            raise
+        if (refusal := self._require_writing(project_name)) is not None:
+            raise RuntimeError(refusal)
+        delete_project_embeddings(project_name, node_ids, nested)
+
+    def _invalidate_graph_for(self, project_name: str) -> None:
+        """Raise the incomplete flag and attribute it to `project_name`.
+
+        The attribution only ever NARROWS to a project when nothing broader
+        already holds the flag. An unattributed flag means the damage could
+        not be pinned to one project -- a wipe spans them all, and a failure
+        before the name was known could have touched anything -- so writing a
+        project name over it would tell the reingest and read guards that
+        every OTHER project is healthy, which is precisely what the
+        unattributed flag denies (Greptile, PR #1547). A flag already owned
+        by a DIFFERENT project widens to unattributed for the same reason:
+        two projects are damaged and the pair cannot be named in one field.
+
+        `_flag_from_failed_clear` is cleared unconditionally: none of these
+        callers stranded a marker, so no marker recovery may heal what they
+        set, whichever attribution ends up in place. The rollback site was
+        briefly split out to preserve an existing licence; it turned out a
+        same-project rollback then authorised the clear of its own damage,
+        so it revokes like every other caller and the split is gone
+        (Greptile, PR #1547). Two functions that must stay in step is the
+        divergence that produced that bug.
+        """
+        already_flagged = self._graph_incomplete
+        owner = self._incomplete_project
+        self._graph_incomplete = True
+        if not already_flagged:
+            self._incomplete_project = project_name
+            self._incomplete_projects = set()
+        elif owner is not None and owner != project_name:
+            self._incomplete_project = None
+            # Two named projects are damaged. The None written here is the
+            # BROAD state, and the outstanding set records WHICH projects, so
+            # a later clear cannot mistake it for the never-attributed one and
+            # repairing both can still settle it.
+            self._note_outstanding(owner, project_name)
+        elif owner is None and self._incomplete_projects:
+            # A THIRD project damaged while the flag is already broad. It
+            # keeps the unattributed attribution, but it is outstanding like
+            # the other two and must be recorded or the flag settles once
+            # they are repaired while this one is still partial (Greptile,
+            # PR #1547): A, B and C damaged, A and B repaired, and C's reads
+            # reopen onto a graph nothing finished.
+            #
+            # Guarded on the set being non-empty so a project damaged under an
+            # UNBOUNDED flag (a failed wipe) does not turn that into a
+            # settleable named set -- a wipe spans projects this process has
+            # never seen, and no enumeration of repairs can retire it.
+            self._note_outstanding(project_name)
+        # An existing flag attributed to this same project, or already
+        # unattributed with nothing outstanding, keeps the attribution it has.
+        self._flag_from_failed_clear = None
+
+    def _note_outstanding(self, *project_names: str | None) -> None:
+        """Record projects whose damage is still outstanding.
+
+        Additive: an earlier name must survive, because the flag settles only
+        when the LAST outstanding project is repaired.
+        """
+        self._incomplete_projects = {
+            *self._incomplete_projects,
+            *(name for name in project_names if name),
+        }
+
+    def _require_marker_cleared(self, project_name: str) -> str | None:
+        """Invariant (b): a run is complete only once its marker is gone.
+
+        Also syncs the in-process flag to the durable state, so this process
+        and the next agree. Returns None on success, or the failure message.
+        """
+        flag_before = self._graph_incomplete
+        owner_before = self._incomplete_project
+        cleared = self._persist_incomplete(project_name, False)
+        if not cleared:
+            self._graph_incomplete = True
+            # Attribute the flag to this project's stranded marker, so the
+            # recovery in `_hydrate_reingest_updater` heals only the flag it
+            # explains -- but only when this run raised the flag from clean.
+            # A flag already up records damage an earlier failure found, and
+            # claiming it here would let this project's recoverable marker
+            # lift a refusal earned elsewhere (`_abandon_before_writing`
+            # takes the same care for the same reason).
+            if not flag_before:
+                self._incomplete_project = project_name
+                self._flag_from_failed_clear = project_name
+            else:
+                self._incomplete_project = owner_before
+            return cs.MCP_INCOMPLETE_MARKER_STUCK.format(project=project_name)
+        # A successful clear is evidence about THIS project only. A flag
+        # attributed to a different one is the sole record that the other
+        # project is partial whenever the damaging failure could not write
+        # its durable marker, so healing it here would open reads onto a
+        # partial graph (Greptile, PR #1547).
+        #
+        # An UNATTRIBUTED flag is not this project's to settle either, and
+        # reading it as "owned by nobody, so mine to clear" was a bug (4-55,
+        # #1547 review). `_invalidate_graph_for` widens the attribution to
+        # None precisely BECAUSE a second project is damaged, and a wipe is
+        # unattributed because it spans every project. None is therefore the
+        # BROADEST state, not the narrowest: it says the damage could not be
+        # pinned to one project, so evidence about one project cannot retire
+        # it. The two functions read the same field oppositely, and the
+        # `_abandon_before_writing` docstring records that letting them
+        # diverge is what produced the previous bug here.
+        #
+        # Only the run that owns the flag settles it -- plus the genuinely
+        # unattributed single-project case, where the run that earned the flag
+        # is the run clearing it and no other project was ever implicated.
+        # The outstanding set is what separates that from the broad None: a
+        # repair discards this project, and the flag settles only once nothing
+        # is left outstanding. A BOOLEAN here could never be lowered -- no
+        # sequence of successful repairs retires a flag that counts nothing --
+        # which latched every project's reads, including projects never
+        # damaged, for the life of the process (greptile-local, PR #1547).
+        self._incomplete_projects = {
+            name for name in self._incomplete_projects if name != project_name
+        }
+        if not self._incomplete_unbounded and (
+            self._incomplete_project == project_name
+            or (self._incomplete_project is None and not self._incomplete_projects)
+        ):
+            self._graph_incomplete = False
+            self._incomplete_project = None
+            self._flag_from_failed_clear = None
+        elif self._flag_from_failed_clear == project_name:
+            # This project's stranded marker is gone, so the reason recorded
+            # for the flag no longer holds; the flag itself belongs to the
+            # other project and stays.
+            self._flag_from_failed_clear = None
+        return None
+
+    def _incomplete_refusal(
+        self, project_name: str, tool: cs.MCPToolName
+    ) -> str | None:
+        """The refusal for a graph read while the graph is known partial.
+
+        Returns the message, or None to proceed. The eight tools behind
+        `_graph_query` share its guard; these handlers each dispatch
+        directly and have three different return shapes between them, so
+        the shared part is the DECISION and the message, and each call site
+        wraps it in whatever it returns (Greptile, PR #1547).
+        """
+        in_process = self._graph_incomplete and self._incomplete_project in (
+            None,
+            project_name,
+        )
+        if in_process or self._marker_says_incomplete(project_name):
+            return cs.MCP_QUERY_AFTER_FAILED_RUN.format(project=project_name, tool=tool)
+        return None
+
+    def _marker_says_incomplete(self, project_name: str) -> bool:
+        """`_persisted_incomplete`, but an unreachable store is not a verdict.
+
+        That method returns True when it cannot tell, so a reingest refuses
+        rather than starting on an unknown graph. A READ wants the opposite
+        default: a store that is down should surface as the store being down,
+        not as a spurious incomplete-graph refusal that hides it.
+        """
+        try:
+            self.ingestor.fetch_all(
+                cq.CYPHER_PROJECT_IS_INCOMPLETE,
+                {cs.KEY_PROJECT_NAME: project_name},
+            )
+        # Any failure to reach the marker means no verdict: let the read
+        # itself report why the store could not be reached.
+        except Exception:  # noqa: BLE001
+            return False
+        return self._persisted_incomplete(project_name)
+
+    def _marker_rows(self, project_name: str) -> list[dict] | None:
+        """Outstanding marker rows for the project, or None if unreadable.
+
+        Split out so the post-recovery re-check reads the same way the first
+        read does; `None` means the store could not answer, which every
+        caller must treat as "refuse" rather than "nothing outstanding".
+        """
+        try:
+            return list(
+                self.ingestor.fetch_all(
+                    cq.CYPHER_PROJECT_IS_INCOMPLETE,
+                    {cs.KEY_PROJECT_NAME: project_name},
+                )
+                or []
+            )
+        except Exception as error:  # noqa: BLE001 -- same contract as the caller
+            logger.warning(
+                lg.MCP_INCOMPLETE_MARKER_UNREADABLE.format(
+                    project=project_name, error=error
+                )
+            )
+            return None
+
+    def _persisted_incomplete(self, project_name: str) -> bool:
+        """Whether a previous process left this project mid-update.
+
+        An absent property means complete, so a project indexed before this
+        marker existed reads exactly like one whose run finished and no
+        migration is needed. A store that cannot answer returns True: "I
+        cannot tell" and "the last run finished" are different answers and
+        only refusing is safe to act on; update_repository recovers either
+        way (#1705 review). A marker whose run never reached a graph write
+        (`writing=false`) is cleared here and does not refuse.
+        """
+        try:
+            rows = self.ingestor.fetch_all(
+                cq.CYPHER_PROJECT_IS_INCOMPLETE,
+                {cs.KEY_PROJECT_NAME: project_name},
+            )
+        except Exception as error:  # noqa: BLE001 -- see docstring
+            logger.warning(
+                lg.MCP_INCOMPLETE_MARKER_UNREADABLE.format(
+                    project=project_name, error=error
+                )
+            )
+            # Refuse rather than assume complete. "I cannot tell" and "the
+            # last run finished" are different answers, and only one of them
+            # is safe to act on: treating an unreadable marker as absent
+            # hydrates a scoped reingest from a graph that may be partial,
+            # which is the failure this guard exists to prevent. An
+            # update_repository recovers either way (#1705 review).
+            return True
+        for row in rows or []:
+            if not row.get("run_incomplete"):
+                continue
+            # The marker's phase decides. A run that reached its first graph
+            # write may have left the graph partial: refuse. One that stopped
+            # before it -- an aborted prologue, a failed embedding purge, a
+            # crash in either -- left the graph as it found it and simply
+            # could not (or did not live to) clear its own marker. That marker
+            # is safe to clear here, and clearing it is what stops a no-write
+            # abort from blocking every later process until someone runs a
+            # full update (#1705 review). An absent phase reads as writing, so
+            # a marker from before the phase existed stays fail-closed.
+            if row.get("writing", True):
+                return True
+            if not self._recover_stranded_markers(project_name):
+                # Could not clear it. The store refused a write, so the run
+                # that would follow could not mark itself either; refuse now
+                # and let the next attempt retry.
+                return True
+            # The recovery is CONDITIONAL (it deletes only markers still
+            # read-only), and a write reports no affected-row count, so
+            # "the write succeeded" does not mean "the marker is gone". A run
+            # that promoted its own marker between this method's read and
+            # that delete leaves a row the delete skipped, and returning
+            # False here would let a scoped reingest proceed over a graph
+            # being written (raised by CodeRabbit on #1850). Re-read and
+            # refuse if anything is still outstanding.
+            remaining = self._marker_rows(project_name)
+            if remaining is None or remaining:
+                return True
+            logger.warning(
+                lg.MCP_INCOMPLETE_MARKER_RECOVERED.format(project=project_name)
+            )
+        return False
+
+    def _begin_writing_or_refuse(self, project_name: str) -> None:
+        """`before_write` for `GraphUpdater.reingest`: advance the phase or stop.
+
+        Raising here is caught by the updater and re-raised as
+        `ReingestAborted` with the graph untouched, which `_reingest_sync`
+        then classifies as "nothing changed" and clears the marker.
+        """
+        if (refusal := self._require_writing(project_name)) is not None:
+            raise RuntimeError(refusal)
+
+    @staticmethod
+    def _reingest_mutated(updater: object, exc: BaseException) -> bool:
+        """Whether a failed reingest got as far as writing.
+
+        Classifies by WHAT HAPPENED rather than by exception type: the updater
+        sets `reingest_mutated` at the exact point its read-only prologue
+        ends, so a future abort raised mid-run is still classified as partial
+        (#1705 review). Split out of `_reingest_sync` to keep that function
+        under the cognitive-complexity limit.
+        """
+        flag = getattr(updater, "reingest_mutated", None)
+        if isinstance(flag, bool):
+            return flag
+        # No usable flag (an updater predating it, or a test double). Fall
+        # back to the exception type, which carries the same information less
+        # precisely: `GraphUpdater.reingest` converts EVERY prologue failure to
+        # `ReingestAborted` and rejects bad paths with `ValueError` before
+        # touching anything, so any other exception means writing had begun.
+        #
+        # `isinstance` on the flag rather than `getattr(..., True)`: any
+        # attribute of a MagicMock is a truthy child mock, which would classify
+        # every failure as mutated (measured).
+        return not isinstance(exc, ValueError | ReingestAborted)
+
+    def _recover_then_persisted_incomplete(self, project_name: str) -> bool:
+        """Recover a stranded marker, then report the durable state.
+
+        Shared by the hydrating and the retained-updater paths. It has to be
+        shared rather than restated: reading the latch WITHOUT first letting
+        `_persisted_incomplete` clear a recoverable `writing=false` marker
+        makes the same project refuse on a warm updater and proceed on a cold
+        one, for identical state -- the warm/cold asymmetry this PR already
+        fixed once, arriving back in the refusing direction (Greptile,
+        PR #1547).
+
+        A widened flag records damage to a SECOND project and this recovery
+        is evidence about one, so it may not retire a refusal another project
+        earned -- the same rule as the clear in `_require_marker_cleared`.
+        """
+        recoverable_here = self._flag_from_failed_clear == project_name
+        persisted_incomplete = self._persisted_incomplete(project_name)
+        if (
+            not persisted_incomplete
+            and recoverable_here
+            and not self._incomplete_unbounded
+            and not self._incomplete_projects
+        ):
+            self._graph_incomplete = False
+            self._incomplete_project = None
+            self._flag_from_failed_clear = None
+        return persisted_incomplete
+
+    def _hydrate_reingest_updater(self, project_name: str) -> GraphUpdater:
+        """Build a scoped updater when none is retained.
+
+        Split out of `_reingest_sync` to keep it under the
+        cognitive-complexity limit; the guards and their reasoning are
+        unchanged. Raises rather than returning on a refusal, exactly as
+        it did inline.
+        """
+        # A scoped re-ingest completes a graph; it cannot stand in for
+        # the first index. After delete_project or wipe_database the
+        # project is gone, and hydrating from nothing would leave every
+        # unrelated definition missing.
+        # The persisted marker is what makes this survive the process
+        # that earned it: with no retained updater this may be a fresh
+        # registry after a crash, where `_graph_incomplete` is False
+        # because nothing in THIS process failed (issue #1679).
+        # The durable check runs FIRST and unconditionally, because
+        # `_persisted_incomplete` is also what CLEARS a recoverable
+        # `writing=false` marker. Short-circuiting on `_graph_incomplete`
+        # skipped that recovery: after a read-only abort whose marker clear
+        # failed transiently, `_require_marker_cleared` left the flag True and
+        # this process refused every later scoped reingest, even once the
+        # store became writable again, until a full update or a restart
+        # (#1705 review).
+        #
+        # Its answer does NOT override the local flag, it joins it. The flag
+        # can be the only evidence there is: a failure that could not persist
+        # a marker at all leaves the durable state clean while this process
+        # knows the graph is partial, and dropping the flag would accept
+        # scoped work over it. The flag is cleared only when the recovery
+        # above actually cleared the marker, which is exactly the wedged case.
+        # Cleared first so the flag reports only THIS call's recovery. As a
+        # process-lifetime latch it would go on authorising a clear long after
+        # the recovery that set it: an earlier recovered marker, then a later
+        # failure that could not persist a marker at all, and the next
+        # reingest would drop a `_graph_incomplete` that is the only record
+        # the graph is partial.
+        persisted_incomplete = self._recover_then_persisted_incomplete(project_name)
+        # Scoped exactly as `_incomplete_refusal` scopes a read: a latch
+        # attributed to ANOTHER project says nothing about this one, and a
+        # scoped reingest is how a project recovers, so refusing here would
+        # remove a healthy project's only route back to a complete graph
+        # (Greptile, PR #1547). An unattributed latch still blocks every
+        # project, because a wipe-shaped failure could have touched anything.
+        latched_here = self._graph_incomplete and self._incomplete_project in (
+            None,
+            project_name,
+        )
+        if latched_here or persisted_incomplete:
+            raise ValueError(
+                cs.MCP_REINGEST_AFTER_FAILED_RUN.format(project=project_name)
+            )
+        if project_name not in self.ingestor.list_projects():
+            raise ValueError(cs.MCP_REINGEST_NEEDS_INDEX.format(project=project_name))
+        # Marked after the guards above -- they ask whether a PREVIOUS run
+        # left the graph partial, so marking first would make every
+        # reingest refuse on its own marker -- and before
+        # `ensure_constraints`, which runs the same destructive migration
+        # the index and update paths mark before. Invariant (c).
+        if (refusal := self._require_marker(project_name)) is not None:
+            raise RuntimeError(refusal)
+        self.ingestor.ensure_constraints()
+        # The same exclusion set the index and update paths use, or an
+        # agent-named path under a CLI-excluded directory would be
+        # indexed here and kept by every later update.
+        exclude_paths, unignore_paths = self._ignore_sets()
+        updater = GraphUpdater(
+            ingestor=self.ingestor,
+            repo_path=Path(self.project_root),
+            parsers=self.parsers,
+            queries=self.queries,
+            unignore_paths=unignore_paths,
+            exclude_paths=exclude_paths,
+            project_name=project_name,
+        )
+        self._live_updater = updater
+        return updater
+
+    def _reingest_sync(
+        self, paths: list[str], deleted: list[str]
+    ) -> ReingestToolResult:
+        updater = self._live_updater
+        # Invariant (a) for EVERY reingest, before either branch does anything.
+        # Both branches reach `updater.reingest` below, which mutates, and the
+        # hydrating branch additionally runs `ensure_constraints` -- the same
+        # destructive migration the index and update paths mark before. The
+        # mark used to live INSIDE `if updater is None:`, so a reingest through
+        # a retained updater ran entirely unmarked and an interruption left a
+        # partial graph a restarted process could not tell from a complete one
+        # (#1705 review, round 6).
+        #
+        # Marking here rather than in each branch is the same lesson as the
+        # helpers: enumerate the paths once, at the point they share.
+        # The refusal guard must run BEFORE this call marks anything: it asks
+        # whether a PREVIOUS run left the graph partial, and marking first
+        # would make every reingest refuse on its own marker.
+        project_name = derive_project_name(Path(self.project_root))
+        marked_here: str | None = None
+        if updater is None:
+            updater = self._hydrate_reingest_updater(project_name)
+            marked_here = project_name
+        else:
+            # The RETAINED-updater branch reaches the same mutating call below
+            # but skipped every marker step, because the mark lived inside the
+            # hydration branch. An interruption here left a partially mutated
+            # graph a restarted process could not tell from a complete one
+            # (#1705 review, round 6). Same invariant, fifth path.
+            #
+            # `writing=False` because the updater's prologue is read-only:
+            # the phase advances through `before_write` below, at the exact
+            # point the updater is about to issue its first delete. Until
+            # then the marker tells a fresh process the graph is untouched
+            # (#1705 review).
+            if (
+                refusal := self._require_marker(project_name, writing=False)
+            ) is not None:
+                raise RuntimeError(refusal)
+            marked_here = project_name
+        try:
+            report = updater.reingest(
+                paths,
+                deleted=deleted,
+                before_write=lambda: self._begin_writing_or_refuse(project_name),
+            )
+        except Exception as exc:
+            # One classification for every failure, by WHAT HAPPENED rather
+            # than by exception type (#1705 review, round 7):
+            #
+            #   nothing written -> the graph is exactly as it was, so the
+            #     marker this call created is a lie about a run that changed
+            #     nothing. Clear it, or a fresh process refuses scoped
+            #     reingests against a complete graph until someone runs a
+            #     full update.
+            #   something written -> the graph may be partial. The marker
+            #     stays, and the retained updater goes, because it describes
+            #     a graph that no longer exists.
+            #
+            # `reingest_mutated` is set inside `GraphUpdater.reingest` at the
+            # exact point its read-only prologue ends. Classifying on
+            # ReingestAborted instead would misread a future abort raised
+            # mid-run as "nothing changed" and clear a marker that is
+            # protecting a partial graph.
+            mutated = self._reingest_mutated(updater, exc)
+            if mutated:
+                self._live_updater = None
+                self._invalidate_graph_for(project_name)
+                #
+                # Load-bearing across PROCESSES, which is easy to miss: this
+                # project's marker is `writing=true` by now, so within one
+                # registry `_persisted_incomplete` refuses on its own. But
+                # another process completing a full update clears that marker
+                # durably, and a stale attribution from an earlier failed
+                # clear would then satisfy `recoverable_here`, heal the flag,
+                # and let a scoped reingest run over the partial graph this
+                # very branch left (#1705 review, final round).
+                #
+                # `_invalidate_graph_for` above performs the attribution,
+                # including the "claim only when raising from clean" rule
+                # (#1846 review) that a single owner field expressed as
+                # `if not flag_before`. It records WHICH projects are
+                # outstanding rather than one owner, so a second damaged
+                # project is not dropped (#1867).
+                self._flag_from_failed_clear = None
+            elif marked_here is not None:
+                # Nothing was written, so the marker this call created is a
+                # lie about a run that changed nothing and must come off.
+                #
+                # The caller's real error (a bad path, an abort) stays
+                # primary -- replacing it with a marker error would hide why
+                # the reingest actually failed. But a FAILED clear cannot be
+                # discarded either: it leaves the project marked incomplete,
+                # so every later scoped reingest is refused until a full
+                # update runs, for a run that touched nothing (#1705 review).
+                #
+                # `_abandon_before_writing` syncs `_graph_incomplete` to the
+                # durable state, so this process stops believing the graph is
+                # clean, and the warning it logs is what tells an operator
+                # why later reingests refuse. The marker it could not clear
+                # still says `writing=False`, so a later process clears it
+                # for itself rather than refusing forever (#1705 review).
+                self._abandon_before_writing(marked_here)
+            raise
+        if marked_here is not None:
+            # Invariant (b), same as every other path: the hydration above
+            # marked before its destructive migration, so a completed reingest
+            # must lift that or this path refuses every later call -- and if
+            # the clear FAILS, this is a retryable failure, not a success with
+            # the marker retained.
+            #
+            # This site was hand-written in round 3 rather than routed through
+            # the helper, and that is exactly why it kept the old
+            # report-success-anyway behaviour when every other path had been
+            # fixed. Going through `_require_marker_cleared` is the point of
+            # having the helper (#1705 review, round 5).
+            if (stuck := self._require_marker_cleared(marked_here)) is not None:
+                raise RuntimeError(stuck)
+        return ReingestToolResult(
+            reparsed=list(report.reparsed),
+            affected=list(report.affected),
+            removed=list(report.removed),
+            skipped=list(report.skipped),
+            elapsed_ms=round(report.elapsed_ms, 1),
+        )
+
+    async def reingest(
+        self, paths: list[str], deleted: list[str] | None = None
+    ) -> ReingestToolResult:
+        logger.info(lg.MCP_REINGESTING.format(count=len(paths)))
+        try:
+            async with self._ingestor_lock:
+                return await _run_in_thread(
+                    self._reingest_sync, list(paths), list(deleted or ())
+                )
+        except Exception as e:
+            logger.error(lg.MCP_ERROR_REINGEST.format(error=e))
+            return ReingestToolResult(
+                error=cs.MCP_REINGEST_ERROR.format(error=e),
+                reparsed=[],
+                affected=[],
+                removed=[],
+                skipped=[],
+                elapsed_ms=0.0,
+            )
+
+    async def update_repository(self) -> str:
+        return await self._run_ingest(
+            self._update_repository_sync,
+            lg.MCP_UPDATING_REPO,
+            lg.MCP_ERROR_UPDATING,
+            cs.MCP_UPDATE_ERROR,
+        )
+
+    async def semantic_search(
+        self, natural_language_query: str, top_k: int = 5, project: str | None = None
+    ) -> str:
+        assert self._semantic_search_tool is not None
+        logger.info(lg.MCP_SEMANTIC_SEARCH.format(query=natural_language_query))
+        # The underlying tool already accepted `project` and passes it to
+        # `search_embeddings`, which filters in the vector store. Only this
+        # handler failed to forward it, so scoping here is plumbing rather
+        # than a second filter (issue #1494).
+        project, scope_error = self._workspace_scope(project)
+        if scope_error is not None:
+            return scope_error
+        if project is not None:
+            known = await _run_in_thread(self.ingestor.list_projects)
+            if project not in known:
+                return self._unknown_project_error(project, known)
+        # The vector store is searched first, but the hits are hydrated from
+        # the GRAPH, so a partial graph loses matches the embeddings still
+        # know about.
+        search_project = project or derive_project_name(Path(self.project_root))
+        # Serialise against index/update, which delete and rebuild the graph
+        # under this lock; an interleaved read mixes generations. The guard
+        # is inside the lock for the same reason: an update landing between
+        # the check and the read would leave an approved read running against
+        # the partial graph (Greptile, PR #1547).
+        async with self._ingestor_lock:
+            if refusal := await _run_in_thread(
+                self._incomplete_refusal, search_project, cs.MCPToolName.SEMANTIC_SEARCH
+            ):
+                return refusal
+            result = await _plain_function(self._semantic_search_tool)(
+                query=natural_language_query, top_k=top_k, project=project
+            )
+        return str(result)
+
+    async def find_duplicate_code(
+        self,
+        project: str | None = None,
+        threshold: float = cs.DUPLICATES_DEFAULT_THRESHOLD,
+        min_size: int = cs.DUPLICATES_DEFAULT_MIN_NODES,
+        limit: int = cs.DUPLICATES_DEFAULT_GROUP_LIMIT,
+    ) -> str:
+        """Report structurally duplicated functions (issue #1342).
+
+        Duplicate detection spans several graph reads -- fingerprints, then
+        skipped-symbol coverage -- so it takes the lock for the same reason
+        `flow_verdict` does: index/update delete and rebuild while holding it,
+        and an interleaved read would report groups from one generation with
+        coverage from another.
+        """
+        project, scope_error = self._workspace_scope(project)
+        if scope_error is not None:
+            return scope_error
+        dup_project = project or derive_project_name(Path(self.project_root))
+        async with self._ingestor_lock:
+            if refusal := await _run_in_thread(
+                self._incomplete_refusal,
+                dup_project,
+                cs.MCPToolName.FIND_DUPLICATE_CODE,
+            ):
+                return refusal
+            result = await _plain_function(self._find_duplicates_tool)(
+                project=project, threshold=threshold, min_size=min_size, limit=limit
+            )
+        if isinstance(result, te.ToolFailure):
+            return result
+        return str(result)
+
+    async def get_function_source(self, node_id: int) -> str:
+        """Fetch a function's source by graph node id (issue #1342).
+
+        A node id is only meaningful within one generation of the graph, so
+        the lookup must not straddle a rebuild that could reassign it.
+        """
+        # A node id from a partial graph may name a node that the completed
+        # index would not have produced at all.
+        async with self._ingestor_lock:
+            if refusal := await _run_in_thread(
+                self._incomplete_refusal,
+                derive_project_name(Path(self.project_root)),
+                cs.MCPToolName.GET_FUNCTION_SOURCE,
+            ):
+                return refusal
+            result = await _plain_function(self._function_source_tool)(node_id=node_id)
+        return str(result)
+
+    async def structural_search(self, pattern: str, language: str | None = None) -> str:
+        result = await _plain_function(self._structural_search_tool)(
+            pattern=pattern, language=language
+        )
+        if isinstance(result, te.ToolFailure):
+            return result
+        return str(result)
+
+    async def structural_replace(
+        self,
+        pattern: str,
+        rewrite: str,
+        language: str | None = None,
+        dry_run: bool = True,
+    ) -> str:
+        # The write and the re-ingest that follows it share the lock, so a
+        # rebuild cannot land between the two (issue #1525).
+        async with self._ingestor_lock:
+            self._structural_written = []
+            result = await _plain_function(self._structural_editor_tool)(
+                pattern=pattern, rewrite=rewrite, language=language, dry_run=dry_run
+            )
+            written = list(self._structural_written)
+            if isinstance(result, te.ToolFailure):
+                return result
+            if dry_run or not written:
+                return str(result)
+            return str(result) + await _run_in_thread(self._delta_after_write, written)
+
+    def _note_structural_changes(self, changes: list[StructuralReplaceChange]) -> None:
+        self._structural_written = [c["file"] for c in changes if c["applied"]]
+
+    def _delta_after_write(self, paths: list[str]) -> str:
+        """The structural delta of a write, as text to append to its result.
+
+        Never fails the write: a project that is not indexed yields nothing,
+        and any other failure is reported in place of the delta.
+        """
+        root = Path(self.project_root)
+        relative = sd.normalise_paths(paths, root)
+        # Set when the hydration below marks the run, so the success path can
+        # lift that marker (invariant b) -- see the comment at the call.
+        marked_here: str | None = None
+        try:
+            if self._live_updater is None and (
+                derive_project_name(root) not in self.ingestor.list_projects()
+            ):
+                return ""
+            # The marker-reading hydration, not `_updater_for_reingest`
+            # (issue #1783). That helper guards on `_graph_incomplete` alone,
+            # which lives on the registry and dies with the process: after a
+            # crash or an MCP restart it is False because nothing in THIS
+            # process failed, so the guard passes and hydrates from a graph a
+            # previous run left partial. `_hydrate_reingest_updater` reads the
+            # persisted marker as well, which is what survives the process
+            # that earned it (#1679).
+            #
+            # #1705 rebuilt the scoped-reingest call site onto this helper but
+            # not this one, which the #1546 stack added after that branch was
+            # written -- so the two paths refused and proceeded in the same
+            # registry state, and neither call site showed it.
+            #
+            # Invariant (b) comes with it: that helper MARKS before its
+            # destructive migration, so a completed delta has to lift the
+            # marker or every later run refuses on it -- a successful delta
+            # would durably wedge the project (caught in review of #1845).
+            # `_reingest_sync` pairs the same mark with a clear via
+            # `marked_here`; this tracks it the same way.
+            #
+            # BOTH branches mark. The retained-updater branch reaches the same
+            # mutating `reingest` below, so leaving it unmarked meant a crash
+            # mid-delta left a partially rebuilt graph that a fresh process
+            # could not tell from a complete one (raised in review of #1845).
+            # That is the fifth-path gap `_reingest_sync` closed in the #1705
+            # review, round 6, arriving on this path too. `writing=False`
+            # because the updater's prologue is read-only; the phase advances
+            # at its first delete.
+            project_name = derive_project_name(root)
+            if self._live_updater is not None:
+                updater = self._live_updater
+                if (
+                    refusal := self._require_marker(project_name, writing=False)
+                ) is not None:
+                    raise RuntimeError(refusal)
+                marked_here = project_name
+            else:
+                marked_here = project_name
+                updater = self._hydrate_reingest_updater(marked_here)
+            deleted = [p for p in relative if not (root / p).exists()]
+            changed = [p for p in relative if p not in deleted]
+            delta = sd.observe(
+                self.ingestor.fetch_all,
+                updater.project_name,
+                relative,
+                # Invariant (a), second half: the marks above say
+                # `writing=False`, and `reingest` starts deleting after its
+                # read-only prologue. Without advancing the phase there, a
+                # crash mid-delete left a partial graph that a fresh registry
+                # reads as recoverable, CLEARS, and hydrates as complete
+                # (raised by CodeRabbit on #1845). Same callback
+                # `_reingest_sync` passes for the same reason.
+                lambda: updater.reingest(
+                    changed,
+                    deleted=deleted,
+                    before_write=lambda: self._begin_writing_or_refuse(project_name),
+                ),
+                repo_root=root,
+            )
+        except (ValueError, ReingestAborted) as e:
+            # Raised before any graph change (validation, an abort while the
+            # paths are split): the graph is whole and the updater reusable.
+            logger.warning(lg.MCP_DELTA_FAILED.format(error=e))
+            # ...so the marker this call took must come off, or a graph that
+            # was never touched goes on refusing every later scoped reingest
+            # (raised by CodeRabbit on #1845). `_abandon_before_writing` is
+            # the same helper `_reingest_sync` uses for its own no-write
+            # aborts: it lifts the marker and leaves the attribution to
+            # whichever failure owns it.
+            if marked_here is not None:
+                self._abandon_before_writing(marked_here)
+            return "\n\n" + cs.MCP_DELTA_ERROR.format(error=e)
+        except Exception as e:
+            # The re-ingest may have deleted a subtree it never rebuilt: the
+            # same invalidation `_reingest_sync` applies, so no later query
+            # or write reuses a partial graph (issue #1525).
+            logger.warning(lg.MCP_DELTA_FAILED.format(error=e))
+            self._live_updater = None
+            # This handler writes into THIS server's repository, so the
+            # damage is confined to the project that root derives to -- but
+            # only NARROWS to it when nothing broader already holds the flag,
+            # or a delta failure here would erase another project's
+            # marker-less damage (greptile-local, PR #1547).
+            self._invalidate_graph_for(derive_project_name(root))
+            # Not a stranded marker: this flag must not be healed by one.
+            # This path invalidates precisely BECAUSE a subtree may have been
+            # deleted and not rebuilt, so the flag records real damage that no
+            # marker describes. Leaving an earlier attribution in place would
+            # let an unrelated marker recovery lift it -- the same overwrite
+            # the abandon path was fixed for, arriving from the other side.
+            # Added on the rebase: this site landed on main (#1525) after the
+            # attribution was written, so it had no way to know about it.
+            self._flag_from_failed_clear = None
+            return "\n\n" + cs.MCP_DELTA_ERROR.format(error=e)
+        if marked_here is not None:
+            # Invariant (b): the hydration marked before its constraint
+            # migration, so a completed delta must lift it. A failed clear is
+            # reported in place of the delta rather than silently retained --
+            # this method never raises, so the message is the only channel.
+            if (stuck := self._require_marker_cleared(marked_here)) is not None:
+                logger.warning(lg.MCP_DELTA_FAILED.format(error=stuck))
+                return "\n\n" + cs.MCP_DELTA_ERROR.format(error=stuck)
+        return (
+            "\n\n"
+            + cs.MCP_DELTA_HEADER
+            + "\n"
+            + json.dumps(delta, indent=cs.MCP_JSON_INDENT)
+        )
+
+    async def ask_agent(self, question: str) -> dict[str, str]:
+        logger.info(lg.MCP_ASK_AGENT.format(question=question))
+        try:
+            # The agent is given the RAW tool objects (self._query_tool,
+            # self._code_tool, the semantic search tool), not the locked
+            # handler methods on this class -- so its graph reads bypass every
+            # wrapper below. The lock therefore has to be taken here, around
+            # the whole run: an agent answer assembled from two graph
+            # generations is wrong in a way no single tool call would reveal.
+            #
+            # Held for the full run rather than per tool call, because the
+            # answer is composed ACROSS calls. Serialising each call
+            # individually would still let a rebuild land between them, which
+            # is the case this is meant to exclude.
+            async with self._ingestor_lock:
+                # Guarded HERE, not in a wrapper, precisely because the agent
+                # holds the raw tools: there is no wrapper of ours between it
+                # and the graph. And inside the lock like every other reader,
+                # so a rebuild cannot land between the check and the run.
+                # An agent answer is composed across several tool calls and
+                # comes back with no sign that the definitions behind it were
+                # missing, so a partial graph is worse here than for a single
+                # read -- the caller cannot tell (Greptile, PR #1547).
+                project = derive_project_name(Path(self.project_root))
+                if (
+                    refusal := self._incomplete_refusal(
+                        project, cs.MCPToolName.ASK_AGENT
+                    )
+                ) is not None:
+                    return {cs.DICT_KEY_ERROR: refusal}
+                # No operator to ask: an edit or a non-read-only command is
+                # denied, and the model answers without it.
+                answer = await run_to_text_answer(
+                    self.rag_agent,
+                    question,
+                    approve=False,
+                    denial=cs.MCP_ASK_AGENT_APPROVAL_DENIED,
+                )
+            return {"output": answer}
+        except Exception as e:
+            logger.error(lg.MCP_ASK_AGENT_ERROR.format(error=e))
+            return {"error": cs.MCP_ASK_AGENT_ERROR.format(error=e)}
+
+    # --- deterministic graph queries (issue #1523) -------------------------------
+
+    def _graph_tool(
+        self,
+        name: cs.MCPToolName,
+        params: dict[str, str],
+        required: list[str],
+        handler: MCPHandlerType,
+        integer_params: set[str] | None = None,
+        boolean_params: set[str] | None = None,
+    ) -> ToolMetadata:
+        kinds = dict.fromkeys(integer_params or (), cs.MCPSchemaType.INTEGER)
+        kinds |= dict.fromkeys(boolean_params or (), cs.MCPSchemaType.BOOLEAN)
+        properties = {
+            key: MCPInputSchemaProperty(
+                type=kinds.get(key, cs.MCPSchemaType.STRING), description=description
+            )
+            for key, description in params.items()
+        }
+        properties[cs.MCPParamName.PROJECT] = MCPInputSchemaProperty(
+            type=cs.MCPSchemaType.STRING, description=td.MCP_PARAM_PROJECT
+        )
+        return ToolMetadata(
+            name=name,
+            description=td.MCP_TOOLS[name],
+            input_schema=MCPInputSchema(
+                type=cs.MCPSchemaType.OBJECT, properties=properties, required=required
+            ),
+            handler=handler,
+            returns_json=True,
+        )
+
+    async def _graph_query(
+        self,
+        tool: cs.MCPToolName,
+        project: str | None,
+        run: Callable[[str], object],
+        target: str | None = None,
+    ) -> object:
+        # Every path that reads the graph, the project check included, runs
+        # under the ingestor lock so an index/update rebuild cannot tear the
+        # read (issue #1471). A typo in `project` would otherwise read as a
+        # genuine empty result; the default is the project this server's
+        # root derives to. `target` is the qualified name the query walks
+        # from: an empty answer for a name the graph never saw is refused,
+        # not returned as "nothing calls it" (issue #2461).
+        try:
+            async with self._ingestor_lock:
+                # The workspace allow-list is checked FIRST and narrows only:
+                # a name outside it is refused with the workspace's names,
+                # and a name inside it is still held to the graph's own
+                # check below, so an unindexed workspace repo reads as
+                # unknown rather than as a second, weaker path (issue #1494).
+                project, scope_error = self._workspace_scope(project)
+                if scope_error is not None:
+                    return {cs.DICT_KEY_ERROR: scope_error}
+                known = await _run_in_thread(self.ingestor.list_projects)
+                if project is not None and project not in known:
+                    return {
+                        cs.DICT_KEY_ERROR: self._unknown_project_error(project, known)
+                    }
+                project_name = project or derive_project_name(Path(self.project_root))
+                # The derived default is held to the same check: a server
+                # rooted in a directory that was never indexed answered every
+                # read with nothing (issue #2461).
+                if project_name not in known:
+                    return {
+                        cs.DICT_KEY_ERROR: await _run_in_thread(
+                            self._root_not_indexed_error, project_name, known
+                        )
+                    }
+                # A read is as wrong as a reingest when the graph is known
+                # partial: a failed run (or a rollback whose re-ingest
+                # failed) leaves definitions and edges missing, and every
+                # tool here would report that absence as fact. `_reingest`
+                # already refuses on this flag; the read paths dispatched
+                # regardless, so a caller could not tell a restored graph
+                # from a complete one.
+                # The durable marker is consulted only when this process has
+                # no opinion. `_persisted_incomplete` answers True when the
+                # store cannot be reached -- right for a reingest, which must
+                # not start on an unknown state, but wrong here: it would
+                # report every store outage as "graph incomplete" and bury
+                # the real error the caller needs to see. A read that cannot
+                # reach the store fails below as itself.
+                # The same project-scoped decision the direct readers use:
+                # reading the bare flag here refused project B because
+                # project A's recovery failed (Greptile, PR #1547).
+                #
+                # Evaluated INSIDE the lock, with the read, because they must
+                # serialise: an update that lands between an approval and the
+                # read sets the graph incomplete and the approved read then
+                # runs against the partial graph.
+                if tool in _READS_THE_GRAPH and (
+                    refusal := await _run_in_thread(
+                        self._incomplete_refusal, project_name, tool
+                    )
+                ):
+                    return {cs.DICT_KEY_ERROR: refusal}
+                result = await _run_in_thread(run, project_name)
+                if target is not None and _found_nothing(result):
+                    if unknown := await _run_in_thread(
+                        self._unknown_target_error, project_name, target
+                    ):
+                        # A `found: false` row keeps its fields beside the
+                        # refusal, for a client that reads `found`.
+                        if isinstance(result, dict):
+                            return {**result, cs.DICT_KEY_ERROR: unknown}
+                        return {cs.DICT_KEY_ERROR: unknown}
+                return result
+        except Exception as e:
+            logger.error(lg.MCP_GRAPH_QUERY_ERROR.format(tool=tool, error=e))
+            return {
+                cs.DICT_KEY_ERROR: cs.MCP_GRAPH_QUERY_ERROR.format(tool=tool, error=e)
+            }
+
+    def _nameable(self, projects: Collection[str]) -> list[str]:
+        """The `projects` a refusal may name: under a workspace, only the
+        ones it serves; without one, all of them.
+
+        The graph is shared, and a workspace project that is not indexed
+        passes the allow-list and is refused as unknown, so its "did you
+        mean" and its fallback list were drawn from every indexed project and
+        named ones outside the workspace (CodeRabbit, PR #2562; CWE-200).
+        """
+        if self.workspace is None:
+            return list(projects)
+        served = set(self.workspace.project_names())
+        return [name for name in projects if name in served]
+
+    def _unknown_project_error(self, project: str, known: list[str]) -> str:
+        # The close matches when there are any; a shared graph lists dozens
+        # of `<dir>__<hash>` names, and the one meant is the one to name.
+        known = self._nameable(known)
+        close = graph_query.close_project_names(project, known)
+        if close:
+            return cs.MCP_UNKNOWN_PROJECT_NAMED.format(
+                project=project
+            ) + graph_query.did_you_mean(close)
+        listed = cs.SEPARATOR_COMMA_SPACE.join(known)
+        if self.workspace is None:
+            return cs.MCP_UNKNOWN_PROJECT.format(project=project, known=listed)
+        # Labelled as the workspace's, so a short list does not read as the
+        # whole graph, and an empty one is said rather than left blank.
+        if not known:
+            return cs.MCP_UNKNOWN_WORKSPACE_PROJECT_NONE_INDEXED.format(
+                project=project, workspace=self.workspace.name
+            )
+        return cs.MCP_UNKNOWN_WORKSPACE_PROJECT.format(
+            project=project, workspace=self.workspace.name, known=listed
+        )
+
+    def _root_not_indexed_error(
+        self,
+        project_name: str,
+        known: list[str],
+        message: str = cs.MCP_ROOT_NOT_INDEXED,
+    ) -> str:
+        root = Path(self.project_root)
+        # A repository indexed under a name of its own is the likeliest
+        # meaning, then names spelled close to the derived one; both only
+        # among the projects this server may name.
+        rooted = self._nameable(
+            graph_query.projects_rooted_at(self.ingestor.list_project_roots(), root)
+        )
+        close = graph_query.close_project_names(project_name, self._nameable(known))
+        return message.format(path=root.resolve()) + graph_query.did_you_mean(
+            list(dict.fromkeys([*rooted, *close]))
+        )
+
+    def _flow_endpoint_refusal(
+        self, project_name: str, source: str, sink: str
+    ) -> str | None:
+        """Why `flow_verdict` cannot answer for these names (issue #2939).
+
+        A name that is no node has no flow edges, so the walk found no path
+        and, on a fully covered project, answered NO_FLOW: the verified
+        absence a taint question reads as safe, for a typo. The source must
+        also be this project's own, or a resource no project owns: only this
+        project's flow edges are walked from it. A sink may sit across a
+        service boundary, in another project.
+        """
+        problems = [
+            cs.MCP_FLOW_ENDPOINT.format(side=side, problem=problem)
+            for side, qualified_name in (
+                (cs.MCP_FLOW_SOURCE, source),
+                (cs.MCP_FLOW_SINK, sink),
+            )
+            if (problem := self._unknown_target_error(project_name, qualified_name))
+        ]
+        if not problems and (owner := self._other_owner(project_name, source)):
+            problems.append(
+                cs.MCP_FLOW_SOURCE_ELSEWHERE.format(
+                    qualified_name=source, owner=owner, project=project_name
+                )
+            )
+        return " ".join(problems) or None
+
+    def _other_owner(self, project_name: str, qualified_name: str) -> str | None:
+        # The longest registered project the name sits under, when it is not
+        # this one: project names may contain dots, so a name under this
+        # project's prefix can still belong to `<project>.v2`.
+        owner = self._name_owner(
+            qualified_name, [*self.ingestor.list_projects(), project_name]
+        )
+        return owner if owner != project_name else None
+
+    def _unknown_target_error(self, project_name: str, target: str) -> str | None:
+        fetch_all = self.ingestor.fetch_all
+        if graph_query.node_exists(fetch_all, target):
+            return None
+        close = graph_query.similar_targets(fetch_all, project_name, target)
+        return cs.MCP_UNKNOWN_TARGET.format(qualified_name=target) + (
+            graph_query.did_you_mean(close) if close else cs.MCP_UNKNOWN_TARGET_HINT
+        )
+
+    @staticmethod
+    def _depth(depth: int | None) -> int:
+        return max(1, min(int(depth or 1), cs.GRAPH_QUERY_MAX_DEPTH))
+
+    async def resolve(self, target: str, project: str | None = None) -> object:
+        return await self._graph_query(
+            cs.MCPToolName.RESOLVE,
+            project,
+            lambda name: self._resolve_rows(name, target),
+        )
+
+    def _resolve_rows(self, project_name: str, target: str) -> object:
+        # A line no file can have is refused as such (issue #3244); the
+        # graph would only be asked about it to overflow a Bolt integer.
+        location = graph_query.parse_location(target)
+        if location is not None and location[1] > cs.GRAPH_MAX_SOURCE_LINE:
+            path, line = location
+            return {
+                cs.DICT_KEY_ERROR: cs.MCP_RESOLVE_LINE_OUT_OF_RANGE.format(
+                    path=path, line=line
+                )
+            }
+        return graph_query.resolve_or_refuse(
+            self.ingestor.fetch_all, project_name, target
+        )
+
+    def _workspace_scope(self, project: str | None) -> tuple[str | None, str | None]:
+        """(the project a request means, why it is refused) under a workspace.
+
+        The one decision every project-taking tool applies (issue #1494,
+        local review): a name outside the workspace is refused with the
+        workspace's names; a bare request takes the workspace default or is
+        refused naming the choices. Without a workspace nothing changes. The
+        graph's own unknown-project check still follows in every caller, so
+        an unindexed workspace repo reads as unknown, never as served.
+        """
+        if self.workspace is None:
+            return project, None
+        names = self.workspace.project_names()
+        if project is not None:
+            if project in names:
+                return project, None
+            return None, cs.MCP_PROJECT_OUTSIDE_WORKSPACE.format(
+                project=project,
+                workspace=self.workspace.name,
+                known=cs.SEPARATOR_COMMA_SPACE.join(names),
+            )
+        default = self._workspace_default_project()
+        if default is None:
+            return None, cs.MCP_WORKSPACE_DEFAULT_AMBIGUOUS.format(
+                workspace=self.workspace.name,
+                count=len(names),
+                known=cs.SEPARATOR_COMMA_SPACE.join(names),
+            )
+        return default, None
+
+    def _fixed_root_project(self) -> tuple[str, None] | tuple[None, str]:
+        """(project, refusal) for a handler that takes no `project` argument.
+
+        flow_verdict, explain_traceback and rank_root_causes derive their
+        project from this server's directory. Without a workspace that is
+        the whole world and the derivation stands. UNDER a workspace it is
+        not: `TARGET_REPO_PATH` may point at an indexed repo the workspace
+        does not serve, and a bare call would then answer from outside the
+        boundary. The workspace default applies, and an ambiguous one
+        refuses rather than guessing (Copilot, PR #1972).
+        """
+        if self.workspace is None:
+            return derive_project_name(Path(self.project_root)), None
+        default = self._workspace_default_project()
+        if default is not None:
+            return default, None
+        names = self.workspace.project_names()
+        return None, cs.MCP_WORKSPACE_DEFAULT_AMBIGUOUS.format(
+            workspace=self.workspace.name,
+            count=len(names),
+            known=cs.SEPARATOR_COMMA_SPACE.join(names),
+        )
+
+    def _unindexed_refusal(self, project: str) -> str | None:
+        """Why a fixed-root handler must not read `project`, or None.
+
+        `_fixed_root_project` derives the name without asking the graph. A
+        project the graph does not hold has no FLOWS_TO edge and no Module
+        to report as uncovered, so flow_verdict answered NO_FLOW, the
+        verified absence, and the traceback tools resolved nothing with no
+        note (issue #3193). The check `_graph_query` makes, with its
+        messages: a workspace default is a named project, a derived one is
+        the server's root.
+        """
+        known = self.ingestor.list_projects()
+        if project in known:
+            return None
+        if self.workspace is not None:
+            return self._unknown_project_error(project, known)
+        return self._root_not_indexed_error(
+            project, known, cs.MCP_FIXED_ROOT_NOT_INDEXED
+        )
+
+    def _workspace_default_project(self) -> str | None:
+        """The workspace project a request without `project` means.
+
+        The repo rooted at this server's directory, if the workspace has
+        one; else the only project, if it has one; else nothing, and the
+        caller must say which. Never a guess between several.
+        """
+        assert self.workspace is not None
+        root = Path(self.project_root).resolve()
+        for repo in self.workspace.repos:
+            if repo.repo_path() == root:
+                return repo.project_name
+        names = self.workspace.project_names()
+        return names[0] if len(names) == 1 else None
+
+    def _source_root_for(self, project_name: str) -> Path | None:
+        # Source is read from disk only when the selected project was indexed
+        # from this server's repository (its Project node's stored root):
+        # another project's definition carries a relative path that may also
+        # exist here and would read the wrong file, and a matching name alone
+        # does not prove the root, so its span is answered without source.
+        # A workspace names each repo's root, so its projects are answered
+        # from their own checkouts under the same stored-root proof.
+        candidate = Path(self.project_root)
+        if self.workspace is not None:
+            for repo in self.workspace.repos:
+                if repo.project_name == project_name:
+                    candidate = repo.repo_path()
+                    break
+        return graph_query.source_root_for(
+            self.ingestor.fetch_all, project_name, candidate
+        )
+
+    def _uncaptured_refusal[T](
+        self, tool: cs.MCPToolName, project_name: str, rows: list[T]
+    ) -> list[T] | dict[str, str]:
+        # Only an EMPTY answer is questioned, so a project with rows pays no
+        # extra read, and a graph with no recorded capture keeps its `[]`.
+        if rows:
+            return rows
+        gap = graph_query.capture_gap(
+            self.ingestor.fetch_all, project_name, _CAPTURE_READ_BY[tool]
+        )
+        if gap is None:
+            return rows
+        return {
+            cs.DICT_KEY_ERROR: cs.MCP_CAPTURE_GROUP_MISSING.format(
+                tool=tool,
+                project=project_name,
+                groups=cs.CHAR_COMMA.join(gap["groups"]),
+                relationships=cs.SEPARATOR_COMMA_SPACE.join(gap["relationships"]),
+                root=gap["root_path"] or cs.MCP_DEFAULT_DIRECTORY,
+            )
+        }
+
+    async def definition(
+        self, qualified_name: str, project: str | None = None
+    ) -> object:
+        return await self._graph_query(
+            cs.MCPToolName.DEFINITION,
+            project,
+            lambda name: graph_query.definition(
+                self.ingestor.fetch_all,
+                name,
+                qualified_name,
+                self._source_root_for(name),
+            ),
+            # Refused as `callers` refuses an unknown name (issue #3244).
+            target=qualified_name,
+        )
+
+    async def endpoints(self, project: str | None = None) -> object:
+        return await self._graph_query(
+            cs.MCPToolName.ENDPOINTS,
+            project,
+            lambda name: self._uncaptured_refusal(
+                cs.MCPToolName.ENDPOINTS,
+                name,
+                graph_query.endpoints(self.ingestor.fetch_all, name),
+            ),
+        )
+
+    async def endpoint_callers(self, target: str, project: str | None = None) -> object:
+        return await self._graph_query(
+            cs.MCPToolName.ENDPOINT_CALLERS,
+            project,
+            lambda name: self._endpoint_callers(name, target),
+        )
+
+    def _endpoint_callers(self, project_name: str, target: str) -> object:
+        # A target that names no endpoint is refused, as `callers` refuses an
+        # unknown name: `[]` means the endpoint exists and nothing reaches it
+        # (issue #3186). A project synced without what the tool reads holds no
+        # endpoint at all, so that refusal names the missing capture instead.
+        tool = cs.MCPToolName.ENDPOINT_CALLERS
+        try:
+            rows = graph_query.endpoint_callers(
+                self.ingestor.fetch_all, project_name, target
+            )
+        except graph_query.UnknownEndpointError as unknown:
+            return self._uncaptured_refusal(tool, project_name, []) or {
+                cs.DICT_KEY_ERROR: str(unknown)
+            }
+        return self._uncaptured_refusal(tool, project_name, rows)
+
+    async def remote_dependencies(self, project: str | None = None) -> object:
+        return await self._graph_query(
+            cs.MCPToolName.REMOTE_DEPENDENCIES,
+            project,
+            lambda name: self._uncaptured_refusal(
+                cs.MCPToolName.REMOTE_DEPENDENCIES,
+                name,
+                graph_query.remote_dependencies(self.ingestor.fetch_all, name),
+            ),
+        )
+
+    async def callers(
+        self, qualified_name: str, depth: int | None = None, project: str | None = None
+    ) -> object:
+        return await self._graph_query(
+            cs.MCPToolName.CALLERS,
+            project,
+            lambda name: graph_query.callers(
+                self.ingestor.fetch_all, name, qualified_name, self._depth(depth)
+            ),
+            target=qualified_name,
+        )
+
+    async def callees(
+        self, qualified_name: str, depth: int | None = None, project: str | None = None
+    ) -> object:
+        return await self._graph_query(
+            cs.MCPToolName.CALLEES,
+            project,
+            lambda name: graph_query.callees(
+                self.ingestor.fetch_all, name, qualified_name, self._depth(depth)
+            ),
+            target=qualified_name,
+        )
+
+    async def implementors(
+        self, qualified_name: str, project: str | None = None, depth: int | None = None
+    ) -> object:
+        return await self._graph_query(
+            cs.MCPToolName.IMPLEMENTORS,
+            project,
+            lambda name: graph_query.implementors(
+                self.ingestor.fetch_all, name, qualified_name, self._depth(depth)
+            ),
+            target=qualified_name,
+        )
+
+    async def overrides(
+        self, qualified_name: str, project: str | None = None, depth: int | None = None
+    ) -> object:
+        return await self._graph_query(
+            cs.MCPToolName.OVERRIDES,
+            project,
+            lambda name: graph_query.overrides(
+                self.ingestor.fetch_all, name, qualified_name, self._depth(depth)
+            ),
+            target=qualified_name,
+        )
+
+    async def importers(
+        self,
+        module_qualified_name: str,
+        project: str | None = None,
+        through_reexports: bool = False,
+    ) -> object:
+        # A single `return await` keeps the handler a pure delegation to the
+        # locked `_graph_query`, so the read is serialised against a rebuild
+        # (issue #1471) whichever query the flag picks.
+        return await self._graph_query(
+            cs.MCPToolName.IMPORTERS,
+            project,
+            lambda name: (
+                graph_query.importers_through_reexports
+                if through_reexports
+                else graph_query.importers
+            )(self.ingestor.fetch_all, name, module_qualified_name),
+            target=module_qualified_name,
+        )
+
+    async def tests_reaching(
+        self, qualified_name: str, project: str | None = None
+    ) -> object:
+        return await self._graph_query(
+            cs.MCPToolName.TESTS_REACHING,
+            project,
+            lambda name: graph_query.tests_reaching(
+                self.ingestor.fetch_all, name, qualified_name
+            ),
+            target=qualified_name,
+        )
+
+    # --- graph-driven edit operations (issue #1532) ------------------------------
+
+    # --- agent-authored notes (issue #1808) -----------------------------------
+
+    def _commit_sha_for(self, project_name: str) -> str | None:
+        # Recorded only when the graph project was indexed from this server's
+        # checkout: another project's HEAD is not this repository's HEAD, and
+        # a note stamped with the wrong commit is worse than one without.
+        root = self._source_root_for(project_name)
+        return head_commit(root) if root is not None else None
+
+    async def annotate(
+        self,
+        target: str,
+        body: str,
+        kind: str,
+        mentions: str | None = None,
+        author: str | None = None,
+        project: str | None = None,
+    ) -> object:
+        # Runs under the ingestor lock like every graph read, so the write
+        # cannot interleave with an index or reingest deleting its subject.
+        return await self._graph_query(
+            cs.MCPToolName.ANNOTATE,
+            project,
+            lambda name: gloss.write_gloss(
+                self.ingestor.fetch_all,
+                self.ingestor.execute_write,
+                name,
+                target,
+                body,
+                kind,
+                mentions,
+                author,
+                self._commit_sha_for(name),
+                self._source_reader_for(name),
+            ),
+        )
+
+    def _source_reader_for(self, project_name: str) -> SourceReader | None:
+        # The note's text-quote anchor needs the subject's file, read from
+        # disk only under the same rule as `definition`'s source: the
+        # project must have been indexed from this server's checkout.
+        root = self._source_root_for(project_name)
+        if root is None:
+            return None
+
+        def read(project: str, path: str) -> ParsedSource | None:
+            if project != project_name:
+                return None
+            target = (root / path).resolve()
+            if root not in (target, *target.parents):
+                return None
+            try:
+                text = target.read_text(encoding=cs.ENCODING_UTF8, errors="replace")
+            except OSError:
+                return None
+            return ParsedSource(text, parse_source(self.parsers, target, text))
+
+        return read
+
+    async def glosses(self, target: str, project: str | None = None) -> object:
+        return await self._graph_query(
+            cs.MCPToolName.GLOSSES,
+            project,
+            lambda name: gloss.glosses_for(self.ingestor.fetch_all, name, target),
+        )
+
+    def _context_tool(self) -> ToolMetadata:
+        def prop(kind: cs.MCPSchemaType, description: str) -> MCPInputSchemaProperty:
+            return MCPInputSchemaProperty(type=kind, description=description)
+
+        return ToolMetadata(
+            name=cs.MCPToolName.CONTEXT,
+            description=td.MCP_TOOLS[cs.MCPToolName.CONTEXT],
+            input_schema=MCPInputSchema(
+                type=cs.MCPSchemaType.OBJECT,
+                properties={
+                    cs.MCPParamName.TARGET: prop(
+                        cs.MCPSchemaType.STRING, td.MCP_PARAM_CONTEXT_TARGET
+                    ),
+                    cs.MCPParamName.BUDGET_TOKENS: prop(
+                        cs.MCPSchemaType.INTEGER, td.MCP_PARAM_BUDGET_TOKENS
+                    ),
+                    cs.MCPParamName.PROJECT: prop(
+                        cs.MCPSchemaType.STRING, td.MCP_PARAM_PROJECT
+                    ),
+                },
+                required=[cs.MCPParamName.TARGET],
+            ),
+            handler=self.context,
+            returns_json=True,
+        )
+
+    async def context(
+        self,
+        target: str,
+        budget_tokens: int = cs.CONTEXT_DEFAULT_BUDGET,
+        project: str | None = None,
+    ) -> object:
+        return await self._graph_query(
+            cs.MCPToolName.CONTEXT,
+            project,
+            lambda name: self._run_context(name, target, budget_tokens),
+        )
+
+    def _run_context(
+        self, project_name: str, target: str, budget_tokens: int
+    ) -> object:
+        from codebase_rag.context_slice import context as build_context
+
+        # The CLI enforces this with typer's min=1; without the same check an
+        # MCP caller's zero or negative budget returns an empty slice that
+        # reads as success. Checked here rather than in `context` so that
+        # handler stays a pure delegation to the locked `_graph_query`.
+        if budget_tokens < 1:
+            return {
+                cs.DICT_KEY_ERROR: cs.MCP_CONTEXT_BUDGET_INVALID.format(
+                    budget=budget_tokens
+                )
+            }
+
+        # Scoped to the project `_graph_query` resolved, not the optional
+        # argument: an omitted `project` would otherwise search every project
+        # and resolve to a name the project-scoped reads cannot find.
+        def search(text: str) -> list[SemanticSearchResult]:
+            return semantic_code_search(self.ingestor, text, project=project_name)
+
+        return build_context(
+            self.ingestor.fetch_all,
+            project_name,
+            target,
+            budget_tokens,
+            self._source_root_for(project_name),
+            search=search if self._semantic_search_tool is not None else None,
+        )
+
+    def _rename_tool(self) -> ToolMetadata:
+        def prop(kind: cs.MCPSchemaType, description: str) -> MCPInputSchemaProperty:
+            return MCPInputSchemaProperty(type=kind, description=description)
+
+        return ToolMetadata(
+            name=cs.MCPToolName.RENAME,
+            description=td.MCP_TOOLS[cs.MCPToolName.RENAME],
+            input_schema=MCPInputSchema(
+                type=cs.MCPSchemaType.OBJECT,
+                properties={
+                    cs.MCPParamName.QUALIFIED_NAME: prop(
+                        cs.MCPSchemaType.STRING, td.MCP_PARAM_QUALIFIED_NAME
+                    ),
+                    cs.MCPParamName.NEW_NAME: prop(
+                        cs.MCPSchemaType.STRING, td.MCP_PARAM_NEW_NAME
+                    ),
+                    cs.MCPParamName.ALLOW_HEURISTIC: prop(
+                        cs.MCPSchemaType.BOOLEAN, td.MCP_PARAM_ALLOW_HEURISTIC
+                    ),
+                    cs.MCPParamName.DRY_RUN: prop(
+                        cs.MCPSchemaType.BOOLEAN, td.MCP_PARAM_RENAME_DRY_RUN
+                    ),
+                    cs.MCPParamName.PROJECT: prop(
+                        cs.MCPSchemaType.STRING, td.MCP_PARAM_PROJECT
+                    ),
+                },
+                required=[cs.MCPParamName.QUALIFIED_NAME, cs.MCPParamName.NEW_NAME],
+            ),
+            handler=self.rename,
+            returns_json=True,
+        )
+
+    def _move_tool(self) -> ToolMetadata:
+        def prop(kind: cs.MCPSchemaType, description: str) -> MCPInputSchemaProperty:
+            return MCPInputSchemaProperty(type=kind, description=description)
+
+        return ToolMetadata(
+            name=cs.MCPToolName.MOVE,
+            description=td.MCP_TOOLS[cs.MCPToolName.MOVE],
+            input_schema=MCPInputSchema(
+                type=cs.MCPSchemaType.OBJECT,
+                properties={
+                    cs.MCPParamName.QUALIFIED_NAME: prop(
+                        cs.MCPSchemaType.STRING, td.MCP_PARAM_QUALIFIED_NAME
+                    ),
+                    cs.MCPParamName.TARGET_MODULE: prop(
+                        cs.MCPSchemaType.STRING, td.MCP_PARAM_TARGET_MODULE
+                    ),
+                    cs.MCPParamName.KEEP_ALIAS: prop(
+                        cs.MCPSchemaType.BOOLEAN, td.MCP_PARAM_KEEP_ALIAS
+                    ),
+                    cs.MCPParamName.DRY_RUN: prop(
+                        cs.MCPSchemaType.BOOLEAN, td.MCP_PARAM_MOVE_DRY_RUN
+                    ),
+                    cs.MCPParamName.PROJECT: prop(
+                        cs.MCPSchemaType.STRING, td.MCP_PARAM_PROJECT
+                    ),
+                },
+                required=[
+                    cs.MCPParamName.QUALIFIED_NAME,
+                    cs.MCPParamName.TARGET_MODULE,
+                ],
+            ),
+            handler=self.move,
+            returns_json=True,
+        )
+
+    async def move(
+        self,
+        qualified_name: str,
+        target_module: str,
+        keep_alias: bool = False,
+        dry_run: bool = False,
+        project: str | None = None,
+    ) -> object:
+        return await self._graph_query(
+            cs.MCPToolName.MOVE,
+            project,
+            lambda name: self._run_move(
+                name, qualified_name, target_module, keep_alias, dry_run
+            ),
+        )
+
+    def _run_move(
+        self,
+        project_name: str,
+        qualified_name: str,
+        target_module: str,
+        keep_alias: bool,
+        dry_run: bool,
+    ) -> object:
+        from codebase_rag.editing.move import MoveRefused, move
+
+        # The selected project's repo-relative paths name files only under the
+        # root it was indexed from; resolving them beneath this server's
+        # checkout would cut and rewrite another tree's files (issue #1542).
+        root = graph_query.source_root_for(
+            self.ingestor.fetch_all, project_name, Path(self.project_root)
+        )
+        if root is None:
+            return {
+                cs.DICT_KEY_ERROR: cs.MOVE_WRONG_ROOT.format(project=project_name),
+                cs.KEY_CYCLE: [],
+            }
+        # As for `change_signature`: a preview never re-ingests, and an
+        # applied move that is refused before it re-ingests releases the
+        # mid-update mark its hydrated updater set.
+        reingest, release = (
+            (None, None) if dry_run else self._signature_reingest(project_name)
+        )
+        try:
+            report = move(
+                root,
+                self.ingestor.fetch_all,
+                project_name,
+                qualified_name,
+                target_module,
+                keep_alias=keep_alias,
+                dry_run=dry_run,
+                reingest=reingest,
+            )
+        except MoveRefused as refused:
+            return {cs.DICT_KEY_ERROR: str(refused), cs.KEY_CYCLE: list(refused.cycle)}
+        finally:
+            if release is not None:
+                release()
+        payload_marker_error: str | None = None
+        if report.graph_incomplete:
+            # The same invalidation, in memory and durably, that
+            # `_run_rename` applies after a failed re-ingest.
+            self._live_updater = None
+            self._invalidate_graph_for(project_name)
+            payload_marker_error = self._require_marker(project_name, writing=True)
+        payload = dict(report._asdict())
+        payload[cs.KEY_VERDICT] = report.verdict._asdict() if report.verdict else None
+        if payload_marker_error is not None:
+            payload[cs.DICT_KEY_ERROR] = payload_marker_error
+        return payload
+
+    async def rename(
+        self,
+        qualified_name: str,
+        new_name: str,
+        allow_heuristic: bool = False,
+        dry_run: bool = False,
+        project: str | None = None,
+    ) -> object:
+        # The graph read and the edit share the ingestor lock (taken by
+        # `_graph_query`): a rebuild landing between planning and writing
+        # would rewrite stale sites.
+        return await self._graph_query(
+            cs.MCPToolName.RENAME,
+            project,
+            lambda name: self._run_rename(
+                name, qualified_name, new_name, allow_heuristic, dry_run
+            ),
+        )
+
+    def _rename_reingest_updater(self, project_name: str) -> GraphUpdater:
+        """The updater the rename re-ingests through, refusing a partial graph.
+
+        A retained updater for THIS project is reused as-is: it is warm, and
+        the guarded callback does its own marking. Otherwise hydrate through
+        the marker-reading helper, never a flag-only one -- `_updater_for_
+        reingest` was deleted under #1783 precisely because its guard reads
+        `_graph_incomplete` alone, which dies with the process, so a fresh
+        registry after a crash hydrated from a graph a previous run left
+        partial (#1679).
+
+        The reuse therefore has to carry the same refusal itself. Skipping it
+        re-created that very defect on this path: `_require_marker` WRITES a
+        marker and never reads one, and `_hydrate_reingest_updater` is the
+        only place `_persisted_incomplete` is consulted, so a warm updater
+        re-ingested over a graph a PEER REGISTRY left partial -- identical
+        incomplete state giving opposite outcomes purely on whether an updater
+        happened to be warm. Two registries per project is a real
+        configuration (#1709), and RENAME sits outside `_READS_THE_GRAPH`, so
+        the read guard does not cover it either (greptile-local, PR #1547).
+
+        Split out of `_guarded_rename_reingest` to keep it under the
+        cognitive-complexity limit; choosing the updater and refusing over a
+        partial graph is one decision, and wrapping the call is another.
+        """
+        retained = self._live_updater
+        if retained is None or retained.project_name != project_name:
+            return self._hydrate_reingest_updater(project_name)
+        # Recovery FIRST, then the latch: reading the latch before
+        # `_persisted_incomplete` can clear a stranded recoverable marker left
+        # this path refusing a rename the cold path allows.
+        persisted_incomplete = self._recover_then_persisted_incomplete(project_name)
+        latched_here = self._graph_incomplete and self._incomplete_project in (
+            None,
+            project_name,
+        )
+        if latched_here or persisted_incomplete:
+            raise ValueError(
+                cs.MCP_REINGEST_AFTER_FAILED_RUN.format(project=project_name)
+            )
+        return retained
+
+    def _guarded_rename_reingest(
+        self, project_name: str
+    ) -> Callable[[list[str]], ReingestReport] | None:
+        """The rename's re-ingest callback, behind the incomplete-run marker.
+
+        Returns None when the project has no graph to measure against.
+
+        The callback was previously passed RAW, so a process death part way
+        through it left a partial graph that a restarted server treated as
+        complete -- the exact failure the marker exists to prevent, on the one
+        path that did not use it (Greptile, PR #1547). Same shape as
+        `_reingest_sync`: mark before the first write, clear after, and refuse
+        rather than start if the marker cannot be written.
+
+        `writing=False` at the mark, because the updater's prologue is
+        read-only; `before_write` advances the phase at the exact point the
+        first delete is about to be issued.
+        """
+        if (
+            self._live_updater is None
+            and project_name not in self.ingestor.list_projects()
+        ):
+            return None
+        updater = self._rename_reingest_updater(project_name)
+
+        def guarded(paths: list[str]) -> ReingestReport:
+            if (
+                refusal := self._require_marker(project_name, writing=False)
+            ) is not None:
+                raise RuntimeError(refusal)
+            try:
+                report = updater.reingest(
+                    paths,
+                    before_write=lambda: self._begin_writing_or_refuse(project_name),
+                )
+            except Exception as exc:
+                # Classified exactly as `_reingest_sync` does, which is what
+                # "same shape" above is supposed to mean. Clearing in a
+                # blanket `finally` was the bug: the rename recovers this
+                # signal only on the ROLLBACK path, where the report carries
+                # `graph_incomplete` and `_run_rename` re-marks durably. The
+                # INITIAL postcondition re-ingest fails inside `measure()`,
+                # which returns `verdict=None` and sets no such flag, so a
+                # mutating failure there dropped the durable marker, raised
+                # nothing, and returned `applied` over a possibly-partial
+                # graph (found by a peer review session, PR #1547).
+                if self._reingest_mutated(updater, exc):
+                    # The marker STAYS: the graph may be partial and it is the
+                    # only record that survives this process. The retained
+                    # updater goes because it describes a graph that is gone,
+                    # and the healing licence is revoked for the same reason
+                    # as the rollback site -- an earlier failed clear does not
+                    # explain damage this call just did.
+                    self._live_updater = None
+                    self._invalidate_graph_for(project_name)
+                    self._flag_from_failed_clear = None
+                else:
+                    # Nothing was written, so the marker this call created is
+                    # a lie about a run that changed nothing: leaving it up
+                    # would refuse every later run for a failure already
+                    # reported. This direction is not a nicety -- an earlier
+                    # round of this PR shipped a marker with no expressible
+                    # exit and refused every later run for the process
+                    # lifetime, which was worse than the leak it replaced.
+                    self._require_marker_cleared(project_name)
+                raise
+            self._require_marker_cleared(project_name)
+            return report
+
+        return guarded
+
+    def _run_rename(
+        self,
+        project_name: str,
+        qualified_name: str,
+        new_name: str,
+        allow_heuristic: bool,
+        dry_run: bool,
+    ) -> object:
+        from codebase_rag.editing.rename import RenameRefused, rename, sites_for
+
+        # The selected project's relative paths are meaningful only under
+        # the root it was indexed from; another project's paths must not be
+        # edited beneath this server's repository (issue #1542).
+        root = graph_query.source_root_for(
+            self.ingestor.fetch_all, project_name, Path(self.project_root)
+        )
+        if root is None:
+            return {
+                cs.DICT_KEY_ERROR: cs.RENAME_WRONG_ROOT.format(project=project_name)
+            }
+        try:
+            # The applied rename is held to its postcondition contract through
+            # the scoped re-ingest (issue #1531); a project that is not indexed
+            # has no graph to measure against and skips it.
+            # The selected project was verified to be indexed from this
+            # root above, and the guarded callback rejects a cached updater
+            # built for a different project, so the delta is measured under
+            # the same name the re-ingest writes.
+            reingest = self._guarded_rename_reingest(project_name)
+            report = rename(
+                root,
+                self.ingestor.fetch_all,
+                project_name,
+                qualified_name,
+                new_name,
+                allow_heuristic=allow_heuristic,
+                dry_run=dry_run,
+                reingest=reingest,
+                heuristic_opt_in=cs.MCPParamName.ALLOW_HEURISTIC,
+            )
+        except RenameRefused as refused:
+            return {
+                cs.DICT_KEY_ERROR: str(refused),
+                cs.KEY_AMBIGUOUS: sites_for(refused.ambiguous),
+                cs.KEY_UNLOCATABLE: list(refused.unlocatable),
+                cs.KEY_UNPLANNED: sites_for(refused.unplanned),
+            }
+        payload_marker_error: str | None = None
+        if getattr(report, "graph_incomplete", False):
+            # The rollback's re-ingest failed: the same invalidation the
+            # scoped re-ingest applies, so no later call reuses a partial graph.
+            self._live_updater = None
+            # Narrows to this project only when nothing broader holds the
+            # flag, and revokes any healing licence: the rollback's damage
+            # is new, so no earlier failed clear explains it.
+            self._invalidate_graph_for(project_name)
+            # ...and DURABLY, because that flag dies with this process while
+            # the half-restored graph does not. A fresh registry would see a
+            # project that looks whole, serve reads from it and hydrate a
+            # scoped updater from the partial graph (Greptile, PR #1547).
+            # `writing=True`: the failed re-ingest had already begun mutating.
+            payload_marker_error = self._require_marker(project_name, writing=True)
+        payload = dict(report._asdict())
+        payload[cs.KEY_SITES] = sites_for(report.sites)
+        payload[cs.KEY_AMBIGUOUS] = sites_for(report.ambiguous)
+        payload[cs.KEY_UNPLANNED] = sites_for(report.unplanned)
+        payload["verdict"] = report.verdict._asdict() if report.verdict else None
+        if payload_marker_error is not None:
+            # The graph is partial AND the record of it could not be written.
+            # Reported, never swallowed: this needs operational recovery and
+            # a restarted process cannot infer it.
+            payload[cs.DICT_KEY_ERROR] = payload_marker_error
+        return payload
+
+    def _change_signature_tool(self) -> ToolMetadata:
+        def prop(kind: cs.MCPSchemaType, description: str) -> MCPInputSchemaProperty:
+            return MCPInputSchemaProperty(type=kind, description=description)
+
+        return ToolMetadata(
+            name=cs.MCPToolName.CHANGE_SIGNATURE,
+            description=td.MCP_TOOLS[cs.MCPToolName.CHANGE_SIGNATURE],
+            input_schema=MCPInputSchema(
+                type=cs.MCPSchemaType.OBJECT,
+                properties={
+                    cs.MCPParamName.QUALIFIED_NAME: prop(
+                        cs.MCPSchemaType.STRING, td.MCP_PARAM_QUALIFIED_NAME
+                    ),
+                    cs.MCPParamName.NEW_PARAMS: MCPInputSchemaProperty(
+                        type=cs.MCPSchemaType.ARRAY,
+                        description=td.MCP_PARAM_NEW_PARAMS,
+                        items={cs.MCPSchemaField.TYPE: cs.MCPSchemaType.STRING},
+                    ),
+                    cs.MCPParamName.MAPPING: prop(
+                        cs.MCPSchemaType.OBJECT, td.MCP_PARAM_MAPPING
+                    ),
+                    cs.MCPParamName.ALLOW_HEURISTIC: prop(
+                        cs.MCPSchemaType.BOOLEAN, td.MCP_PARAM_ALLOW_HEURISTIC
+                    ),
+                    cs.MCPParamName.DRY_RUN: prop(
+                        cs.MCPSchemaType.BOOLEAN, td.MCP_PARAM_RENAME_DRY_RUN
+                    ),
+                    cs.MCPParamName.PROJECT: prop(
+                        cs.MCPSchemaType.STRING, td.MCP_PARAM_PROJECT
+                    ),
+                },
+                required=[
+                    cs.MCPParamName.QUALIFIED_NAME,
+                    cs.MCPParamName.NEW_PARAMS,
+                ],
+            ),
+            handler=self.change_signature,
+            returns_json=True,
+        )
+
+    async def change_signature(
+        self,
+        qualified_name: str,
+        new_params: list[str],
+        mapping: dict[str, str] | None = None,
+        allow_heuristic: bool = False,
+        dry_run: bool = False,
+        project: str | None = None,
+    ) -> object:
+        # Under the ingestor lock for the same reason as `rename`: a rebuild
+        # landing between planning and writing would rewrite stale sites.
+        return await self._graph_query(
+            cs.MCPToolName.CHANGE_SIGNATURE,
+            project,
+            lambda name: self._run_change_signature(
+                name, qualified_name, new_params, mapping, allow_heuristic, dry_run
+            ),
+        )
+
+    def _signature_reingest(
+        self, project_name: str
+    ) -> tuple[Callable[[list[str]], ReingestReport] | None, Callable[[], None]]:
+        """The guarded re-ingest callback for an applied signature change, and
+        a release to run once the change returns.
+
+        Built before planning, as for `rename`, so a graph left partial by an
+        earlier run refuses the change before any file is written. Hydrating
+        a cold updater marks the project mid-update, and only the callback
+        clears that mark; a change refused before it re-ingests (a bad
+        parameter list, an unmapped hierarchy) would otherwise leave the
+        project marked and every later read refusing. The release clears the
+        mark this call made when the callback never ran. A retained updater
+        marks nothing up front, so there is nothing to release.
+        """
+        before = self._live_updater
+        guarded = self._guarded_rename_reingest(project_name)
+        hydrated = guarded is not None and self._live_updater is not before
+        ran = False
+
+        def reingest(paths: list[str]) -> ReingestReport:
+            nonlocal ran
+            ran = True
+            assert guarded is not None
+            return guarded(paths)
+
+        def release() -> None:
+            if hydrated and not ran:
+                self._require_marker_cleared(project_name)
+
+        return (reingest if guarded is not None else None), release
+
+    def _run_change_signature(
+        self,
+        project_name: str,
+        qualified_name: str,
+        new_params: list[str],
+        mapping: dict[str, str] | None,
+        allow_heuristic: bool,
+        dry_run: bool,
+    ) -> object:
+        from codebase_rag.editing.signature import change_signature
+        from codebase_rag.editing.signature_spec import (
+            SignatureRefused,
+            sites_for,
+            unmapped_for,
+        )
+
+        # Paths are meaningful only under the root the project was indexed
+        # from (issue #1542), exactly as for `rename`.
+        root = graph_query.source_root_for(
+            self.ingestor.fetch_all, project_name, Path(self.project_root)
+        )
+        if root is None:
+            return {
+                cs.DICT_KEY_ERROR: cs.RENAME_WRONG_ROOT.format(project=project_name)
+            }
+        # A preview never re-ingests, so it gets no callback: building one
+        # hydrates an updater and marks the project mid-update, and only the
+        # callback itself clears that mark.
+        reingest, release = (
+            (None, None) if dry_run else self._signature_reingest(project_name)
+        )
+        try:
+            report = change_signature(
+                root,
+                self.ingestor.fetch_all,
+                project_name,
+                qualified_name,
+                new_params,
+                mapping,
+                allow_heuristic=allow_heuristic,
+                dry_run=dry_run,
+                reingest=reingest,
+            )
+        except SignatureRefused as refused:
+            return {cs.DICT_KEY_ERROR: str(refused)}
+        finally:
+            if release is not None:
+                release()
+        payload_marker_error: str | None = None
+        if report.graph_incomplete:
+            # The rollback's re-ingest failed: the same invalidation, in
+            # memory and durably, that `_run_rename` applies.
+            self._live_updater = None
+            self._invalidate_graph_for(project_name)
+            payload_marker_error = self._require_marker(project_name, writing=True)
+        payload = dict(report._asdict())
+        payload[cs.KEY_SITES] = sites_for(report.sites)
+        payload[cs.KEY_UNMAPPED] = unmapped_for(report.unmapped)
+        payload[cs.KEY_VERDICT] = report.verdict._asdict() if report.verdict else None
+        if payload_marker_error is not None:
+            payload[cs.DICT_KEY_ERROR] = payload_marker_error
+        return payload
+
+    async def query_code_graph(
+        self, natural_language_query: str, project: str | None = None
+    ) -> QueryResultDict:
+        logger.info(lg.MCP_QUERY_CODE_GRAPH.format(query=natural_language_query))
+        try:
+            # The workspace allow-list and default first (issue #1494), then
+            # the graph's own check: a typo returning zero rows is
+            # indistinguishable from a genuine empty result.
+            project, scope_error = self._workspace_scope(project)
+            if scope_error is not None:
+                return QueryResultDict(
+                    error=scope_error,
+                    query_used=cs.QUERY_NOT_AVAILABLE,
+                    results=[],
+                    summary=scope_error,
+                )
+            if project is not None:
+                known = await _run_in_thread(self.ingestor.list_projects)
+                if project not in known:
+                    unknown = self._unknown_project_error(project, known)
+                    return QueryResultDict(
+                        error=unknown,
+                        query_used=cs.QUERY_NOT_AVAILABLE,
+                        results=[],
+                        summary=unknown,
+                    )
+            # The same refusal the eight `_graph_query` tools apply. This one
+            # does not share that path -- it binds a per-request query tool
+            # below -- so the check is repeated here rather than inherited.
+            project_name = project or derive_project_name(Path(self.project_root))
+            # Per REQUEST, not per process: one HTTP server hosts several
+            # projects, and a scope fixed at startup would force a process
+            # each (issue #1494). The pre-built `_query_tool` has its project
+            # bound at construction, so a scoped request gets a tool of its
+            # own -- which runs the evidence guard and the row filter BEFORE
+            # its row cap and token truncation. Filtering here instead spent
+            # the caps on foreign rows and left `summary` describing rows the
+            # caller never received (issue #1508).
+            query_tool = (
+                self._query_tool
+                if project is None
+                else create_query_tool(
+                    ingestor=self.ingestor,
+                    cypher_gen=self.cypher_gen,
+                    console=self._stderr_console,
+                    project_name=project,
+                )
+            )
+            # Serialise against index/update, which delete and rebuild the
+            # graph under this lock; an interleaved read mixes generations.
+            # The guard is evaluated in the SAME lock scope as the read: an
+            # earlier version checked under `_refusal_under_lock`, released
+            # the lock and reacquired it here, so an update could mark the
+            # graph incomplete in the gap and the approved query still ran
+            # (Greptile, PR #1547).
+            async with self._ingestor_lock:
+                if refusal := await _run_in_thread(
+                    self._incomplete_refusal,
+                    project_name,
+                    cs.MCPToolName.QUERY_CODE_GRAPH,
+                ):
+                    return QueryResultDict(
+                        error=refusal,
+                        query_used=cs.QUERY_NOT_AVAILABLE,
+                        results=[],
+                        summary=refusal,
+                    )
+                graph_data = await _plain_function(query_tool)(natural_language_query)
+            result_dict: QueryResultDict = graph_data.model_dump()
+            # The error key marks a scoping refusal; absent it means success,
+            # so a None must not leak into the wire shape as a present key.
+            if graph_data.error is None:
+                result_dict.pop(cs.MCP_KEY_ERROR, None)
+            logger.info(
+                lg.MCP_QUERY_RESULTS.format(
+                    count=len(result_dict.get(cs.DICT_KEY_RESULTS, []))
+                )
+            )
+            return result_dict
+        except Exception as e:
+            logger.exception(lg.MCP_ERROR_QUERY.format(error=e))
+            return QueryResultDict(
+                error=str(e),
+                query_used=cs.QUERY_NOT_AVAILABLE,
+                results=[],
+                summary=cs.MCP_TOOL_EXEC_ERROR.format(
+                    name=cs.MCPToolName.QUERY_CODE_GRAPH, error=e
+                ),
+            )
+
+    async def get_code_snippet(self, qualified_name: str) -> CodeSnippetResultDict:
+        logger.info(lg.MCP_GET_CODE_SNIPPET.format(name=qualified_name))
+        try:
+            # Serialise against index/update, which delete and rebuild the
+            # graph under this lock; an interleaved read mixes generations.
+            # The guard is inside the lock so an update cannot land between
+            # the check and the read (Greptile, PR #1547).
+            async with self._ingestor_lock:
+                project_name = derive_project_name(Path(self.project_root))
+                if refusal := await _run_in_thread(
+                    self._incomplete_refusal,
+                    project_name,
+                    cs.MCPToolName.GET_CODE_SNIPPET,
+                ):
+                    return CodeSnippetResultDict(
+                        error=refusal, found=False, error_message=refusal
+                    )
+                snippet = await _plain_function(self._code_tool)(
+                    qualified_name=qualified_name
+                )
+                if isinstance(snippet, str):
+                    # The workspace guard answered instead of the retriever.
+                    return CodeSnippetResultDict(
+                        error=snippet, found=False, error_message=snippet
+                    )
+                result: CodeSnippetResultDict | None = snippet.model_dump()
+                if result is None:
+                    return CodeSnippetResultDict(
+                        error=te.MCP_TOOL_RETURNED_NONE,
+                        found=False,
+                        error_message=te.MCP_INVALID_RESPONSE,
+                    )
+                if result.get(cs.MCP_KEY_FOUND) is False:
+                    # No snippet is a refusal, worded as `callers` words an
+                    # unknown name when the graph has none (issue #3244).
+                    unknown = await _run_in_thread(
+                        self._unknown_target_error, project_name, qualified_name
+                    )
+                    result[cs.DICT_KEY_ERROR] = (
+                        unknown
+                        or result.get(cs.MCP_KEY_ERROR_MESSAGE)
+                        or te.CODE_ENTITY_NOT_FOUND
+                    )
+            return result
+        except Exception as e:
+            logger.error(lg.MCP_ERROR_CODE_SNIPPET.format(error=e))
+            return CodeSnippetResultDict(
+                error=str(e),
+                found=False,
+                error_message=str(e),
+            )
+
+    async def surgical_replace_code(
+        self, file_path: str, target_code: str, replacement_code: str
+    ) -> str:
+        logger.info(lg.MCP_SURGICAL_REPLACE.format(path=file_path))
+        if refused := self._sensitive_write_refused(file_path):
+            return refused
+        try:
+            async with self._ingestor_lock:
+                result = await _plain_function(self._file_editor_tool)(
+                    file_path=file_path,
+                    target_code=target_code,
+                    replacement_code=replacement_code,
+                )
+                if str(result) != cs.MSG_SURGICAL_SUCCESS.format(path=file_path):
+                    return te.ToolFailure(result)
+                delta = await _run_in_thread(self._delta_after_write, [file_path])
+                return str(result) + delta
+        except Exception as e:
+            logger.error(lg.MCP_ERROR_REPLACE.format(error=e))
+            return te.failure(e)
+
+    async def read_file(
+        self, file_path: str, offset: int | None = None, limit: int | None = None
+    ) -> str:
+        logger.info(lg.MCP_READ_FILE.format(path=file_path, offset=offset, limit=limit))
+        if offset is not None and offset < cs.MCP_READ_OFFSET_MINIMUM:
+            return te.failure(cs.MCP_READ_OFFSET_NEGATIVE.format(offset=offset))
+        if limit is not None and limit < cs.MCP_READ_LIMIT_MINIMUM:
+            return te.failure(cs.MCP_READ_LIMIT_NOT_POSITIVE.format(limit=limit))
+        if not settings.ALLOW_SENSITIVE_READS and self.file_reader.is_sensitive(
+            file_path
+        ):
+            return te.failure(cs.MCP_READ_SENSITIVE_REFUSED.format(path=file_path))
+        try:
+            if offset is not None or limit is not None:
+                project_root = Path(self.project_root).resolve()
+                try:
+                    full_path = (project_root / file_path).resolve()
+                    full_path.relative_to(project_root)
+                except (ValueError, RuntimeError):
+                    return te.failure(lg.FILE_OUTSIDE_ROOT.format(action="access"))
+                start = offset if offset is not None else 0
+                return await _run_in_thread(
+                    _read_file_slice, full_path, start, limit, file_path
+                )
+            else:
+                # Returned as is: a ToolFailure must stay one (issue #2650).
+                # Not through the agent's tool: that one defers a credential
+                # file for approval, and this path has already decided.
+                return await read_file_text(self.file_reader, file_path)
+
+        except Exception as e:
+            logger.error(lg.MCP_ERROR_READ.format(error=e))
+            return te.failure(e)
+
+    def _sensitive_write_refused(self, file_path: str) -> te.ToolFailure | None:
+        if settings.ALLOW_SENSITIVE_WRITES or not self.file_reader.is_sensitive(
+            file_path
+        ):
+            return None
+        return te.failure(cs.MCP_WRITE_SENSITIVE_REFUSED.format(path=file_path))
+
+    async def write_file(self, file_path: str, content: str) -> str:
+        logger.info(lg.MCP_WRITE_FILE.format(path=file_path))
+        if refused := self._sensitive_write_refused(file_path):
+            return refused
+        try:
+            async with self._ingestor_lock:
+                result = await _plain_function(self._file_writer_tool)(
+                    file_path=file_path, content=content
+                )
+                if not result.success:
+                    return te.failure(result.error_message)
+                delta = await _run_in_thread(self._delta_after_write, [file_path])
+                return cs.MCP_WRITE_SUCCESS.format(path=file_path) + delta
+        except Exception as e:
+            logger.error(lg.MCP_ERROR_WRITE.format(error=e))
+            return te.failure(e)
+
+    async def list_directory(
+        self, directory_path: str = cs.MCP_DEFAULT_DIRECTORY
+    ) -> str:
+        logger.info(lg.MCP_LIST_DIR.format(path=directory_path))
+        try:
+            return _plain_function(self._directory_lister_tool)(
+                directory_path=directory_path
+            )
+        except Exception as e:
+            logger.error(lg.MCP_ERROR_LIST_DIR.format(error=e))
+            return te.failure(e)
+
+    def get_tool_schemas(self) -> list[MCPToolSchema]:
+        return [
+            MCPToolSchema(
+                name=metadata.name,
+                description=metadata.description,
+                inputSchema=metadata.input_schema,
+            )
+            for metadata in self._tools.values()
+            if self.serves(metadata.name)
+        ]
+
+    def serves(self, name: str) -> bool:
+        """Whether this server offers `name`: every tool, or under read-only
+        mode only those that never write (issue #3458)."""
+        return not settings.MCP_READ_ONLY or name in cs.MCP_READ_ONLY_TOOLS
+
+    def get_tool_handler(self, name: str) -> tuple[MCPHandlerType, bool] | None:
+        metadata = self._tools.get(name)
+        return None if metadata is None else (metadata.handler, metadata.returns_json)
+
+
+def tool_annotations(name: str) -> ToolAnnotations:
+    """What a client may assume of tool `name` before calling it, so its own
+    approval rules can tell `callers` from `wipe_database` (issue #3458).
+    Every tool works on this server's graph and files, never the open web."""
+    return ToolAnnotations(
+        read_only_hint=name in cs.MCP_READ_ONLY_TOOLS,
+        destructive_hint=name in cs.MCP_DESTRUCTIVE_TOOLS,
+        idempotent_hint=name in cs.MCP_IDEMPOTENT_TOOLS,
+        open_world_hint=False,
+    )
+
+
+def create_mcp_tools_registry(
+    project_root: str,
+    ingestor: MemgraphIngestor,
+    cypher_gen: CypherQueryGenerator,
+    workspace: WorkspaceConfig | None = None,
+) -> MCPToolsRegistry:
+    return MCPToolsRegistry(
+        project_root=project_root,
+        ingestor=ingestor,
+        cypher_gen=cypher_gen,
+        workspace=workspace,
+    )

@@ -1,0 +1,59 @@
+---
+description: "Graph-based RAG system that parses multi-language codebases with Tree-sitter and compiler-grade frontends, builds knowledge graphs, and enables natural language querying, editing, and optimisation."
+---
+
+# Code-Graph-RAG
+
+**The ultimate RAG for your monorepo.** Query, understand, and edit multi-language codebases with the power of AI and knowledge graphs.
+
+<p align="center">
+  <b>1. Index:</b> <code>cgr start --update-graph</code> parses a repository into a knowledge graph (sped up)
+</p>
+<p align="center">
+  <img src="assets/demo-indexing.gif" alt="cgr parsing the code-graph-rag repository into a Memgraph knowledge graph, then printing node and relationship counts">
+</p>
+
+<p align="center">
+  <b>2. Ask:</b> <code>cgr start</code> answers questions and edits code, grounded in that graph
+</p>
+<p align="center">
+  <img src="assets/demo.gif" alt="Code-Graph-RAG agent answering questions about the indexed repository">
+</p>
+
+## What is Code-Graph-RAG?
+
+Code-Graph-RAG is an accurate Retrieval-Augmented Generation (RAG) system that analyses multi-language codebases using Tree-sitter, sharpened by compiler-grade frontends and runtime traces where available, builds comprehensive knowledge graphs in Memgraph, and enables natural language querying of codebase structure and relationships as well as editing capabilities.
+
+## Key Features
+
+- **Multi-Language Support** for Python, TypeScript, JavaScript, Rust, Java, C++, Go, Lua, and more
+- **Tree-sitter Parsing** for robust, language-agnostic AST analysis, with optional compiler-grade frontends (libclang, `go/types`, Roslyn, `javac`, Jedi) and [dynamic tracing](guide/dynamic-tracing.md) layered on top
+- **Knowledge Graph Storage** using Memgraph for interconnected codebase structure
+- **Natural Language Querying** to ask questions about your code in plain English
+- **AI-Powered Cypher Generation** with Google Gemini, OpenAI, and Ollama support
+- **Code Snippet Retrieval** with actual source code for found functions and methods
+- **Advanced File Editing** with AST-based function targeting and visual diff previews
+- **Shell Command Execution** for running tests and CLI tools
+- **Interactive Code Optimisation** with language-specific best practices
+- **Reference-Guided Optimisation** using your own coding standards
+- **Dead Code Detection** to find functions unreachable from any entry point
+- **Dependency Analysis** from `pyproject.toml`
+- **Semantic Code Search** using UniXcoder embeddings to find functions by intent
+- **MCP Server Integration** for seamless use with Claude Code
+- **Real-Time Graph Updates** via file watcher for active development
+
+## Quick Start
+
+```bash
+pip install code-graph-rag
+cgr daemon up
+cgr start --repo-path ./my-project --update-graph
+```
+
+See the [Installation](getting-started/installation.md) guide for full setup instructions.
+
+## Enterprise Services
+
+Code-Graph-RAG is open source and free to use. For organisations that need more, we offer **fully managed cloud-hosted solutions** and **on-premise deployments**.
+
+[View plans & pricing at code-graph-rag.com](https://code-graph-rag.com/enterprise){ .md-button }

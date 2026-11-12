@@ -1,0 +1,234 @@
+# ast-grep security rules for Python (issue #413).
+# Each match becomes a SecurityIssue node linked to the file's Module via
+# HAS_VULNERABILITY. Rules are heuristic; treat findings as review prompts.
+ast_grep_id: python
+extensions: [.py]
+rules:
+  - id: sqli_concat
+    message: "Possible SQL injection: query built with string concatenation or % formatting"
+    rule:
+      any:
+        - pattern: "$OBJ.execute($A + $B)"
+        # (%) matches only when a string literal is present, so a numeric modulo
+        # like execute(index % shard_count) is not mistaken for query formatting.
+        - all:
+            - pattern: "$OBJ.execute($A % $B)"
+            - has: { kind: string, stopBy: end }
+  - id: sqli_fstring
+    message: "Possible SQL injection: execute() called with an f-string"
+    # The callee is execute/executemany and the f-string is one of ITS
+    # arguments. Searching the whole subtree for each (issue #2691) matched a
+    # keyword argument named `execute`, an f-string beside a constant query,
+    # and every call enclosing a real one, once per enclosing call. The search
+    # descends only through parentheses and adjacent-literal concatenation, so
+    # `execute((f"..."))` and `execute(f"..." " LIMIT 1")` are still found
+    # while an f-string inside a parameter tuple or a nested call is not.
+    rule:
+      kind: call
+      all:
+        - has: { field: function, regex: '(?:^|\.)execute(?:many)?$' }
+        - has:
+            field: arguments
+            has:
+              kind: string
+              regex: '^(?i:f|rf|fr)[\x27"]'
+              stopBy:
+                not:
+                  any:
+                    - kind: parenthesized_expression
+                    - kind: concatenated_string
+  - id: sqli_format
+    message: "Possible SQL injection: query built with str.format()"
+    # `"... {}".format(u)` builds the query as `+`, `%` and f-strings do
+    # (issue #2863). The query is execute's first argument, the receiver a
+    # string literal, and at least one formatted value is not a constant, so
+    # `.format(5)`, a value formatted into the bound parameters and a string
+    # built inside a nested call stay clean. Parentheses around the query, the
+    # receiver or a value build the same string, so each is read through them:
+    # `field` with `stopBy` looks through only one pair, hence the nesting.
+    rule:
+      kind: call
+      all:
+        - has: { field: function, regex: '(?:^|\.)execute(?:many)?$' }
+        - has:
+            field: arguments
+            has:
+              kind: call
+              nthChild: 1
+              all:
+                - has:
+                    field: function
+                    kind: attribute
+                    all:
+                      - has:
+                          field: object
+                          any:
+                            - kind: string
+                            - kind: concatenated_string
+                            - kind: parenthesized_expression
+                              has:
+                                any: [{ kind: string }, { kind: concatenated_string }]
+                                stopBy:
+                                  not: { kind: parenthesized_expression }
+                      - has: { field: attribute, regex: '^format$' }
+                - has:
+                    field: arguments
+                    has:
+                      any:
+                        - kind: identifier
+                          not: { inside: { kind: keyword_argument, field: name } }
+                        - kind: attribute
+                        - kind: subscript
+                        - kind: call
+                        - kind: binary_operator
+                        - kind: conditional_expression
+                        - kind: list_splat
+                        - kind: dictionary_splat
+                        - kind: string
+                          has: { kind: interpolation }
+                      stopBy:
+                        not:
+                          any:
+                            - kind: parenthesized_expression
+                            - kind: keyword_argument
+                            - kind: concatenated_string
+              stopBy:
+                not: { kind: parenthesized_expression }
+  - id: hardcoded_secret
+    # Security rule: favour recall. Value must be a non-trivial literal (>=8
+    # chars) that is not a format/message template (an f-string/.format {..}
+    # placeholder or a printf %s/%d specifier). Braces and % conversions are the
+    # only exclusions so real secrets that legitimately contain %, spaces, URLs
+    # with embedded credentials, or SCREAMING_SNAKE shapes are still caught.
+    # Ceiling: without entropy scoring, identifier/word/URL-name literals (e.g.
+    # "OPENAI_API_KEY", "cl100k_base") still surface as review prompts; that
+    # residual is the known limit of regex-only secret detection, not a defect.
+    message: "Hardcoded secret assigned to a credential-named variable"
+    rule:
+      kind: assignment
+      all:
+        - has: { field: left, regex: '(?i)(password|secret|api_key|token)' }
+        - has:
+            field: right
+            all:
+              - kind: string
+              - regex: '^.{10,}$'
+              - not:
+                  any:
+                    - regex: '\{[^{}]*\}'
+                    - regex: '%[sdrifeEgGxXoc(]'
+  - id: eval_use
+    message: "eval() executes arbitrary code"
+    rule:
+      pattern: "eval($$$)"
+  - id: exec_use
+    message: "exec() executes arbitrary code"
+    rule:
+      pattern: "exec($$$)"
+  - id: os_system_concat
+    message: "Possible command injection: os.system() with concatenation"
+    rule:
+      pattern: "os.system($A + $B)"
+  - id: os_system_fstring
+    message: "Possible command injection: os.system() with an f-string"
+    # The command f-string must interpolate something: `f"ping localhost"` is
+    # a constant (issue #2863).
+    rule:
+      kind: call
+      all:
+        - has: { field: function, regex: '^os\.system$' }
+        - has:
+            field: arguments
+            has:
+              kind: string
+              regex: '^(?i:f|rf|fr)[\x27"]'
+              has: { kind: interpolation }
+              stopBy:
+                not:
+                  any:
+                    - kind: parenthesized_expression
+                    - kind: concatenated_string
+  - id: os_system_format
+    message: "Possible command injection: os.system() with str.format()"
+    # Same str.format() shape as sqli_format (issue #2863).
+    rule:
+      kind: call
+      all:
+        - has: { field: function, regex: '^os\.system$' }
+        - has:
+            field: arguments
+            has:
+              kind: call
+              nthChild: 1
+              all:
+                - has:
+                    field: function
+                    kind: attribute
+                    all:
+                      - has:
+                          field: object
+                          any:
+                            - kind: string
+                            - kind: concatenated_string
+                            - kind: parenthesized_expression
+                              has:
+                                any: [{ kind: string }, { kind: concatenated_string }]
+                                stopBy:
+                                  not: { kind: parenthesized_expression }
+                      - has: { field: attribute, regex: '^format$' }
+                - has:
+                    field: arguments
+                    has:
+                      any:
+                        - kind: identifier
+                          not: { inside: { kind: keyword_argument, field: name } }
+                        - kind: attribute
+                        - kind: subscript
+                        - kind: call
+                        - kind: binary_operator
+                        - kind: conditional_expression
+                        - kind: list_splat
+                        - kind: dictionary_splat
+                        - kind: string
+                          has: { kind: interpolation }
+                      stopBy:
+                        not:
+                          any:
+                            - kind: parenthesized_expression
+                            - kind: keyword_argument
+                            - kind: concatenated_string
+              stopBy:
+                not: { kind: parenthesized_expression }
+  - id: subprocess_shell
+    message: "subprocess called with shell=True enables command injection"
+    # The call's OWN `shell=True` keyword argument: the text anywhere under
+    # the call also matched a string argument (`["grep", "shell=True"]`), a
+    # comment between the arguments or another call's keyword, none of which
+    # runs a shell (issue #2869).
+    rule:
+      pattern: "subprocess.$M($$$)"
+      has:
+        field: arguments
+        has:
+          kind: keyword_argument
+          all:
+            - has: { field: name, regex: '^shell$' }
+            - has: { field: value, kind: 'true' }
+  - id: yaml_load
+    message: "yaml.load() without SafeLoader can execute arbitrary code"
+    # A SafeLoader or CSafeLoader, by keyword or as the second positional
+    # argument, is the fix this message asks for (issue #2691).
+    rule:
+      pattern: "yaml.load($$$)"
+      not:
+        has:
+          field: arguments
+          has:
+            any:
+              - kind: keyword_argument
+                regex: '^Loader\s*=\s*(?:yaml\.)?C?SafeLoader$'
+              - regex: '^(?:yaml\.)?C?SafeLoader$'
+  - id: pickle_loads
+    message: "pickle.loads() on untrusted data executes arbitrary code"
+    rule:
+      pattern: "pickle.loads($$$)"

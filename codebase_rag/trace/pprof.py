@@ -1,0 +1,494 @@
+"""Convert Go pprof CPU profiles to the trace interchange format.
+
+``go test -cpuprofile`` and ``runtime/pprof`` write gzipped protobuf
+profiles whose samples are observed stacks: locations reference functions
+with symbol names, source files, and declaration lines. Parent/child
+adjacency within a sampled stack is a caller/callee relationship the
+sampler actually saw, so dispatch through interface values and function
+values appears whenever samples landed there. Counts are sample counts,
+not call counts.
+
+The wire decoding below is deliberately dependency-free: pprof's schema is
+small and stable, and only samples, locations, lines, functions, and the
+string table are needed. Frames outside the repository (the Go runtime,
+the standard library, module cache) and vendored code are glue; edges see
+through them to the nearest project frame.
+
+Go symbol names carry package paths, receivers, and generic instantiations
+(``example.com/pkg.(*Dog).Sound``, ``main.Map[go.shape.int]``); resolution
+is span-first against declaration lines, so names normalise to their bare
+member form and compiler-generated closure symbols (``runAll.func1``)
+become ``<anonymous>``. Traced builds should disable inlining
+(``-gcflags=all=-l``) or inlined callees vanish from the profile.
+"""
+
+from __future__ import annotations
+
+import re
+import zlib
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+from .. import constants as cs
+from .records import (
+    CallRecord,
+    FramePoint,
+    TraceFormatError,
+    TraceHeader,
+    write_trace_file,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence, Sized
+    from pathlib import Path
+
+_Sample = tuple[list[int], int]
+
+_WIRE_VARINT = 0
+_WIRE_FIXED64 = 1
+_WIRE_LEN = 2
+_WIRE_FIXED32 = 5
+
+_GO_CLOSURE_SEGMENT = re.compile(r"^func\d+(\.\d+)*$")
+_GO_EXCLUDED_DIR = "vendor"
+
+
+def _fields(data: bytes) -> Iterator[tuple[int, int, bytes | int]]:
+    position = 0
+    length = len(data)
+    while position < length:
+        tag, position = _varint(data, position)
+        field, wire = tag >> 3, tag & 0x7
+        if wire == _WIRE_VARINT:
+            value, position = _varint(data, position)
+            yield field, wire, value
+        elif wire == _WIRE_LEN:
+            size, position = _varint(data, position)
+            yield field, wire, data[position : position + size]
+            position += size
+        elif wire == _WIRE_FIXED64:
+            yield field, wire, int.from_bytes(data[position : position + 8], "little")
+            position += 8
+        elif wire == _WIRE_FIXED32:
+            yield field, wire, int.from_bytes(data[position : position + 4], "little")
+            position += 4
+        else:
+            raise TraceFormatError(str(wire))
+
+
+def _varint(data: bytes, position: int) -> tuple[int, int]:
+    result = 0
+    shift = 0
+    while True:
+        if position >= len(data):
+            raise TraceFormatError("truncated varint")
+        byte = data[position]
+        position += 1
+        result |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            return result, position
+        shift += 7
+
+
+def _repeated_uint(wire: int, value: bytes | int) -> list[int]:
+    """A repeated uint64 field arrives packed or one element at a time."""
+    if wire == _WIRE_VARINT and isinstance(value, int):
+        return [value]
+    if wire == _WIRE_LEN and isinstance(value, bytes):
+        out = []
+        position = 0
+        while position < len(value):
+            element, position = _varint(value, position)
+            out.append(element)
+        return out
+    return []
+
+
+@dataclass(slots=True)
+class _Function:
+    name_index: int = 0
+    filename_index: int = 0
+    start_line: int = 0
+
+
+def _parse_function(payload: bytes) -> tuple[int, _Function]:
+    function_id = 0
+    function = _Function()
+    for field, _wire, value in _fields(payload):
+        if field == 1 and isinstance(value, int):
+            function_id = value
+        elif field == 2 and isinstance(value, int):
+            function.name_index = value
+        elif field == 4 and isinstance(value, int):
+            function.filename_index = value
+        elif field == 5 and isinstance(value, int):
+            function.start_line = value
+    return function_id, function
+
+
+def _parse_line(payload: bytes) -> tuple[int, int]:
+    """One `Line` record's function id and source line (0 when unknown)."""
+    function_id = line = 0
+    for field, _wire, value in _fields(payload):
+        if field == 1 and isinstance(value, int):
+            function_id = value
+        elif field == 2 and isinstance(value, int):
+            line = value
+    return function_id, line
+
+
+def _parse_location(payload: bytes) -> tuple[int, list[tuple[int, int]]]:
+    """A location's (function id, line) records, innermost inline frame first."""
+    location_id = 0
+    lines: list[tuple[int, int]] = []
+    for field, _wire, value in _fields(payload):
+        if field == 1 and isinstance(value, int):
+            location_id = value
+        elif field == 4 and isinstance(value, bytes):
+            function_id, line = _parse_line(value)
+            if function_id:
+                lines.append((function_id, line))
+    return location_id, lines
+
+
+def _backfill_start_lines(
+    functions: Mapping[int, _Function], sampled_lines: Mapping[int, int]
+) -> None:
+    """Give a function without a start_line the first line it was sampled on.
+
+    pprof-rs writes no `Function.start_line`, only each location's
+    `Line.line`, so every Rust frame had line 0: same-named functions of one
+    file merged into one frame and resolved to whichever name match sorted
+    first (issue #2877). Any line inside the body resolves by span
+    containment; the smallest keeps one frame per function. A start_line
+    the producer wrote (Go's runtime/pprof) is kept.
+    """
+    for function_id, line in sampled_lines.items():
+        function = functions.get(function_id)
+        if function is not None and function.start_line <= 0:
+            function.start_line = line
+
+
+def _first_lines(
+    records: Iterable[tuple[int, int]], into: dict[int, int] | None = None
+) -> dict[int, int]:
+    """The smallest known line of each function among `records`."""
+    lines = {} if into is None else into
+    for function_id, line in records:
+        if line > 0 and (function_id not in lines or line < lines[function_id]):
+            lines[function_id] = line
+    return lines
+
+
+def _parse_sample(payload: bytes) -> tuple[list[int], int]:
+    location_ids: list[int] = []
+    weight = 0
+    for field, wire, value in _fields(payload):
+        if field == 1:
+            location_ids.extend(_repeated_uint(wire, value))
+        elif field == 2 and not weight:
+            values = _repeated_uint(wire, value)
+            weight = values[0] if values else 0
+    return location_ids, max(weight, 1)
+
+
+def _matching_bracket(text: str, start: int) -> int:
+    """Index of the ``]`` closing the ``[`` at ``start``, or -1 if unbalanced."""
+    depth = 0
+    for index in range(start, len(text)):
+        if text[index] == "[":
+            depth += 1
+        elif text[index] == "]":
+            depth -= 1
+            if depth == 0:
+                return index
+    return -1
+
+
+def _strip_generics(tail: str) -> str:
+    """Drop ``[...]`` generic instantiations, keeping what follows them.
+
+    `(*Cache[go.shape.string]).Get` must keep `.Get`. Brackets nest in
+    shape types, so remove balanced groups rather than up to the first `]`;
+    an unbalanced group truncates the remainder.
+    """
+    while True:
+        start = tail.find("[")
+        if start < 0:
+            return tail
+        end = _matching_bracket(tail, start)
+        if end < 0:
+            return tail[:start]
+        tail = tail[:start] + tail[end + 1 :]
+
+
+def _bare_name(symbol: str) -> str:
+    """``example.com/pkg.(*Dog).Sound`` as the member name ``Sound``.
+
+    Span resolution against declaration lines carries identity; the name is
+    a tiebreak, so package paths, receivers, and generic instantiations
+    drop. Compiler-generated closure segments mark the frame anonymous.
+    """
+    tail = _strip_generics(symbol.rsplit("/", 1)[-1])
+    segments = [s for s in tail.split(".") if s and not s.startswith("(")]
+    if not segments:
+        return cs.TRACE_QUALNAME_ANONYMOUS
+    # A nested closure surfaces as `main.runAll.func1.1`; its final segment is
+    # a bare number, so test every trailing run of segments, not just the leaf.
+    if any(
+        _GO_CLOSURE_SEGMENT.fullmatch(".".join(segments[index:]))
+        for index in range(len(segments))
+    ):
+        return cs.TRACE_QUALNAME_ANONYMOUS
+    return segments[-1]
+
+
+def _decompress(
+    raw: bytes,
+    profile_path: Path,
+    *,
+    bad_template: str = cs.TRACE_ERR_BAD_PPROF,
+    too_large_template: str = cs.TRACE_ERR_PPROF_TOO_LARGE,
+) -> bytes:
+    """Gunzip a gzipped profile under a size cap (#2263).
+
+    Malformed input, and output past ``TRACE_MAX_DECOMPRESSED_BYTES``, become a
+    TraceFormatError worded by the two templates. Inflating in chunks keeps a
+    decompression bomb from ever being held whole; every gzip member is read,
+    as ``gzip.decompress`` does.
+    """
+    if raw[:2] != cs.TRACE_GZIP_MAGIC:
+        return raw
+    bad = TraceFormatError(bad_template.format(path=profile_path))
+    view = memoryview(raw)
+    out = bytearray()
+    position = 0
+    members = 0
+    try:
+        while position < len(raw):
+            if raw[position] == 0:
+                # Trailing NUL padding after the last member is accepted, as
+                # gzip does; checked once, since it ends the loop either way.
+                if raw.count(0, position) != len(raw) - position:
+                    raise bad
+                break
+            members += 1
+            if members > cs.TRACE_MAX_GZIP_MEMBERS:
+                raise bad
+            position = _inflate_member(
+                view, position, out, bad, too_large_template, profile_path
+            )
+    except zlib.error as e:
+        raise bad from e
+    return bytes(out)
+
+
+def _inflate_member(
+    view: memoryview,
+    position: int,
+    out: bytearray,
+    bad: TraceFormatError,
+    too_large_template: str,
+    profile_path: Path,
+) -> int:
+    """Inflate the gzip member at `position` into `out`; return where it ends.
+
+    Input goes in bounded slices, so each member costs the slices it spans
+    rather than a copy of everything after it.
+    """
+    limit = cs.TRACE_MAX_DECOMPRESSED_BYTES
+    inflater = zlib.decompressobj(cs.TRACE_GZIP_WBITS)
+    while not inflater.eof:
+        if position >= len(view):
+            raise bad
+        chunk = view[position : position + cs.TRACE_GZIP_INPUT_CHUNK_BYTES]
+        out += inflater.decompress(chunk, limit + 1 - len(out))
+        if len(out) > limit:
+            raise TraceFormatError(
+                too_large_template.format(path=profile_path, limit=limit)
+            )
+        # Below the cap the output limit never bound, so the slice was
+        # consumed up to the member's end; what follows it is unused.
+        position += (
+            len(chunk) - len(inflater.unconsumed_tail) - len(inflater.unused_data)
+        )
+    return position
+
+
+def _decode_profile(
+    raw: bytes,
+) -> tuple[list[str], dict[int, _Function], dict[int, list[int]], list[_Sample]]:
+    """The pprof message's string, function, location, and sample tables."""
+    strings: list[str] = []
+    functions: dict[int, _Function] = {}
+    locations: dict[int, list[int]] = {}
+    sampled_lines: dict[int, int] = {}
+    samples: list[_Sample] = []
+    for field, _wire, value in _fields(raw):
+        if not isinstance(value, bytes):
+            continue
+        if field == 2:
+            samples.append(_parse_sample(value))
+        elif field == 4:
+            location_id, lines = _parse_location(value)
+            locations[location_id] = [function_id for function_id, _line in lines]
+            _first_lines(lines, into=sampled_lines)
+        elif field == 5:
+            function_id, function = _parse_function(value)
+            functions[function_id] = function
+        elif field == 6:
+            strings.append(value.decode("utf-8", errors="replace"))
+    _backfill_start_lines(functions, sampled_lines)
+    return strings, functions, locations, samples
+
+
+def _build_frame(
+    function: _Function | None,
+    strings: list[str],
+    root_prefix: str,
+    excluded_dir: str,
+    bare_name: Callable[[str], str],
+) -> FramePoint | None:
+    """A project FramePoint for the function, or None if out of scope."""
+    if function is None or not (0 < function.filename_index < len(strings)):
+        return None
+    path = strings[function.filename_index]
+    if not path.startswith(root_prefix):
+        return None
+    if excluded_dir in path[len(root_prefix) :].split("/"):
+        return None
+    name = (
+        strings[function.name_index] if 0 < function.name_index < len(strings) else ""
+    )
+    return FramePoint(
+        path=path, qualname=bare_name(name), line=max(function.start_line, 0)
+    )
+
+
+def _accumulate_edges(
+    samples: list[_Sample],
+    locations: dict[int, list[int]],
+    resolve: Callable[[int], FramePoint | None],
+) -> dict[tuple[FramePoint, FramePoint], int]:
+    """Adjacent in-project frames across each leaf-first sampled stack.
+
+    Samples are leaf-first; walk root-first, expanding inline frames
+    outermost-first within each location.
+    """
+    edges: dict[tuple[FramePoint, FramePoint], int] = {}
+    for location_ids, weight in samples:
+        ancestor: FramePoint | None = None
+        for location_id in reversed(location_ids):
+            for function_id in reversed(locations.get(location_id, [])):
+                frame = resolve(function_id)
+                if frame is None:
+                    continue
+                if ancestor is not None:
+                    key = (ancestor, frame)
+                    edges[key] = edges.get(key, 0) + weight
+                ancestor = frame
+    return edges
+
+
+def _require_profile_content(
+    profile_path: Path, strings: Sequence[str], functions: Sized, samples: Sized
+) -> None:
+    """Refuse a profile with nothing to convert, saying why.
+
+    Every profile pprof writes has a string table; one that decoded without
+    one is not a profile. A decoded profile with no samples is a valid one
+    from a run too short to be sampled (issue #2887).
+    """
+    if not strings:
+        raise TraceFormatError(cs.TRACE_ERR_BAD_PPROF.format(path=profile_path))
+    if not samples:
+        # pprof requires the table's first string to be empty, and its own
+        # tooling rejects a profile without it: such a payload is corrupt, not
+        # a run too short to sample, and "profile longer" would mislead.
+        message = (
+            cs.TRACE_ERR_BAD_PPROF if strings[0] else cs.TRACE_ERR_PPROF_NO_SAMPLES
+        )
+        raise TraceFormatError(message.format(path=profile_path))
+    if not functions:
+        raise TraceFormatError(cs.TRACE_ERR_BAD_PPROF.format(path=profile_path))
+
+
+def convert_pprof_profile(
+    profile_path: Path,
+    repo_root: Path,
+    output: Path,
+    workload: str | None,
+    *,
+    excluded_dir: str,
+    bare_name: Callable[[str], str],
+    language: str,
+    tracer: str,
+) -> int:
+    """Decode a pprof profile and write its project call edges to ``output``.
+
+    Shared by the Go and Rust converters, which differ only in ``bare_name``
+    (symbol demangling), the out-of-scope ``excluded_dir`` and the header tags.
+    pprof profiles are sampled, so the header is always flagged ``sampled``.
+    """
+    raw = _decompress(profile_path.read_bytes(), profile_path)
+    try:
+        strings, functions, locations, samples = _decode_profile(raw)
+    except TraceFormatError as e:
+        raise TraceFormatError(cs.TRACE_ERR_BAD_PPROF.format(path=profile_path)) from e
+    _require_profile_content(profile_path, strings, functions, samples)
+
+    root_prefix = repo_root.resolve().as_posix() + "/"
+    frames: dict[int, FramePoint | None] = {}
+
+    def _frame(function_id: int) -> FramePoint | None:
+        if function_id not in frames:
+            frames[function_id] = _build_frame(
+                functions.get(function_id),
+                strings,
+                root_prefix,
+                excluded_dir,
+                bare_name,
+            )
+        return frames[function_id]
+
+    edges = _accumulate_edges(samples, locations, _frame)
+
+    workloads = (workload,) if workload else ()
+    records = [
+        CallRecord(
+            caller=caller,
+            callee=callee,
+            count=count,
+            workloads=workloads,
+            receiver_types=(),
+        )
+        for (caller, callee), count in edges.items()
+    ]
+    header = TraceHeader(
+        version=cs.TRACE_FORMAT_VERSION,
+        language=language,
+        repo_root=str(repo_root),
+        tracer=tracer,
+        sampled=True,
+    )
+    write_trace_file(output, header, records)
+    return len(records)
+
+
+def convert_pprof(
+    profile_path: Path,
+    repo_root: Path,
+    output: Path,
+    workload: str | None = None,
+) -> int:
+    """Write ``profile_path``'s project call edges to ``output``; returns count."""
+    return convert_pprof_profile(
+        profile_path,
+        repo_root,
+        output,
+        workload,
+        excluded_dir=_GO_EXCLUDED_DIR,
+        bare_name=_bare_name,
+        language=cs.TRACE_LANGUAGE_GO,
+        tracer=cs.TRACE_TOOL_NAME_PPROF,
+    )

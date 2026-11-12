@@ -1,0 +1,1012 @@
+# A Dart getter access is an attribute read, not an invocation: no CALLS
+# edge can ever land on one, so dead-code flagged every read-only getter
+# (roughly 15 of the wonderous app's ~20 residual candidates: _enableVideo,
+# _artifactRoute, startYr/endYr and kin). Mirror the C# property-read
+# design: mark getter_signature methods is_property and emit REFERENCES
+# edges for bare and receiver-position reads (issue #869).
+from __future__ import annotations
+
+from pathlib import Path
+from unittest.mock import MagicMock
+
+import pytest
+
+from codebase_rag import constants as cs
+from codebase_rag.graph_updater import GraphUpdater
+from codebase_rag.parser_loader import load_parsers
+from codebase_rag.parsers.dart import DartDirective
+
+REFERENCES = cs.RelationshipType.REFERENCES.value
+
+
+def _run(tmp_path: Path, files: dict[str, str]) -> MagicMock:
+    parsers, queries = load_parsers()
+    if "dart" not in parsers:
+        pytest.skip("dart parser not available")
+    for rel, content in files.items():
+        p = tmp_path / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content, encoding="utf-8")
+    mock = MagicMock()
+    GraphUpdater(
+        ingestor=mock, repo_path=tmp_path, parsers=parsers, queries=queries
+    ).run()
+    return mock
+
+
+def _rels(mock: MagicMock) -> set[tuple[str, str, str]]:
+    return {
+        (c.args[0][2], str(c.args[1]), c.args[2][2])
+        for c in mock.ensure_relationship_batch.call_args_list
+    }
+
+
+def _has(
+    rels: set[tuple[str, str, str]], caller_suffix: str, rel: str, callee_suffix: str
+) -> bool:
+    return any(
+        a.endswith(caller_suffix) and r == rel and b.endswith(callee_suffix)
+        for a, r, b in rels
+    )
+
+
+def test_getter_is_marked_is_property(tmp_path: Path) -> None:
+    mock = _run(
+        tmp_path,
+        {"m.dart": "class Money {\n  bool get enabled => true;\n}\n"},
+    )
+    props: dict[str, dict] = {}
+    for c in mock.ensure_node_batch.call_args_list:
+        if c.args[0] == cs.NodeLabel.METHOD:
+            props.setdefault(c.args[1][cs.KEY_QUALIFIED_NAME], {}).update(c.args[1])
+    enabled = next(v for k, v in props.items() if k.endswith("Money.enabled"))
+    assert enabled.get(cs.KEY_IS_PROPERTY) is True, enabled
+
+
+def test_bare_getter_read_is_referenced(tmp_path: Path) -> None:
+    files = {
+        "app.dart": (
+            "class Player {\n"
+            "  bool get enableVideo => true;\n"
+            "  bool get unusedFlag => false;\n"
+            "  void start() {\n"
+            "    if (enableVideo) {\n"
+            "      run();\n"
+            "    }\n"
+            "  }\n"
+            "  void run() {}\n"
+            "}\n"
+        ),
+    }
+    rels = _rels(_run(tmp_path, files))
+    assert _has(rels, ".Player.start", REFERENCES, ".Player.enableVideo"), rels
+    assert not _has(rels, ".Player.start", REFERENCES, ".Player.unusedFlag")
+
+
+def test_receiver_getter_read_is_referenced(tmp_path: Path) -> None:
+    files = {
+        "app.dart": (
+            "class Marker {\n"
+            "  int get startYr => 1900;\n"
+            "}\n"
+            "\n"
+            "class Timeline {\n"
+            "  void draw(Marker marker) {\n"
+            "    print(marker.startYr);\n"
+            "  }\n"
+            "}\n"
+        ),
+    }
+    rels = _rels(_run(tmp_path, files))
+    assert _has(rels, ".Timeline.draw", REFERENCES, ".Marker.startYr"), rels
+
+
+def test_this_qualified_getter_read_is_referenced(tmp_path: Path) -> None:
+    files = {
+        "app.dart": (
+            "class Gauge {\n"
+            "  int get level => 1;\n"
+            "  void show() {\n"
+            "    print(this.level);\n"
+            "  }\n"
+            "}\n"
+        ),
+    }
+    rels = _rels(_run(tmp_path, files))
+    assert _has(rels, ".Gauge.show", REFERENCES, ".Gauge.level"), rels
+
+
+def test_local_shadow_suppresses_bare_read(tmp_path: Path) -> None:
+    # A local (or parameter) named like the getter hides it for bare reads;
+    # emitting an edge here would fabricate liveness for a dead getter.
+    files = {
+        "app.dart": (
+            "class Cart {\n"
+            "  int get total => 3;\n"
+            "  void tally(int total) {\n"
+            "    print(total);\n"
+            "  }\n"
+            "}\n"
+        ),
+    }
+    rels = _rels(_run(tmp_path, files))
+    assert not _has(rels, ".Cart.tally", REFERENCES, ".Cart.total"), rels
+
+
+def test_cascade_getter_read_is_referenced(tmp_path: Path) -> None:
+    # `marker..startYr` reads through a cascade_section, not the ordinary
+    # selector chain; a cascade holding an argument_part is an invocation
+    # the call pass owns, and a cascade WRITE (`..endYr = 5`) targets the
+    # setter, so neither may fabricate a getter read.
+    files = {
+        "app.dart": (
+            "class Marker {\n"
+            "  int get startYr => 1900;\n"
+            "  int get endYr => 2000;\n"
+            "  void refresh() {}\n"
+            "}\n"
+            "\n"
+            "class Board {\n"
+            "  void ping(Marker marker) {\n"
+            "    marker..startYr;\n"
+            "    marker..refresh();\n"
+            "  }\n"
+            "}\n"
+        ),
+    }
+    rels = _rels(_run(tmp_path, files))
+    assert _has(rels, ".Board.ping", REFERENCES, ".Marker.startYr"), rels
+    assert not _has(rels, ".Board.ping", REFERENCES, ".Marker.refresh"), rels
+
+
+def test_closure_shadow_does_not_suppress_outer_read(tmp_path: Path) -> None:
+    # A closure's parameter named like the getter shadows it only INSIDE the
+    # closure: the enclosing method's own bare read still resolves to the
+    # getter and must be referenced, while the closure-internal read of the
+    # parameter must not be.
+    files = {
+        "app.dart": (
+            "class Cart {\n"
+            "  int get total => 3;\n"
+            "  int get untouched => 4;\n"
+            "  void tally() {\n"
+            "    run((int total) {\n"
+            "      print(total);\n"
+            "      print(untouched);\n"
+            "    });\n"
+            "    print(total);\n"
+            "  }\n"
+            "}\n"
+        ),
+    }
+    rels = _rels(_run(tmp_path, files))
+    assert _has(rels, ".Cart.tally", REFERENCES, ".Cart.total"), rels
+    assert _has(rels, ".Cart.tally", REFERENCES, ".Cart.untouched"), rels
+
+
+def test_loop_catch_and_pattern_binders_shadow_bare_reads(tmp_path: Path) -> None:
+    # A loop variable, catch parameter, or pattern binding reusing a getter
+    # name declares a local like any other: reads of it must not fabricate
+    # liveness for the (otherwise unused) getter.
+    files = {
+        "app.dart": (
+            "class Bag {\n"
+            "  int get total => 1;\n"
+            "  int get errorCode => 2;\n"
+            "  int get alpha => 3;\n"
+            "  void churn(List<int> xs) {\n"
+            "    for (final total in xs) {\n"
+            "      print(total);\n"
+            "    }\n"
+            "    try {\n"
+            "      print(xs);\n"
+            "    } catch (errorCode) {\n"
+            "      print(errorCode);\n"
+            "    }\n"
+            "    var (alpha, beta) = (1, 2);\n"
+            "    print(alpha);\n"
+            "    print(beta);\n"
+            "  }\n"
+            "}\n"
+        ),
+    }
+    rels = _rels(_run(tmp_path, files))
+    assert not _has(rels, ".Bag.churn", REFERENCES, ".Bag.total"), rels
+    assert not _has(rels, ".Bag.churn", REFERENCES, ".Bag.errorCode"), rels
+    assert not _has(rels, ".Bag.churn", REFERENCES, ".Bag.alpha"), rels
+
+
+def test_reads_before_the_binder_still_reference_the_getter(tmp_path: Path) -> None:
+    # A binder is live only AFTER its declaration: the for-in ITERABLE and
+    # the try BODY precede theirs, so a getter read there is genuine and
+    # must not be suppressed by the statement-wide shadow.
+    files = {
+        "app.dart": (
+            "class Scanner {\n"
+            "  int get total => 1;\n"
+            "  int get errorCode => 2;\n"
+            "  void scan() {\n"
+            "    for (final total in [total]) {\n"
+            "      print(total);\n"
+            "    }\n"
+            "    try {\n"
+            "      print(errorCode);\n"
+            "    } catch (errorCode) {\n"
+            "      print(errorCode);\n"
+            "    }\n"
+            "  }\n"
+            "}\n"
+        ),
+    }
+    rels = _rels(_run(tmp_path, files))
+    assert _has(rels, ".Scanner.scan", REFERENCES, ".Scanner.total"), rels
+    assert _has(rels, ".Scanner.scan", REFERENCES, ".Scanner.errorCode"), rels
+
+
+def test_call_result_cascade_read_is_referenced(tmp_path: Path) -> None:
+    # `getMarker()..startYr` reads the getter through a call-result cascade:
+    # the receiver chain carries a call hop the resolver types from the
+    # callee's declared return type.
+    files = {
+        "app.dart": (
+            "class Marker {\n"
+            "  int get startYr => 1900;\n"
+            "}\n"
+            "\n"
+            "class Board {\n"
+            "  Marker getMarker() {\n"
+            "    return Marker();\n"
+            "  }\n"
+            "  void ping() {\n"
+            "    getMarker()..startYr;\n"
+            "  }\n"
+            "}\n"
+        ),
+    }
+    rels = _rels(_run(tmp_path, files))
+    assert _has(rels, ".Board.ping", REFERENCES, ".Marker.startYr"), rels
+
+
+def test_field_initializer_getter_read_is_referenced(tmp_path: Path) -> None:
+    # A class FIELD INITIALIZER reads getters outside any method body
+    # (wonderous: `late final TextStyle body = _createFont(contentFont, ...)`),
+    # so neither a method caller's walk nor the module pass (which skipped
+    # class subtrees) saw it, and the getter reported dead.
+    files = {
+        "app.dart": (
+            "int wrap(int v) {\n"
+            "  return v;\n"
+            "}\n"
+            "\n"
+            "class Palette {\n"
+            "  int get base => 3;\n"
+            "  int get factor => 2;\n"
+            "  int get unusedTone => 9;\n"
+            "  late final int wrapped = wrap(base);\n"
+            "  late final int scaled = factor * 2;\n"
+            "}\n"
+        ),
+    }
+    rels = _rels(_run(tmp_path, files))
+    assert any(r == REFERENCES and b.endswith(".Palette.base") for _a, r, b in rels), (
+        rels
+    )
+    assert any(
+        r == REFERENCES and b.endswith(".Palette.factor") for _a, r, b in rels
+    ), rels
+    assert not any(
+        r == REFERENCES and b.endswith(".Palette.unusedTone") for _a, r, b in rels
+    ), rels
+
+
+def test_field_initializers_resolve_against_the_owning_class(tmp_path: Path) -> None:
+    # Two classes can define the same getter name: each field initializer
+    # must resolve against ITS OWN class, and one class's read must not
+    # dedup away the other's.
+    files = {
+        "app.dart": (
+            "int wrap(int v) {\n"
+            "  return v;\n"
+            "}\n"
+            "\n"
+            "class Alpha {\n"
+            "  int get tone => 1;\n"
+            "  late final int a = wrap(tone);\n"
+            "}\n"
+            "\n"
+            "class Beta {\n"
+            "  int get tone => 2;\n"
+            "  late final int b = wrap(tone);\n"
+            "}\n"
+        ),
+    }
+    rels = _rels(_run(tmp_path, files))
+    assert any(r == REFERENCES and b.endswith("Alpha.tone") for _a, r, b in rels), rels
+    assert any(r == REFERENCES and b.endswith("Beta.tone") for _a, r, b in rels), rels
+
+
+def test_initializer_closure_read_is_referenced(tmp_path: Path) -> None:
+    # A closure INSIDE a field initializer belongs to no method pass: its
+    # body must still be walked or the getter it reads reports dead.
+    files = {
+        "app.dart": (
+            "class Deck {\n"
+            "  int get tone => 1;\n"
+            "  late final int Function() pick = () {\n"
+            "    return tone;\n"
+            "  };\n"
+            "}\n"
+        ),
+    }
+    rels = _rels(_run(tmp_path, files))
+    assert any(r == REFERENCES and b.endswith("Deck.tone") for _a, r, b in rels), rels
+
+
+def test_getter_call_chain_is_not_double_counted(tmp_path: Path) -> None:
+    # `other.total()` is an invocation the call pass already resolves; the
+    # read pass must not add a REFERENCES edge for the same chain, or every
+    # method call would double as a phantom property read.
+    files = {
+        "app.dart": (
+            "class Engine {\n"
+            "  void ignite() {}\n"
+            "  void fire(Engine other) {\n"
+            "    other.ignite();\n"
+            "  }\n"
+            "}\n"
+        ),
+    }
+    rels = _rels(_run(tmp_path, files))
+    assert not _has(rels, ".Engine.fire", REFERENCES, ".Engine.ignite"), rels
+
+
+def test_method_parameter_does_not_shadow_initializer_read(tmp_path: Path) -> None:
+    # A method parameter named like the getter scopes to ITS method body,
+    # which the initializer walk never enters: it must not suppress a field
+    # initializer's read of the getter.
+    files = {
+        "app.dart": (
+            "class Widgeta {\n"
+            "  int get tone => 1;\n"
+            "  late final int value = tone;\n"
+            "  void resize(int tone) {\n"
+            "    print(tone);\n"
+            "  }\n"
+            "}\n"
+        ),
+    }
+    rels = _rels(_run(tmp_path, files))
+    assert any(r == REFERENCES and b.endswith("Widgeta.tone") for _a, r, b in rels), (
+        rels
+    )
+
+
+def test_receiver_position_getter_read_is_referenced(tmp_path: Path) -> None:
+    # `_wonders.length` reads the `_wonders` getter even though the FINAL
+    # member (`length`) is external: the chain head in receiver position is
+    # a read (issue #873, wonderous `_HomeScreenState._wonders`).
+    files = {
+        "app.dart": (
+            "class Screen {\n"
+            "  List<int> get _wonders => [1, 2];\n"
+            "  int get _numWonders => _wonders.length;\n"
+            "}\n"
+        ),
+    }
+    rels = _rels(_run(tmp_path, files))
+    assert _has(rels, ".Screen._numWonders", REFERENCES, ".Screen._wonders"), rels
+
+
+def test_receiver_position_read_shadowed_by_local(tmp_path: Path) -> None:
+    # A local named like the getter owns the receiver position inside its
+    # scope: no read of the getter may be fabricated.
+    files = {
+        "app.dart": (
+            "class Screen {\n"
+            "  List<int> get _wonders => [1, 2];\n"
+            "  int count() {\n"
+            "    final _wonders = <int>[3];\n"
+            "    return _wonders.length;\n"
+            "  }\n"
+            "}\n"
+        ),
+    }
+    rels = _rels(_run(tmp_path, files))
+    assert not _has(rels, ".Screen.count", REFERENCES, ".Screen._wonders"), rels
+
+
+def test_cascade_receiver_getter_read_is_referenced(tmp_path: Path) -> None:
+    # `_wonders..add(3)` reads the `_wonders` getter to obtain the cascade
+    # receiver; the cascaded call itself belongs to the call pass.
+    files = {
+        "app.dart": (
+            "class Screen {\n"
+            "  List<int> get _wonders => [1, 2];\n"
+            "  void fill() {\n"
+            "    _wonders..add(3);\n"
+            "  }\n"
+            "}\n"
+        ),
+    }
+    rels = _rels(_run(tmp_path, files))
+    assert _has(rels, ".Screen.fill", REFERENCES, ".Screen._wonders"), rels
+
+
+def test_invoked_chain_head_is_not_a_property_read(tmp_path: Path) -> None:
+    # `_wonders(3)` on a getter returning a callable is an invocation the
+    # call pass owns (it emits the CALLS edge that keeps the getter alive):
+    # a head followed directly by an argument_part must stay out of the
+    # read pass or every such site would double as a phantom read.
+    files = {
+        "app.dart": (
+            "class Screen {\n"
+            "  int Function(int) get _wonders => (n) => n;\n"
+            "  void fill() {\n"
+            "    _wonders(3);\n"
+            "  }\n"
+            "}\n"
+        ),
+    }
+    rels = _rels(_run(tmp_path, files))
+    assert not _has(rels, ".Screen.fill", REFERENCES, ".Screen._wonders"), rels
+    assert _has(rels, ".Screen.fill", "CALLS", ".Screen._wonders"), rels
+
+
+def test_construction_receiver_getter_read_is_referenced(tmp_path: Path) -> None:
+    # A member read on a construction receiver names the member on the
+    # constructed class, for the `new` and type-argument forms as well as
+    # the bare one (issue #2015). The call pass already types the same
+    # receiver, which is why `Box<int>(1).describe()` binds; the read pass
+    # lost the `new` form to an unhandled new_expression base and the
+    # generic form to a `<`/`>` relational mis-parse.
+    files = {
+        "app.dart": (
+            "class Box<T> {\n"
+            "  Box(T v);\n"
+            "  int get height => 2;\n"
+            "  String describe() => 'b';\n"
+            "}\n"
+            "int bareGet() { return Box(1).height; }\n"
+            "int newGet() { return new Box(1).height; }\n"
+            "int genGet() { return Box<int>(1).height; }\n"
+            "void chained() { Box<int>(1).describe(); }\n"
+        ),
+    }
+    rels = _rels(_run(tmp_path, files))
+    # Control: the bare form and the generic CALL already bind on main.
+    assert _has(rels, ".app.bareGet", REFERENCES, ".Box.height"), rels
+    assert _has(rels, ".app.chained", "CALLS", ".Box.describe"), rels
+    assert _has(rels, ".app.newGet", REFERENCES, ".Box.height"), rels
+    assert _has(rels, ".app.genGet", REFERENCES, ".Box.height"), rels
+
+
+def test_real_comparison_is_not_read_as_a_construction(tmp_path: Path) -> None:
+    # `X<int>(1).m` and the chained comparison `a < b > (1).m` parse
+    # identically, so the construction reading is a guess (issue #2015).
+    # Both operator orders are covered, and `flipped`/`same` deliberately
+    # use a LOCAL NAMED AFTER THE CLASS: that is the only shape in which a
+    # fabricated receiver resolves, so a weaker fixture would pass either
+    # way. A local or parameter of that name means the operand is that
+    # variable, not a type, so no member may bind.
+    files = {
+        "app.dart": (
+            "class Box {\n"
+            "  int get height => 2;\n"
+            "  int get width => 3;\n"
+            "}\n"
+            "dynamic same(dynamic Box, dynamic b) {\n"
+            "  return Box < b > (1).height;\n"
+            "}\n"
+            "dynamic flipped(dynamic Box, dynamic b) {\n"
+            "  return Box > b < (1).height;\n"
+            "}\n"
+            "bool nested(int a, int b, Box lo) {\n"
+            "  return (a < b).hashCode > lo.width;\n"
+            "}\n"
+        ),
+    }
+    rels = _rels(_run(tmp_path, files))
+    # The genuine receiver read still binds...
+    assert _has(rels, ".app.nested", REFERENCES, ".Box.width"), rels
+    # ...and neither comparison invents a construction receiver.
+    assert not _has(rels, ".app.same", REFERENCES, ".Box.height"), rels
+    assert not _has(rels, ".app.flipped", REFERENCES, ".Box.height"), rels
+
+
+def test_const_construction_receiver_read_is_referenced(tmp_path: Path) -> None:
+    # `const X(1).m` is a const_object_expression, a DIFFERENT node type
+    # from `new X(1).m`'s new_expression (issue #2015); both carry the class
+    # as their first type_identifier.
+    files = {
+        "app.dart": (
+            "class Box {\n"
+            "  const Box(int v);\n"
+            "  int get height => 2;\n"
+            "}\n"
+            "int constGet() { return const Box(1).height; }\n"
+        ),
+    }
+    rels = _rels(_run(tmp_path, files))
+    assert _has(rels, ".app.constGet", REFERENCES, ".Box.height"), rels
+
+
+def test_import_prefixed_construction_receiver_keeps_the_class_hop(
+    tmp_path: Path,
+) -> None:
+    # An import-prefixed construction (`p.Box<int>(1).height`,
+    # `new p.Box(1).height`) must name the member on the CLASS, not on the
+    # prefix (issue #2033). Both shapes put the prefix where the unprefixed
+    # ones put the class: `new p.Box(1)` is type_identifier(p) +
+    # identifier(Box), and the mis-parsed generic's left spine leads with
+    # the prefix identifier and carries `.Box` as a selector.
+    files = {
+        "lib.dart": ("class Box<T> {\n  Box(T v);\n  int get height => 2;\n}\n"),
+        "app.dart": (
+            "import 'lib.dart' as p;\n"
+            "int genGet() { return p.Box<int>(1).height; }\n"
+            "int newGet() { return new p.Box(1).height; }\n"
+            "int bareGet() { return p.Box(1).height; }\n"
+        ),
+    }
+    rels = _rels(_run(tmp_path, files))
+    # Control: the bare prefixed form already keeps its class hop on main.
+    assert _has(rels, ".app.bareGet", REFERENCES, ".Box.height"), rels
+    assert _has(rels, ".app.genGet", REFERENCES, ".Box.height"), rels
+    assert _has(rels, ".app.newGet", REFERENCES, ".Box.height"), rels
+
+
+def test_an_import_alias_does_not_displace_another_import(tmp_path: Path) -> None:
+    # Registering the `as` prefix (issue #2033) must not overwrite a key an
+    # earlier import already owns. `import 'helper.dart';` keys on the file
+    # name, and `import 'other.dart' as helper;` claims the same string, so
+    # writing the alias unconditionally dropped the FIRST import entirely:
+    # both IMPORTS edges pointed at other.dart and helper.dart was lost.
+    files = {
+        "helper.dart": "class H {\n  int get v => 1;\n}\n",
+        "other.dart": "class O {\n  int get v => 2;\n}\n",
+        "app.dart": (
+            "import 'helper.dart';\n"
+            "import 'other.dart' as helper;\n"
+            "int f() { return H().v; }\n"
+        ),
+    }
+    rels = _rels(_run(tmp_path, files))
+    imports = {b for a, r, b in rels if r == "IMPORTS" and a.endswith(".app")}
+    assert any(q.endswith(".helper") for q in imports), imports
+    assert any(q.endswith(".other") for q in imports), imports
+
+
+def test_a_shadowed_prefix_is_not_read_as_a_construction(tmp_path: Path) -> None:
+    # The shadow check that stops a comparison being read as a construction
+    # (issue #2015) keys on the BARE binder, but an import-prefixed base is
+    # dotted (`p.Box`, issue #2033). A parameter named `p` must still make
+    # `p.Box < b > (1).height` a comparison; looking the dotted name up in
+    # the shadow spans would never match and the wrong edge would return.
+    files = {
+        "lib.dart": "class Box {\n  int get height => 2;\n}\n",
+        "app.dart": (
+            "import 'lib.dart' as p;\n"
+            "dynamic cmp(dynamic p, dynamic b) {\n"
+            "  return p.Box < b > (1).height;\n"
+            "}\n"
+        ),
+    }
+    rels = _rels(_run(tmp_path, files))
+    assert not _has(rels, ".app.cmp", REFERENCES, ".Box.height"), rels
+
+
+def test_a_prefixed_factory_function_types_the_chain_by_its_return(
+    tmp_path: Path,
+) -> None:
+    # A hop after an import prefix need not be a constructor: `p.make()` is a
+    # FUNCTION, so the fold types the chain from its recorded return type
+    # instead of treating `make` as a class (issue #2033). This is the
+    # positive case for that branch -- the factory guard test asserts only an
+    # absence, which a fold-nothing implementation would also satisfy.
+    files = {
+        "lib.dart": (
+            "class Thing {\n  int get v => 1;\n}\n\nThing make() { return Thing(); }\n"
+        ),
+        "app.dart": ("import 'lib.dart' as p;\nint f() { return p.make().v; }\n"),
+    }
+    rels = _rels(_run(tmp_path, files))
+    assert _has(rels, ".app.f", "CALLS", ".lib.make"), rels
+    assert _has(rels, ".app.f", REFERENCES, ".Thing.v"), rels
+
+
+def test_a_named_constructor_is_not_part_of_the_receiver_type(
+    tmp_path: Path,
+) -> None:
+    # `new Box.named(1)` constructs a Box, so the read binds Box.height. The
+    # grammar separates the shapes by node type -- an import prefix is a
+    # type_identifier, a named constructor an identifier -- and joining both
+    # made the receiver type `Box.named`, which resolves to nothing
+    # (issue #2033). The prefixed form keeps its prefix.
+    files = {
+        "lib.dart": (
+            "class Box {\n"
+            "  final int v;\n"
+            "  const Box(this.v);\n"
+            # `const Box.named(1)` below needs a CONST constructor; a plain
+            # one makes that a compile-time error, so the fixture would be
+            # invalid Dart and the test could pass on a parse failure rather
+            # than on resolution (CodeRabbit, PR #2040).
+            "  const Box.named(this.v);\n"
+            "  int get height => 2;\n"
+            "}\n"
+        ),
+        "app.dart": (
+            "import 'lib.dart';\n"
+            "import 'lib.dart' as p;\n"
+            "int named() { return new Box.named(1).height; }\n"
+            "int constNamed() { return const Box.named(1).height; }\n"
+            "int prefixedNamed() { return new p.Box.named(1).height; }\n"
+        ),
+    }
+    rels = _rels(_run(tmp_path, files))
+    assert _has(rels, ".app.named", REFERENCES, ".Box.height"), rels
+    assert _has(rels, ".app.constNamed", REFERENCES, ".Box.height"), rels
+    assert _has(rels, ".app.prefixedNamed", REFERENCES, ".Box.height"), rels
+
+
+def test_a_local_shadowing_an_import_prefix_is_not_folded(tmp_path: Path) -> None:
+    # A parameter named after the import prefix SHADOWS it, so
+    # `p.Box(1).height` reads a member of that parameter, not of the imported
+    # class, and must emit no edge (issue #2033). Folding unconditionally
+    # resolved it through `import ... as p` and invented an edge where the
+    # resolver had emitted none.
+    #
+    # The untyped case is covered by
+    # test_an_untyped_local_shadowing_an_import_prefix_is_not_folded below.
+    #
+    # Separately, the bare `p.Box.named(1).height` spelling (no `new`) has
+    # never resolved on any branch; filed as #2084.
+    files = {
+        "lib.dart": "class Box {\n  Box(int v);\n  int get height => 2;\n}\n",
+        "app.dart": (
+            "import 'lib.dart' as p;\n"
+            "int shadowed(dynamic p) { return p.Box(1).height; }\n"
+            "int unshadowed() { return p.Box(1).height; }\n"
+        ),
+    }
+    rels = _rels(_run(tmp_path, files))
+    assert not _has(rels, ".app.shadowed", REFERENCES, ".Box.height"), rels
+    # Control: the unshadowed prefix still resolves, so the guard is not
+    # simply switching the fold off.
+    assert _has(rels, ".app.unshadowed", REFERENCES, ".Box.height"), rels
+
+
+def test_a_pattern_binding_shadowing_an_import_prefix_is_not_folded(
+    tmp_path: Path,
+) -> None:
+    # `var (p, q) = (1, 2)` binds `p` as surely as `var p = 1` does, and
+    # carries no inferable type either, so neither the span guard nor the
+    # older local_var_types guard sees it unless the span walk descends into
+    # the pattern subtree. It did not, so this shape reproduced the exact
+    # false CALLS/INSTANTIATES/REFERENCES edges the guard exists to stop
+    # (local review P1 on the first cut of this fix).
+    files = {
+        "lib.dart": "class Box {\n  Box(int v);\n  int get height => 2;\n}\n",
+        "app.dart": (
+            "import 'lib.dart' as p;\n"
+            "int pat() { var (p, q) = (1, 2); return p.Box(1).height; }\n"
+            "int clean() { return p.Box(1).height; }\n"
+        ),
+    }
+    rels = _rels(_run(tmp_path, files))
+    assert not _has(rels, ".app.pat", REFERENCES, ".Box.height"), rels
+    # Control: the same prefix in a function with no pattern still folds.
+    assert _has(rels, ".app.clean", REFERENCES, ".Box.height"), rels
+    # NOT asserted: the CALLS/INSTANTIATES pair. Measured at this commit's
+    # parent, `p.Box(1)` under ANY shadow shape -- including the typed
+    # parameter the older guard does catch for reads -- still emits
+    # `CALLS lib.Box.Box` and `INSTANTIATES lib.Box`, because the call path
+    # resolves through `_try_resolve_via_import` rather than the chain fold
+    # this guard sits in. Pre-existing and shape-independent, so it is a
+    # separate defect, not part of this fix.
+
+
+def test_a_parameter_shadow_does_not_reach_past_its_own_body(
+    tmp_path: Path,
+) -> None:
+    # A parameter lives in the SIGNATURE, a sibling of the body, so walking
+    # up for a block ancestor finds none. Falling through to the file root
+    # made one function's parameter shadow the whole module -- measured, it
+    # swallowed an unrelated read 45 bytes later.
+    #
+    # The binder must be the PARAMETER itself -- a `var p = ...` local has a
+    # block ancestor and never reaches the signature branch, so a fixture
+    # using one tests nothing here (measured: it stays green with the rule
+    # deleted).
+    #
+    # It must also be UNANNOTATED. A typed parameter is caught upstream by
+    # local_var_types, which hides any difference; `int first(p)` is not,
+    # so the span path is the only thing suppressing it. With the rule
+    # removed a parameter records NO span at all and `first` leaks
+    # REFERENCES to Box.height.
+    files = {
+        "lib.dart": "class Box {\n  Box(int v);\n  int get height => 2;\n}\n",
+        "app.dart": (
+            "import 'lib.dart' as p;\n"
+            "int first(p) { return p.Box(1).height; }\n"
+            "int second() { return p.Box(1).height; }\n"
+        ),
+    }
+    rels = _rels(_run(tmp_path, files))
+    assert not _has(rels, ".app.first", REFERENCES, ".Box.height"), rels
+    assert _has(rels, ".app.second", REFERENCES, ".Box.height"), rels
+
+
+def test_an_untyped_local_shadowing_an_import_prefix_is_not_folded(
+    tmp_path: Path,
+) -> None:
+    # `var p = 1` shadows the prefix exactly as a typed parameter does, but
+    # it carries no inferable type, so it never reaches `local_var_types` --
+    # instrumented and measured empty at the fold. Checking the type map
+    # therefore cannot see this shadow at all, and the fold resolved
+    # `p.Box(1).height` through `import ... as p`, inventing REFERENCES and
+    # CALLS edges to the imported class (issue #2033, Greptile P1 on #2040).
+    #
+    # The binding is syntactic, so the import processor records the span the
+    # name is bound in and the fold checks the call site against it. No type
+    # inference is involved on either side.
+    files = {
+        "lib.dart": "class Box {\n  Box(int v);\n  int get height => 2;\n}\n",
+        "app.dart": (
+            "import 'lib.dart' as p;\n"
+            "int untyped() { var p = 1; return p.Box(1).height; }\n"
+            "int scoped() {\n"
+            "  { var p = 1; }\n"
+            "  return p.Box(1).height;\n"
+            "}\n"
+            "int unshadowed() { return p.Box(1).height; }\n"
+        ),
+    }
+    rels = _rels(_run(tmp_path, files))
+    assert not _has(rels, ".app.untyped", REFERENCES, ".Box.height"), rels
+    # The shadow is SCOPED: a binding in an inner block does not reach a read
+    # after that block, so `scoped` still folds. Without this the guard could
+    # pass by suppressing the fold for the whole module.
+    assert _has(rels, ".app.scoped", REFERENCES, ".Box.height"), rels
+    # Control: an unshadowed prefix in the same file still resolves.
+    assert _has(rels, ".app.unshadowed", REFERENCES, ".Box.height"), rels
+
+
+def test_an_explicit_alias_beats_a_colliding_filename_key(tmp_path: Path) -> None:
+    """An `as` prefix is the name the SOURCE binds, so it owns that key.
+
+    The file-derived key (`helper` for `helper.dart`) never appears in the
+    source; it exists so an UNPREFIXED import of that file resolves. When a
+    later import aliases a different library to the same name, Dart binds
+    the alias, so `helper.Box` is other.dart's `Box`. Registering the alias
+    only where the key was free dropped it silently and resolved the read
+    against the wrong library (Greptile, PR #2040).
+    """
+    files = {
+        "helper.dart": "class Box {\n  Box(int v);\n  int get height => 1;\n}\n",
+        "other.dart": "class Box {\n  Box(int v);\n  int get width => 2;\n}\n",
+        "app.dart": (
+            "import 'helper.dart';\n"
+            "import 'other.dart' as helper;\n"
+            "int aliased() { return helper.Box(1).width; }\n"
+        ),
+    }
+    rels = _rels(_run(tmp_path, files))
+
+    assert _has(rels, ".app.aliased", REFERENCES, ".other.Box.width"), rels
+    assert not _has(rels, ".app.aliased", REFERENCES, ".helper.Box.height"), rels
+
+
+def test_a_reparse_drops_the_dart_prefix_state(tmp_path: Path) -> None:
+    """`_clear_module_import_state` must carry nothing the file no longer says.
+
+    Both Dart prefix maps are written only when the file HAS prefixed
+    imports, so removing the last one left the previous parse's entries in
+    place: a stale alias kept resolving a name the file no longer binds
+    (Copilot, PR #2040).
+    """
+    from codebase_rag.parsers.import_processor import ImportProcessor
+    from codebase_rag.parsers.js_ts.reexports import JsExport
+
+    class _Probe(ImportProcessor):  # __slots__ forbids stubbing on instances
+        def _retract_import_sites(self, module_qn: str) -> None:
+            return None
+
+    processor = object.__new__(_Probe)
+    processor.import_mapping = {"m": {"p": "m.lib"}}
+    processor.dart_prefix_shadows = {"m": {"p": [(0, 1)]}}
+    processor.dart_import_aliases = {"m": {"p": ["m.lib"]}}
+    processor.dart_bare_imports = {"m": [DartDirective("m.lib", ())]}
+    processor.dart_exports = {"m": [DartDirective("m.lib", ())]}
+    # `m`'s `part` directives wrote the first link; another library's part
+    # keeps its own.
+    processor.dart_part_of = {"m.model": "m", "m": "other"}
+    # An `export` / `part` the file no longer has must stop exposing its
+    # target to importers too (issue #2482).
+    processor.dart_exposed_libraries = {"m": ["m.lib"]}
+    processor._cpp_shadowed_include_targets = set()
+    processor._cpp_declaration_mappings = set()
+    processor.csharp_static_imports = {}
+    processor.csharp_global_static_imports = {}
+    processor._scala_imports = {}
+    processor._scala_block_imports = {}
+    processor.java_static_imports = {}
+    # A module's export table, CommonJS publications included, is the whole
+    # API the re-export walk follows: a re-parse must not keep a stale one.
+    processor.js_export_bindings = {"m": {"Svc": JsExport("m.svc.Svc", local=False)}}
+    processor._julia_scope_map_keys = {"m": {"m.Inner"}}
+    processor._js_side_effect_imports = {}
+
+    processor._clear_module_import_state("m")
+
+    assert "m" not in processor.js_export_bindings
+    assert processor.dart_prefix_shadows.get("m") is None
+    assert processor.dart_import_aliases.get("m") is None
+    assert processor.dart_bare_imports.get("m") is None
+    assert processor.dart_exports.get("m") is None
+    assert processor.dart_part_of == {"m": "other"}
+    assert processor.dart_exposed_libraries.get("m") is None
+    assert processor._julia_scope_map_keys.get("m") is None
+    # The control: the mapping it sits beside is emptied, not dropped, so
+    # this is the documented reset rather than a wholesale delete.
+    assert processor.import_mapping["m"] == {}
+
+
+def test_a_prefixed_factory_types_the_chain_in_its_own_module(tmp_path: Path) -> None:
+    # The recorded return type is a BARE name. Resolved in the CALLER, where
+    # an unprefixed import brings another `Thing` into scope, the chain bound
+    # `alt.Thing.v`; the factory's own module names `lib.Thing`
+    # (Copilot, PR #2040). The decoy must sort BEFORE `lib`: named
+    # `other.dart` the suffix lookup reached `lib.Thing` first by luck and
+    # the test passed on the unfixed code.
+    files = {
+        "lib.dart": (
+            "class Thing {\n  int get v => 1;\n}\n\nThing make() { return Thing(); }\n"
+        ),
+        "alt.dart": "class Thing {\n  int get v => 2;\n}\n",
+        "app.dart": (
+            "import 'lib.dart' as p;\nimport 'alt.dart';\n"
+            "int f() { return p.make().v; }\n"
+        ),
+    }
+    rels = _rels(_run(tmp_path, files))
+    assert _has(rels, ".app.f", REFERENCES, ".lib.Thing.v"), rels
+    assert not _has(rels, ".app.f", REFERENCES, ".alt.Thing.v"), rels
+
+
+def test_libraries_sharing_a_prefix_are_all_searched(tmp_path: Path) -> None:
+    # Dart lets several imports share one prefix, and `p.Box` names the one
+    # library that defines `Box`. Keeping only the LAST import under `p`
+    # searched `b.dart`, which has no `Box`, and the fold gave up
+    # (CodeRabbit, PR #2040).
+    files = {
+        "a.dart": "class Box<T> {\n  Box(T v);\n  int get height => 2;\n}\n",
+        "b.dart": "class Other {\n  int get height => 3;\n}\n",
+        "app.dart": (
+            "import 'a.dart' as p;\nimport 'b.dart' as p;\n"
+            "int genGet() { return p.Box<int>(1).height; }\n"
+        ),
+    }
+    rels = _rels(_run(tmp_path, files))
+    assert _has(rels, ".app.genGet", REFERENCES, ".a.Box.height"), rels
+
+
+def test_a_name_both_prefixed_libraries_define_is_not_guessed(tmp_path: Path) -> None:
+    # The same name in two libraries under one prefix is an ambiguous import
+    # in Dart; the fold binds neither rather than picking one.
+    files = {
+        "a.dart": "class Box<T> {\n  Box(T v);\n  int get height => 2;\n}\n",
+        "b.dart": "class Box<T> {\n  Box(T v);\n  int get height => 3;\n}\n",
+        "app.dart": (
+            "import 'a.dart' as p;\nimport 'b.dart' as p;\n"
+            "int genGet() { return p.Box<int>(1).height; }\n"
+        ),
+    }
+    rels = _rels(_run(tmp_path, files))
+    assert not _has(rels, ".app.genGet", REFERENCES, ".b.Box.height"), rels
+    assert not _has(rels, ".app.genGet", REFERENCES, ".a.Box.height"), rels
+
+
+_NAMED_BOX = (
+    "class Box {\n  Box(int v);\n  Box.named(int v);\n  int get height => 2;\n}\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("header", "call"),
+    [
+        ("import 'lib.dart' as p;\n", "p.Box.named(1).height"),
+        ("import 'lib.dart';\n", "Box.named(1).height"),
+    ],
+)
+def test_a_named_constructor_without_new_types_by_its_class(
+    tmp_path: Path, header: str, call: str
+) -> None:
+    """The bare named-constructor form, prefixed or not, has no construction
+    node: it is an identifier and flat selectors (#2084)."""
+    files = {
+        "lib.dart": _NAMED_BOX,
+        "app.dart": f"{header}int bareNamed() {{ return {call}; }}\n",
+    }
+    rels = _rels(_run(tmp_path, files))
+    assert _has(rels, ".app.bareNamed", REFERENCES, ".Box.height"), rels
+
+
+def test_a_same_module_static_field_chain_is_not_a_construction(
+    tmp_path: Path,
+) -> None:
+    """`Foo.bar.baz()` reads the static field `bar`, so it never binds
+    `Foo.baz`: the #2084 rejoin applies to import prefixes only."""
+    files = {
+        "app.dart": (
+            "class Other { int baz() => 1; }\n"
+            "class Foo {\n  static Other bar = Other();\n  int baz() => 2;\n}\n"
+            "int use() { return Foo.bar.baz(); }\n"
+        ),
+    }
+    rels = _rels(_run(tmp_path, files))
+    assert not any(
+        str(src).endswith(".app.use") and str(dst).endswith(".Foo.baz")
+        for src, _rel, dst in rels
+    ), rels
+
+
+_PLAIN_BOX = "class Box {\n  Box(int v);\n  int get height => 2;\n}\n"
+
+
+@pytest.mark.parametrize(
+    "shadow",
+    [
+        "int shadowed(dynamic p) { return p.Box(1).height; }\n",
+        "int shadowed() { var p = 1; return p.Box(1).height; }\n",
+        "int shadowed() { var (p, q) = (1, 2); return p.Box(1).height; }\n",
+    ],
+)
+def test_a_shadowed_prefix_emits_no_call_through_the_import(
+    tmp_path: Path, shadow: str
+) -> None:
+    """`p` bound at the site is a value, so `p.Box(1)` is a call on it, not
+    a construction of the imported `Box`: no CALLS, INSTANTIATES or
+    REFERENCES through the import (#2088)."""
+    files = {
+        "lib.dart": _PLAIN_BOX,
+        "app.dart": f"import 'lib.dart' as p;\n{shadow}",
+    }
+    rels = _rels(_run(tmp_path, files))
+    leaked = {
+        (rel, dst)
+        for src, rel, dst in rels
+        if src.endswith(".app.shadowed") and ".lib.Box" in dst
+    }
+    assert leaked == set(), leaked
+
+
+def test_the_unshadowed_prefix_still_constructs(tmp_path: Path) -> None:
+    """The control: the same call with no shadow keeps its edges."""
+    files = {
+        "lib.dart": _PLAIN_BOX,
+        "app.dart": (
+            "import 'lib.dart' as p;\nint plain() { return p.Box(1).height; }\n"
+        ),
+    }
+    rels = _rels(_run(tmp_path, files))
+    assert _has(rels, ".app.plain", "CALLS", ".Box.Box"), rels
+    assert _has(rels, ".app.plain", "INSTANTIATES", ".lib.Box"), rels
+
+
+def test_a_typed_shadow_resolves_through_its_type(tmp_path: Path) -> None:
+    """A shadow with a real type is a receiver like any other: `p.Box(1)`
+    on a `Pad p` calls `Pad.Box`, not the imported class (#2088)."""
+    files = {
+        "lib.dart": _PLAIN_BOX,
+        "pad.dart": "class Pad {\n  int Box(int v) => v;\n}\n",
+        "app.dart": (
+            "import 'lib.dart' as p;\nimport 'pad.dart';\n"
+            "int typed(Pad p) { return p.Box(1); }\n"
+        ),
+    }
+    rels = _rels(_run(tmp_path, files))
+    assert _has(rels, ".app.typed", "CALLS", ".Pad.Box"), rels
+    assert not any(
+        src.endswith(".app.typed") and ".lib.Box" in dst for src, _r, dst in rels
+    ), rels

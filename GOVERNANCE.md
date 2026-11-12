@@ -1,0 +1,43 @@
+# Governance
+
+This document describes how the code-graph-rag project is governed: how decisions are made, who holds which roles, and how the project continues if a key person becomes unavailable.
+
+## Governance Model
+
+code-graph-rag uses a maintainer-led governance model. A single lead maintainer holds final decision-making authority over the project's direction, code, and releases. All decisions are made in the open through GitHub issues and pull requests, and anyone is welcome to participate in those discussions.
+
+## Roles and Responsibilities
+
+### Lead Maintainer
+
+The lead maintainer is [Vitali Avagyan (@vitali87)](https://github.com/vitali87). The lead maintainer is responsible for:
+
+- Setting the project direction and maintaining the [roadmap](https://docs.code-graph-rag.com/roadmap/)
+- Triaging issues and reviewing pull requests
+- Merging changes and publishing releases to PyPI and GitHub
+- Responding to security reports as described in the [security policy](.github/SECURITY.md)
+- Enforcing the [code of conduct](.github/CODE_OF_CONDUCT.md)
+
+### Contributors
+
+Anyone may contribute through pull requests, following the [contributing guide](CONTRIBUTING.md). Contributors are credited in release notes and retain copyright in their contributions, which are accepted under the project's MIT licence.
+
+### Becoming a Maintainer
+
+Contributors who make sustained, high-quality contributions and demonstrate good judgement in reviews and issue discussions may be invited by the lead maintainer to become co-maintainers with commit access.
+
+## Decision Making
+
+Routine decisions (bug fixes, small features, dependency updates) are made through the normal pull request process. Significant decisions (new language support, architectural changes, breaking changes) are proposed and discussed in GitHub issues before implementation, so the reasoning is public and searchable. The lead maintainer makes the final call when consensus is not reached.
+
+## Continuity
+
+Release builds and publishing run through GitHub Actions rather than a maintainer's local machine. Release binaries use keyless Sigstore signing, and PyPI publishing uses trusted publishing.
+
+Continuity depends on maintaining authorized access to the repository and publishing services. If release automation becomes unavailable, an authorized maintainer can restore the required access and configuration before resuming releases.
+
+Automated release-tag publishing depends on the [version-bump workflow's](.github/workflows/version-bump.yml) configured credentials. If that automation is unavailable, an authorized maintainer can manually dispatch the publishing workflows for a verified, existing release tag, provided the required publishing access remains available. The [PyPI workflow](.github/workflows/publish.yml) takes a `tag` input; the [Docker](.github/workflows/docker-publish.yml) and [binary](.github/workflows/build-binaries.yml) workflows must be dispatched with the release tag as their ref.
+
+An emergency contact with standby access to the repository and the PyPI project is being designated so that issues, merges, and releases can continue within a week if the lead maintainer becomes unavailable.
+
+If the project becomes unmaintained, the MIT licence permits anyone to fork and continue it.

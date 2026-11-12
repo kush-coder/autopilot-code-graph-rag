@@ -1,0 +1,294 @@
+# Add-language grammar tooling messages, prompts, and file names.
+
+from enum import StrEnum
+
+LANG_GRAMMARS_DIR = "grammars"
+LANG_CONFIG_FILE = "codebase_rag/language_spec.py"
+LANG_TREE_SITTER_JSON = "tree-sitter.json"
+LANG_NODE_TYPES_JSON = "node-types.json"
+LANG_SRC_DIR = "src"
+# Submodule repositories live under `modules/` in the checkout's own git dir:
+# `.git` itself in a plain checkout, or the directory a `.git` file names
+# (`gitdir: ...`) in a linked worktree or a checkout that is a submodule.
+LANG_GIT_MODULES_DIR = "modules"
+LANG_GITFILE_PREFIX = "gitdir:"
+LANG_GIT_DIR = ".git"
+LANG_TOML_KEY_NAME = "name"
+LANG_REPO_URL = "https://github.com/vitali87/code-graph-rag"
+LANG_ISSUES_URL = f"{LANG_REPO_URL}/issues"
+LANG_DEFAULT_GRAMMAR_URL = "https://github.com/tree-sitter/tree-sitter-{name}"
+LANG_TREE_SITTER_URL_MARKER = "github.com/tree-sitter/tree-sitter"
+
+LANG_DEFAULT_FUNCTION_NODES = ("function_definition", "method_definition")
+LANG_DEFAULT_CLASS_NODES = ("class_declaration",)
+LANG_DEFAULT_MODULE_NODES = ("compilation_unit",)
+LANG_DEFAULT_CALL_NODES = ("invocation_expression",)
+LANG_FALLBACK_METHOD_NODE = "method_declaration"
+
+LANG_FUNCTION_KEYWORDS = frozenset(
+    {
+        "function",
+        "method",
+        "constructor",
+        "destructor",
+        "lambda",
+        "arrow_function",
+        "anonymous_function",
+        "closure",
+    }
+)
+LANG_CLASS_KEYWORDS = frozenset(
+    {
+        "class",
+        "interface",
+        "struct",
+        "enum",
+        "trait",
+        "object",
+        "type",
+        "impl",
+        "union",
+    }
+)
+LANG_CALL_KEYWORDS = frozenset({"call", "invoke", "invocation"})
+LANG_MODULE_KEYWORDS = frozenset(
+    {"program", "source_file", "compilation_unit", "module", "chunk"}
+)
+LANG_EXCLUSION_KEYWORDS = frozenset({"access", "call"})
+
+LANG_MSG_USING_DEFAULT_URL = "Using default tree-sitter URL: {url}"
+LANG_MSG_CUSTOM_URL_WARNING = (
+    "WARNING: You are adding a grammar from a custom URL. "
+    "This may execute code from the repository. Only proceed if you trust the source."
+)
+LANG_MSG_ADDING_SUBMODULE = "Adding submodule from {url}..."
+LANG_MSG_SUBMODULE_SUCCESS = "Successfully added submodule at {path}"
+LANG_MSG_SUBMODULE_EXISTS = (
+    "Submodule already exists at {path}. Forcing re-installation..."
+)
+LANG_MSG_REMOVING_ENTRY = "   -> Removing existing submodule entry..."
+LANG_MSG_READDING_SUBMODULE = "   -> Re-adding submodule..."
+LANG_MSG_REINSTALL_SUCCESS = "Successfully re-installed submodule at {path}"
+LANG_MSG_AUTO_DETECTED_LANG = "Auto-detected language: {name}"
+LANG_MSG_USING_LANG_NAME = "Using language name: {name}"
+LANG_MSG_AUTO_DETECTED_EXT = "Auto-detected file extensions: {extensions}"
+LANG_MSG_FOUND_NODE_TYPES = "Found {count} total node types in grammar"
+LANG_MSG_SEMANTIC_CATEGORIES = "Tree-sitter semantic categories:"
+LANG_MSG_CATEGORY_FORMAT = "  {category}: {subtypes} ({count} total)"
+LANG_MSG_MAPPED_CATEGORIES = "\nMapped to our categories:"
+LANG_MSG_FUNCTIONS = "Functions: {nodes}"
+LANG_MSG_CLASSES = "Classes: {nodes}"
+LANG_MSG_MODULES = "Modules: {nodes}"
+LANG_MSG_CALLS = "Calls: {nodes}"
+LANG_MSG_LANG_ADDED = "\nLanguage '{name}' has been added to the configuration!"
+LANG_MSG_UPDATED_CONFIG = "Updated {path}"
+LANG_MSG_REVIEW_PROMPT = "Please review the detected node types:"
+LANG_MSG_REVIEW_HINT = "   The auto-detection is good but may need manual adjustments."
+LANG_MSG_EDIT_HINT = "   Edit the configuration in: {path}"
+LANG_MSG_COMMON_ISSUES = "Look for these common issues:"
+LANG_MSG_ISSUE_MISCLASSIFIED = (
+    "   - Remove misclassified types (e.g., table_constructor in functions)"
+)
+LANG_MSG_ISSUE_MISSING = "   - Add missing types that should be included"
+LANG_MSG_ISSUE_CLASS_TYPES = (
+    "   - Verify class_node_types includes all relevant class-like constructs"
+)
+LANG_MSG_ISSUE_CALL_TYPES = (
+    "   - Check call_node_types covers all function call patterns"
+)
+LANG_MSG_LIST_HINT = (
+    "You can run 'cgr language list-languages' to see the current config."
+)
+LANG_MSG_LANG_NOT_FOUND = "Language '{name}' not found."
+LANG_MSG_AVAILABLE_LANGS = "Available languages: {langs}"
+LANG_MSG_REMOVED_FROM_CONFIG = "Removed language '{name}' from configuration file."
+LANG_MSG_REMOVING_SUBMODULE = "Removing git submodule '{path}'..."
+LANG_MSG_CLEANED_MODULES = "Cleaned up git modules directory: {path}"
+LANG_MSG_SUBMODULE_REMOVED = "Successfully removed submodule '{path}'"
+LANG_MSG_NO_SUBMODULE = "No submodule found at '{path}'"
+LANG_MSG_KEEPING_SUBMODULE = "Keeping submodule (--keep-submodule flag used)"
+LANG_MSG_LANG_REMOVED = "Language '{name}' has been removed successfully!"
+LANG_MSG_NO_MODULES_DIR = "No grammars modules directory found."
+LANG_MSG_NO_GITMODULES = "No .gitmodules file found."
+LANG_MSG_NO_ORPHANS = "No orphaned modules found!"
+LANG_MSG_FOUND_ORPHANS = "Found {count} orphaned module(s): {modules}"
+LANG_MSG_REMOVED_ORPHAN = "Removed orphaned module: {module}"
+LANG_MSG_CLEANUP_COMPLETE = "Cleanup complete!"
+LANG_MSG_CLEANUP_CANCELLED = "Cleanup cancelled."
+
+LANG_ERR_MISSING_ARGS = "Either language_name or --grammar-url must be provided"
+LANG_ERR_REINSTALL_FAILED = "Failed to reinstall submodule: {error}"
+LANG_ERR_MANUAL_REMOVE_HINT = "You may need to remove it manually and try again:"
+LANG_ERR_REPO_NOT_FOUND = "Repository not found at {url}"
+LANG_ERR_CUSTOM_URL_HINT = "Try using a custom URL with: --grammar-url <your-repo-url>"
+LANG_ERR_GIT = "Git error: {error}"
+LANG_ERR_NODE_TYPES_WARNING = (
+    "Warning: node-types.json not found in any expected location for {name}"
+)
+LANG_ERR_TREE_SITTER_JSON_WARNING = "Warning: tree-sitter.json not found in {path}"
+LANG_ERR_NO_GRAMMARS_WARNING = "Warning: No grammars found in tree-sitter.json"
+LANG_ERR_PARSE_NODE_TYPES = "Error parsing node-types.json: {error}"
+LANG_ERR_UPDATE_CONFIG = "Could not register '{name}' in {path}: {error}"
+LANG_ERR_CONFIG_NOT_FOUND = "Could not find LANGUAGE_SPECS dictionary end"
+LANG_ERR_REMOVE_CONFIG = "Failed to update config file: {error}"
+LANG_ERR_REMOVE_SUBMODULE = "Failed to remove submodule: {error}"
+
+LANG_PROMPT_LANGUAGE_NAME = "Language name (e.g., 'c-sharp', 'python')"
+LANG_PROMPT_COMMON_NAME = "What is the common name for this language?"
+LANG_PROMPT_EXTENSIONS = (
+    "What file extensions should be associated with this language? (comma-separated)"
+)
+LANG_PROMPT_FUNCTIONS = "Select nodes representing FUNCTIONS (comma-separated)"
+LANG_PROMPT_CLASSES = "Select nodes representing CLASSES (comma-separated)"
+LANG_PROMPT_MODULES = "Select nodes representing MODULES (comma-separated)"
+LANG_PROMPT_CALLS = "Select nodes representing FUNCTION CALLS (comma-separated)"
+LANG_PROMPT_CONTINUE = "Do you want to continue?"
+LANG_PROMPT_REMOVE_ORPHANS = "Do you want to remove these orphaned modules?"
+
+# Grammar management edits the checkout the running cgr was imported from
+# (issue #2422). An installed cgr has no such checkout, and the cwd is the
+# user's own project, so the commands refuse rather than guess.
+LANG_ERR_NOT_SOURCE_CHECKOUT = (
+    "'cgr language {command}' modifies a code-graph-rag source checkout, and this "
+    "cgr is installed at {package_dir}, outside any checkout. Nothing was changed.\n"
+    "To add or remove a grammar, clone {repo_url} and run "
+    "'uv run cgr language {command}' inside the clone.\n"
+    "To have a language supported, request it at {issues_url}."
+)
+LANG_MSG_ROLLING_BACK = (
+    "'{name}' was not registered; removing the grammar submodule this run added."
+)
+
+
+# `cgr language list-languages` (issue #2421): every language of every
+# parsing tier, with its support level and whether this install can parse it.
+class LanguageTier(StrEnum):
+    TREE_SITTER = "tree-sitter"
+    AST_GREP = "ast-grep"
+    DOCUMENT = "document"
+
+
+class LanguageSupport(StrEnum):
+    FULL = "full"
+    IN_DEVELOPMENT = "in development"
+    STRUCTURAL = "structural"
+    HEADINGS = "headings"
+
+
+class NodeMappingKind(StrEnum):
+    FUNCTIONS = "functions"
+    CLASSES = "classes"
+    MODULES = "modules"
+    CALLS = "calls"
+
+
+class FrontendName(StrEnum):
+    LIBCLANG = "libclang"
+    GO_TYPES = "go/types"
+    ROSLYN = "Roslyn"
+    JAVAC = "javac"
+    JEDI = "Jedi"
+
+
+# The document tier parses Markdown only (tree-sitter-markdown).
+DOCUMENT_TIER_LANGUAGE = "Markdown"
+
+# The settings (environment variables) that select each frontend's mode.
+SETTING_CPP_FRONTEND = "CPP_FRONTEND"
+SETTING_CSHARP_FRONTEND = "CSHARP_FRONTEND"
+SETTING_GO_FRONTEND = "GO_FRONTEND"
+SETTING_JAVA_FRONTEND = "JAVA_FRONTEND"
+SETTING_PYTHON_FRONTEND = "PYTHON_FRONTEND"
+
+# The extra that installs each tier's grammars.
+TIER_EXTRAS: dict[LanguageTier, str] = {
+    LanguageTier.TREE_SITTER: "treesitter-full",
+    LanguageTier.AST_GREP: "ast-grep",
+    LanguageTier.DOCUMENT: "treesitter-full",
+}
+
+LANG_TABLE_TITLE = "Supported Languages"
+LANG_TABLE_COL_LANGUAGE = "Language"
+LANG_TABLE_COL_EXTENSIONS = "Extensions"
+LANG_TABLE_COL_TIER = "Tier"
+LANG_TABLE_COL_SUPPORT = "Support"
+LANG_TABLE_COL_INSTALLED = "Installed"
+LANG_TABLE_YES = "yes"
+LANG_TABLE_NO = "no"
+LANG_TABLE_PLACEHOLDER = "—"
+LANG_TABLE_SEPARATOR = ", "
+LANG_SUPPORT_LEGEND = (
+    "full: definitions, calls and types. structural: modules, functions, "
+    "classes and imports, no call graph. headings: Markdown sections and links."
+)
+LANG_INSTALL_HINT = "Not installed ({tier}): pip install 'code-graph-rag[{extra}]'"
+
+LANG_NODE_TABLE_TITLE = "Tree-sitter Node Types"
+LANG_TABLE_COL_NODE_KIND = "Kind"
+LANG_TABLE_COL_NODE_TYPES = "Node Types"
+
+LANG_FRONTEND_TABLE_TITLE = "Optional Semantic Frontends"
+LANG_TABLE_COL_FRONTEND = "Frontend"
+LANG_TABLE_COL_LANGUAGES = "Languages"
+LANG_TABLE_COL_TOOLCHAIN = "Toolchain"
+LANG_TABLE_COL_SETTING = "Setting"
+LANG_TABLE_COL_ACTIVE = "Active"
+LANG_TOOLCHAIN_FOUND = "found"
+LANG_TOOLCHAIN_MISSING = "missing"
+LANG_SETTING_FMT = "{name}={value}"
+LANG_FRONTEND_LEGEND = (
+    "An active frontend adds compiler facts on top of tree-sitter. libclang "
+    "needs a compile_commands.json, go/types a go.mod, Roslyn a .csproj or .sln."
+)
+
+LANG_MSG_AVAILABLE_NODES = "Available nodes for mapping:"
+LANG_ELLIPSIS = "..."
+# Span-preserving patchers (issue #1529): formatter checks and the identifier
+# node types a rename may target beyond the shared `identifier` family.
+PATCH_GOFMT = "gofmt"
+PATCH_GOFMT_LIST_FLAG = "-l"
+# Probed by invocation before a formatter's verdict is trusted: a rustup shim
+# for an uninstalled component is a real file on PATH that exits non-zero, and
+# that is indistinguishable from "your code is misformatted" (issue #1639).
+PATCH_VERSION_FLAG = "--version"
+# gofmt has no --version and exits 2 on it; -h exits 0. The liveness probe must
+# use a flag the tool accepts, or a working formatter reads as a missing one.
+PATCH_GOFMT_PROBE_FLAG = "-h"
+PATCH_RUSTFMT = "rustfmt"
+PATCH_RUSTFMT_CHECK_FLAG = "--check"
+PATCH_RUSTFMT_EDITION_FLAG = "--edition"
+PATCH_RUSTFMT_EDITION = "2021"
+PATCH_FORMATTER_TIMEOUT_S = 60
+PATCH_TS_FIELD_IDENTIFIER = "field_identifier"
+PATCH_TS_NAMESPACE_IDENTIFIER = "namespace_identifier"
+PATCH_TS_STATEMENT_IDENTIFIER = "statement_identifier"
+LANG_GIT_SUFFIX = ".git"
+LANG_GITMODULES_FILE = ".gitmodules"
+LANG_CALL_KEYWORD_EXCLUDE = "call"
+
+LANG_GITMODULES_REGEX = r"path = (grammars/tree-sitter-[^\n]+)"
+LANG_CONFIG_TMP_SUFFIX = ".tmp"
+
+LANG_SPECS_NAME = "LANGUAGE_SPECS"
+LANG_ENUM_KEY_TEMPLATE = "cs.SupportedLanguage.{member}"
+
+LANG_ERR_ENTRY_NOT_IN_CONFIG = "no config entry found for '{name}'"
+
+# Variables that point git at a repository, index or object store other than
+# the working directory's (git's own `local_repo_env`, less the config ones a
+# user may rely on for auth or proxies when the submodule is cloned).
+GIT_LOCATION_ENV_VARS = frozenset(
+    {
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_DIR",
+        "GIT_GRAFT_FILE",
+        "GIT_IMPLICIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_NAMESPACE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_PREFIX",
+        "GIT_SHALLOW_FILE",
+        "GIT_WORK_TREE",
+    }
+)

@@ -1,0 +1,356 @@
+# Provider validation errors
+GOOGLE_GLA_NO_KEY = (
+    "Gemini GLA provider requires api_key. "
+    "Set ORCHESTRATOR_API_KEY or CYPHER_API_KEY in .env file."
+)
+GOOGLE_VERTEX_NO_PROJECT = (
+    "Gemini Vertex provider requires project_id. "
+    "Set ORCHESTRATOR_PROJECT_ID or CYPHER_PROJECT_ID in .env file."
+)
+OPENAI_NO_KEY = (
+    "OpenAI provider requires api_key. "
+    "Set ORCHESTRATOR_API_KEY or CYPHER_API_KEY in .env file."
+)
+ANTHROPIC_NO_KEY = (
+    "Anthropic provider requires api_key. "
+    "Set ORCHESTRATOR_API_KEY or CYPHER_API_KEY in .env file."
+)
+AZURE_NO_KEY = "Azure OpenAI provider requires api_key. Set AZURE_API_KEY in .env file."
+AZURE_NO_ENDPOINT = (
+    "Azure OpenAI provider requires endpoint. Set AZURE_OPENAI_ENDPOINT in .env file."
+)
+MINIMAX_NO_KEY = (
+    "MiniMax provider requires api_key. "
+    "Set ORCHESTRATOR_API_KEY or CYPHER_API_KEY or MINIMAX_API_KEY in .env file."
+)
+OLLAMA_NOT_RUNNING = (
+    "Ollama server not responding at {endpoint}. "
+    "Make sure Ollama is running: ollama serve"
+)
+LITELLM_NOT_RUNNING = (
+    "LiteLLM proxy server not responding at {endpoint}. "
+    "Make sure LiteLLM proxy is running and API key is valid."
+)
+UNKNOWN_PROVIDER = "Unknown provider '{provider}'. Available providers: {available}"
+UNKNOWN_PROVIDER_SUGGESTION = ". Did you mean '{suggestion}'?"
+
+# Dependency errors
+SEMANTIC_EXTRA = "Semantic search requires 'semantic' extra: uv sync --extra semantic"
+
+# Input errors
+JSON_TOO_DEEP = "JSON nesting exceeds the decoder's recursion limit"
+
+# The Rust extension (rust/cgr_graph_rs), which cgr does not run without
+RUST_EXTENSION_MISSING = (
+    "code-graph-rag needs its Rust extension, cgr-graph-rs, and cannot import "
+    "it ({error}). It ships as wheels for CPython 3.12+ on Linux (x86_64, "
+    "aarch64), macOS and Windows x64; reinstall code-graph-rag there, or, in a "
+    "checkout, run `uv sync` with a Rust toolchain on PATH to build it."
+)
+
+# OpenAI-compatible embedding errors
+OPENAI_EMBEDDING_HTTP_ERROR = (
+    "OpenAI-compatible embedding request failed with status {status}: {body}"
+)
+OPENAI_EMBEDDING_COUNT_MISMATCH = (
+    "OpenAI-compatible embedding response returned {got} embeddings "
+    "for {expected} inputs"
+)
+OPENAI_EMBEDDING_MALFORMED_RESPONSE = (
+    "OpenAI-compatible embedding response is malformed: {error}"
+)
+OPENAI_EMBEDDING_BAD_INDEX = (
+    "OpenAI-compatible embedding response has an invalid or duplicate index: {index}"
+)
+
+# Configuration errors
+PROVIDER_EMPTY = "Provider name cannot be empty in 'provider:model' format."
+MODEL_ID_EMPTY = "Model ID cannot be empty."
+MODEL_FORMAT_INVALID = (
+    "Model must be specified as 'provider:model' (e.g., openai:gpt-4o)."
+)
+BATCH_SIZE_POSITIVE = "batch_size must be a positive integer"
+# A setting refused at start-up (#2474). Worded like click's own "Invalid value
+# for '--batch-size': 0 is not in the range x>=1." so a variable reads the same
+# as the flag it stands in for. Keyed by pydantic's error type; the fields are
+# the error's `input` and `msg` and the entries of its `ctx`.
+SETTING_INVALID = "Invalid value for {name} in {origin}: {problem}"
+SETTING_PROBLEMS = {
+    "int_parsing": "{input!r} is not a valid integer.",
+    "float_parsing": "{input!r} is not a valid float.",
+    "bool_parsing": "{input!r} is not a valid boolean.",
+    "enum": "{input!r} is not one of {expected}.",
+    "greater_than": "{input} is not in the range x>{gt}.",
+    "greater_than_equal": "{input} is not in the range x>={ge}.",
+    "value_error": "{error}",
+}
+SETTING_PROBLEM_OTHER = "{input!r}: {msg}"
+SETTING_NOT_JSON_LIST = '{value!r} is not a JSON list, such as ["ls", "cat"].'
+SETTING_JSON_LIST_TOO_DEEP = (
+    '{value} is nested too deeply to read as a JSON list, such as ["ls", "cat"].'
+)
+# A `.env` value `os.environ` refused, such as one past the 32,767 characters
+# Windows holds in a variable. The error names the limit, not the value.
+SETTING_NOT_SETTABLE = "the operating system refused it ({error})."
+CONFIG = "{role} configuration error: {error}"
+EMPTY_PROJECT_SCOPE = (
+    "The assistant has no project to work on: an empty project scope would "
+    "cover every project in the graph."
+)
+MODEL_ROLE_HALF_CONFIGURED = (
+    "{set_var}={value} is set but {missing_var} is not. "
+    "Set both {role}_PROVIDER and {role}_MODEL, or neither to use the local "
+    "Ollama default."
+)
+MODEL_ID_UNKNOWN = "Unknown {provider} model {model_id!r}. Did you mean {suggestions}?"
+MODEL_ID_UNKNOWN_NO_MATCH = (
+    "Unknown {provider} model {model_id!r}. Known {provider} models: {known}"
+)
+
+# Vector store errors
+QDRANT_VECTOR_DIM_MISMATCH = (
+    "Qdrant collection '{collection}' has vector dimension {dim}, expected "
+    "{expected}. Set QDRANT_VECTOR_DIM to the embedding model's output size, "
+    "or re-index with --clean to rebuild the collection with the new size."
+)
+
+QDRANT_API_KEY_OVER_HTTP = (
+    "QDRANT_API_KEY is set but QDRANT_URL uses plain http, which would send the "
+    "key unencrypted. Use an https:// QDRANT_URL, or set "
+    "QDRANT_ALLOW_INSECURE_API_KEY=true if the connection is protected another "
+    "way (for example, it never leaves the machine)."
+)
+
+SQLITE_VECTOR_DIM_MISMATCH = (
+    "SQLite vector store '{path}' has vector dimension {dim}, expected "
+    "{expected}. Set SQLITE_VECTOR_DIM to the embedding model's output size, "
+    "or re-index with --clean to rebuild the store with the new size."
+)
+SQLITE_VEC_NOT_INSTALLED = (
+    "The sqlite vector store (the default, CGR_VECTOR_STORE_BACKEND=sqlite) "
+    "needs sqlite-vec, which is not installed. Install it with "
+    "`pip install 'code-graph-rag[sqlite-vec]'` (or `uv sync --extra "
+    "sqlite-vec`); the `semantic` extra includes it."
+)
+SQLITE_VEC_EXTENSIONS_UNSUPPORTED = (
+    "The sqlite vector store (the default, CGR_VECTOR_STORE_BACKEND=sqlite) "
+    "loads the sqlite-vec extension, but this "
+    "Python's sqlite3 module was built without extension loading. Use a Python "
+    "that has it (uv-managed Pythons do), or set CGR_VECTOR_STORE_BACKEND=qdrant."
+)
+
+EMBEDDING_DIM_MISMATCH = (
+    "The embedding model produced {dim}-dimensional vectors, but the {backend} "
+    "collection holds {expected}-dimensional ones. Set {setting} to the "
+    "embedding model's output size and re-index with --clean."
+)
+
+# Graph loading errors
+GRAPH_FILE_NOT_FOUND = "Graph file not found: {path}"
+FAILED_TO_LOAD_DATA = "Failed to load data from file"
+# A JSON file that is not a graph export (issue #2446).
+GRAPH_FILE_NOT_AN_EXPORT = "{name} is not a cgr graph export: {reason}"
+GRAPH_FILE_NOT_AN_OBJECT = (
+    'expected a JSON object with "nodes" and "relationships" arrays, found a '
+    "JSON {found}"
+)
+GRAPH_FILE_MISSING_KEYS = (
+    'expected a JSON object with "nodes" and "relationships" arrays '
+    "(missing: {missing})"
+)
+GRAPH_FILE_NOT_AN_ARRAY = '"{key}" is not an array'
+GRAPH_FILE_ITEM_NOT_AN_OBJECT = "{kind} {index} is not an object"
+GRAPH_FILE_ITEM_MISSING = "{kind} {index} is missing {missing}"
+GRAPH_FILE_ITEM_KINDS = {"nodes": "node", "relationships": "relationship"}
+NODES_NOT_LOADED = "Nodes should be loaded"
+RELATIONSHIPS_NOT_LOADED = "Relationships should be loaded"
+DATA_NOT_LOADED = "Data should be loaded"
+
+# Parser errors
+NO_LANGUAGES = "No Tree-sitter languages available."
+
+# LLM errors
+LLM_INIT_CYPHER = "Failed to initialize CypherGenerator: {error}"
+LLM_CYPHER_UNAVAILABLE = (
+    "Natural-language queries need a Cypher model, and none is available "
+    "({error}). Start the configured provider, or set CYPHER_PROVIDER and "
+    "CYPHER_MODEL (plus CYPHER_API_KEY for a hosted one). Indexing and the "
+    "deterministic graph tools (resolve, definition, callers, ...) work "
+    "without it."
+)
+LLM_INVALID_QUERY = "LLM did not generate a valid query. Output: {output}"
+LLM_DANGEROUS_QUERY = "LLM generated a destructive Cypher query (found '{keyword}'). Query rejected: {query}"
+LLM_UNBOUNDED_PATH = (
+    "LLM generated an unbounded variable-length path pattern "
+    "(e.g. [:TYPE*] or [:TYPE*N..]) which causes memory exhaustion on cyclic graphs. "
+    "Add an upper bound such as [:TYPE*1..6]. Query rejected: {query}"
+)
+LLM_DISALLOWED_PROCEDURE = (
+    "LLM generated a CALL to procedure '{name}' which is outside the read-only "
+    "MAGE allowlist. Query rejected: {query}"
+)
+LLM_GENERATION_FAILED = "Cypher generation failed: {error}"
+READ_ONLY_UNKNOWN_OPERATOR = (
+    "Refused to run a generated query: the database plans the operation "
+    "'{operator}', which is not known to be read-only. Query rejected: {query}"
+)
+READ_ONLY_UNREADABLE_PLAN = (
+    "Refused to run a generated query: the database returned no plan that "
+    "could be checked for writes. Query rejected: {query}"
+)
+READ_ONLY_PROCEDURE = (
+    "Refused to run a generated query: the database plans a CALL to "
+    "procedure '{name}', which is outside the read-only allowlist. "
+    "Query rejected: {query}"
+)
+LLM_INIT_ORCHESTRATOR = "Failed to initialize RAG Orchestrator: {error}"
+LLM_INIT_RESEARCH = "Failed to initialize research sub-agent: {error}"
+
+# Graph service errors
+BATCH_SIZE = "batch_size must be a positive integer"
+CONN = "Not connected to Memgraph."
+AUTH_INCOMPLETE = (
+    "Both username and password are required for authentication. "
+    "Either provide both or neither."
+)
+
+# Graph reads (used with raise)
+INGESTOR_NOT_QUERYABLE = "{kind} has no graph to read."
+
+# Access control errors (used with raise)
+ACCESS_DENIED = "Access denied: Cannot access files outside the project root."
+
+
+DEADCODE_ENDPOINT_DATA_MISSING = (
+    "--no-endpoint-roots needs endpoint data: project '{project}' has "
+    "{handlers} route-decorated handler(s) but no recorded endpoint, so it was "
+    "indexed without the io capture group and each handler would stay live by "
+    "its decorator. Re-index it with --capture io (cgr start --repo-path <repo> "
+    "--update-graph --project-name {project} --capture io), or drop "
+    "--no-endpoint-roots."
+)
+
+
+# Tree bridge (used with raise NotBorrowed, which the caller catches and runs
+# the Python twin)
+NO_DESCENDANT = "no node at descendant index {index}"
+
+
+# Exception classes
+class NoTreeBridge(Exception):
+    """Stands in for the Rust extension's `NotBorrowed` when it has no tree
+    bridge, so callers always have a class to catch; nothing raises it."""
+
+
+class UnknownProviderError(ValueError):
+    """A model role names a provider nothing serves (issue #2897).
+
+    Its own type so a caller that turns a missing key into advice does not
+    turn this into advice about a key no setting can supply.
+    """
+
+
+class LLMGenerationError(Exception):
+    pass
+
+
+class CypherModelUnavailableError(LLMGenerationError):
+    """No Cypher model could be built, so nothing was generated or run."""
+
+
+class ReadOnlyQueryError(Exception):
+    """An untrusted query would write, so it was never executed."""
+
+
+# Connecting to the graph (issue #2443). One line each, naming the fix.
+GRAPH_UNREACHABLE = (
+    "Error: cannot reach Memgraph at {address} ({error}). Start the stack with "
+    "`cgr daemon up`, or set MEMGRAPH_HOST/MEMGRAPH_PORT. `cgr doctor` checks "
+    "the setup."
+)
+MGCLIENT_MISSING = (
+    "Error: GRAPH_BACKEND=memgraph needs the Memgraph driver, which is not "
+    "installed. Install it with `pip install 'code-graph-rag[memgraph]'` (or "
+    "`uv sync --extra memgraph`), or unset GRAPH_BACKEND to use the embedded "
+    "graph, which needs no server."
+)
+EMBEDDED_GRAPH_UNAVAILABLE = (
+    "Error: cannot open the embedded graph at {path} ({error}). Set "
+    "SQLITE_GRAPH_PATH to a writable file, or GRAPH_BACKEND=memgraph to use "
+    "a server."
+)
+GRAPH_CREDENTIALS_REFUSED = (
+    "Error: Memgraph at {address} refused the credentials ({error}). Set "
+    "MEMGRAPH_USERNAME/MEMGRAPH_PASSWORD to the ones the stack was started "
+    "with. `cgr doctor` checks the setup."
+)
+
+
+class RepoPathError(ValueError):
+    """The repository root the MCP server was pointed at is missing or no directory.
+
+    A `ValueError` like every other configuration error, so existing handlers
+    still catch it. Its own type is what lets `cgr mcp-server` add the
+    `TARGET_REPO_PATH` hint to this error and no other (issue #2881).
+    """
+
+
+class EndpointDataMissingError(Exception):
+    """Endpoint roots are off, but the project holds no endpoint to decide by.
+
+    Only the `io` capture group writes `EXPOSES`; without it every
+    route-decorated handler stays live by its decorator, so the scan would
+    read as a clean result on handlers it never judged (issue #2896).
+    """
+
+    def __init__(self, project_name: str, handlers: int) -> None:
+        self.project_name = project_name
+        self.handlers = handlers
+        super().__init__(
+            DEADCODE_ENDPOINT_DATA_MISSING.format(
+                project=project_name, handlers=handlers
+            )
+        )
+
+
+# Sync lock (issue #2441)
+SYNC_IN_PROGRESS = (
+    "Another sync of {repo} is running ({holder}). Two syncs of one checkout at "
+    "once leave the graph incomplete; wait for it to finish, then run this again."
+)
+SYNC_HOLDER = "pid {pid}, project '{project}'"
+SYNC_HOLDER_UNKNOWN = "holder unknown"
+SYNC_LOCK_IS_LINK = (
+    "The sync lock {path} is a symbolic link. A sync never writes through one, "
+    "since it can point outside the checkout; remove it, then run this again."
+)
+SYNC_LOCK_UNAVAILABLE = (
+    "Cannot open the sync lock {path} ({error}). Without it this sync cannot "
+    "tell whether another one is running, so it did not start; make the file "
+    "readable and writable for this user, then run this again."
+)
+
+
+# Deriving from Exception would let every `except Exception` handler between
+# the embeddings pass and the top level swallow a Ctrl+C (python:S5709
+# accepted).
+class EmbeddingsInterrupted(KeyboardInterrupt):  # NOSONAR
+    """Ctrl+C stopped the embeddings pass of a run that has already committed.
+
+    A `KeyboardInterrupt`, so a caller that does not look for it still stops
+    where it would have; one that does can finish its own bookkeeping first,
+    because the graph and the hash cache are already saved.
+    """
+
+
+# A `KeyboardInterrupt` for the reason `EmbeddingsInterrupted` is one
+# (python:S5709 accepted), and so the pre-chat sync's worker, which swallows
+# only the interrupt it delivered, still recognises it.
+class SyncInterrupted(KeyboardInterrupt):  # NOSONAR
+    """Ctrl+C stopped a CLI sync part-way through its graph writes.
+
+    Its `:IncompleteRun` marker stays down and its hash cache unpublished, so
+    the graph is incomplete until a sync of the project finishes. Kept apart
+    from a plain interrupt so the command can say so: that would be false of
+    one that landed before the sync wrote anything.
+    """

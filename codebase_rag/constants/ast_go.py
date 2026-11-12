@@ -1,0 +1,189 @@
+# Go tree-sitter node types.
+
+TS_GO_PACKAGE_CLAUSE = "package_clause"
+TS_GO_PACKAGE_IDENTIFIER = "package_identifier"
+TS_GO_TYPE_DECLARATION = "type_declaration"
+TS_GO_TYPE_SPEC = "type_spec"
+TS_GO_TYPE_ALIAS = "type_alias"
+TS_GO_STRUCT_TYPE = "struct_type"
+TS_GO_METHOD_ELEM = "method_elem"
+TS_GO_BLOCK = "block"
+TS_GO_SELECTOR_EXPRESSION = "selector_expression"
+TS_GO_TYPE_ASSERTION_EXPRESSION = "type_assertion_expression"
+# A Go source file ending in `_test.go` is compiled only under `go test`; its
+# module-qn file segment ends with this suffix. It may declare an EXTERNAL test
+# package (`package p_test`) that shares a directory with `package p` but is
+# distinct, so it must be excluded from same-directory fan-out.
+GO_TEST_FILE_SUFFIX = "_test"
+TS_GO_FIELD_DECLARATION_LIST = "field_declaration_list"
+TS_GO_FIELD_DECLARATION = "field_declaration"
+TS_GO_FIELD_IDENTIFIER = "field_identifier"
+TS_GO_INTERFACE_TYPE = "interface_type"
+TS_GO_PARAMETER_DECLARATION = "parameter_declaration"
+TS_GO_VARIADIC_PARAMETER_DECLARATION = "variadic_parameter_declaration"
+# `f(xs...)`: a slice passed whole to a variadic parameter.
+TS_GO_VARIADIC_ARGUMENT = "variadic_argument"
+TS_GO_FUNC_LITERAL = "func_literal"
+TS_GO_SOURCE_FILE = "source_file"
+TS_GO_FUNCTION_DECLARATION = "function_declaration"
+TS_GO_METHOD_DECLARATION = "method_declaration"
+TS_GO_CALL_EXPRESSION = "call_expression"
+TS_GO_IMPORT_DECLARATION = "import_declaration"
+TS_GO_PARAMETER_LIST = "parameter_list"
+TS_GO_VAR_DECLARATION = "var_declaration"
+TS_GO_VAR_SPEC = "var_spec"
+TS_GO_SHORT_VAR_DECLARATION = "short_var_declaration"
+TS_GO_ASSIGNMENT_STATEMENT = "assignment_statement"
+# I/O detection (issue #714): a function body is a `block`; string arguments are
+# `interpreted_string_literal` (double-quoted) whose text lives in a
+# `interpreted_string_literal_content` child; `index_expression`/operand+field are
+# the selector/subscript node shapes (only used by member-access reads, which Go
+# has none of, so they are inert placeholders here).
+TS_GO_IDENTIFIER = "identifier"
+TS_GO_TYPE_IDENTIFIER = "type_identifier"
+TS_GO_CONST_SPEC = "const_spec"
+TS_GO_RANGE_CLAUSE = "range_clause"
+# The init;cond;post header of a C-style Go for; its post statement lives in
+# an `update` field.
+TS_GO_FOR_CLAUSE = "for_clause"
+# Switch family: arms are EXCLUSIVE (Go has no implicit fallthrough).
+TS_GO_EXPRESSION_SWITCH_STATEMENT = "expression_switch_statement"
+TS_GO_TYPE_SWITCH_STATEMENT = "type_switch_statement"
+TS_GO_SELECT_STATEMENT = "select_statement"
+TS_GO_EXPRESSION_CASE = "expression_case"
+TS_GO_TYPE_CASE = "type_case"
+TS_GO_COMMUNICATION_CASE = "communication_case"
+TS_GO_DEFAULT_CASE = "default_case"
+# Legal only as an arm's LAST statement; transfers into the next case.
+TS_GO_FALLTHROUGH_STATEMENT = "fallthrough_statement"
+TS_GO_STATEMENT_LIST = "statement_list"
+TS_GO_BLOCK = "block"
+# Go wraps a block's statements in a single `statement_list` node (unlike JS/Java);
+# the source-order I/O walk unwraps it so per-statement shadowing sees the real
+# statement boundaries.
+TS_GO_STATEMENT_LIST = "statement_list"
+TS_GO_INTERPRETED_STRING = "interpreted_string_literal"
+TS_GO_INTERPRETED_STRING_CONTENT = "interpreted_string_literal_content"
+TS_GO_RAW_STRING = "raw_string_literal"
+TS_GO_RAW_STRING_CONTENT = "raw_string_literal_content"
+TS_GO_DOT = "dot"
+TS_GO_INDEX_EXPRESSION = "index_expression"
+TS_GO_FIELD_OPERAND = "operand"
+TS_GO_FIELD_FIELD = "field"
+TS_GO_FIELD_INDEX = "index"
+TS_GO_EXPRESSION_LIST = "expression_list"
+TS_GO_COMPOSITE_LITERAL = "composite_literal"
+TS_GO_LITERAL_VALUE = "literal_value"
+TS_GO_KEYED_ELEMENT = "keyed_element"
+TS_GO_LITERAL_ELEMENT = "literal_element"
+TS_GO_UNARY_EXPRESSION = "unary_expression"
+# `[]byte(s)` / `string(b)`: value-preserving conversion, unwrapped by the
+# lean flow walk so the operand's taint carries through (issue #714).
+TS_GO_TYPE_CONVERSION_EXPRESSION = "type_conversion_expression"
+TS_GO_POINTER_TYPE = "pointer_type"
+# `pkg.Type` in a signature; kept as dotted text so a binding typed to an
+# external package's type stays TYPED (and drops) instead of trie-guessed.
+TS_GO_QUALIFIED_TYPE = "qualified_type"
+TS_GO_GENERIC_TYPE = "generic_type"
+# Field names of a `qualified_type` (`pkg.Name`): the package identifier and
+# the type name; a `composite_literal` carries its constructed type in `type`.
+FIELD_GO_PACKAGE = "package"
+# `switch t := x.(type)` declares `t` in the type switch's `alias` list; a
+# select arm's `case v := <-ch` is a `receive_statement` with a `left` list.
+FIELD_GO_ALIAS = "alias"
+TS_GO_RECEIVE_STATEMENT = "receive_statement"
+# Statements whose header declares names scoped to the statement itself
+# (`if v := f(); v > 0 {}`, `for i := range xs {}`).
+TS_GO_IF_STATEMENT = "if_statement"
+TS_GO_FOR_STATEMENT = "for_statement"
+# Go composite types a method may return; a chained call lands on the CONTAINER,
+# not its element, so return-type inference must not unwrap these (a `[]Command`
+# return must not resolve `.Run()` to `Command.Run`).
+TS_GO_CONTAINER_TYPES: frozenset[str] = frozenset(
+    {"slice_type", "array_type", "map_type", "channel_type", "function_type"}
+)
+FIELD_OPERAND = "operand"
+# What `for k, v := range xs` binds depends on the container `xs` is declared
+# as: a slice or array yields (index, element), a map (key, value), a channel
+# its element alone. `element` names the element type of the first two.
+TS_GO_SLICE_TYPE = "slice_type"
+TS_GO_ARRAY_TYPE = "array_type"
+TS_GO_MAP_TYPE = "map_type"
+TS_GO_CHANNEL_TYPE = "channel_type"
+FIELD_GO_ELEMENT = "element"
+# `for k, v := range xs` declares its variables; `for k, v = range xs`
+# assigns ones declared before the loop.
+TS_GO_DECLARE_ASSIGN = ":="
+# A generic declaration's `[T any]` list (`type_parameter_declaration`s naming
+# the parameters) and a generic receiver's `Box[T]` arguments (`type_elem`s):
+# the names a result type can spell without naming any declared type.
+FIELD_GO_TYPE_PARAMETERS = "type_parameters"
+TS_GO_TYPE_PARAMETER_DECLARATION = "type_parameter_declaration"
+FIELD_GO_TYPE_ARGUMENTS = "type_arguments"
+TS_GO_TYPE_ELEM = "type_elem"
+# The predeclared interfaces an interface can embed and the methods they add
+# (issue #2483), as (name, parameter types, result types): `any` adds none,
+# `error` adds `Error() string`. Any other embedded name must resolve to a
+# first-party interface for the method set to be known.
+GO_BUILTIN_INTERFACE_METHODS: dict[
+    str, tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...]
+] = {
+    "any": (),
+    "error": (("Error", (), ("string",)),),
+}
+# The predeclared types. A name of one is that type wherever the package does
+# not declare the name itself (`type int = string`), so a method spelling
+# another one in the same place has another signature. The aliases among
+# them name the type they stand for.
+GO_PREDECLARED_TYPES = frozenset(
+    {
+        "any",
+        "bool",
+        "complex64",
+        "complex128",
+        "error",
+        "float32",
+        "float64",
+        "int",
+        "int8",
+        "int16",
+        "int32",
+        "int64",
+        "string",
+        "uint",
+        "uint8",
+        "uint16",
+        "uint32",
+        "uint64",
+        "uintptr",
+    }
+)
+GO_PREDECLARED_ALIASES = {"byte": "uint8", "rune": "int32"}
+# Appended to a package key (`dir:clause`) for what the package's `_test.go`
+# files declare, which only `go test` compiles: no identifier holds a space.
+GO_TEST_SCOPE_SUFFIX = " [test]"
+# The type of a span-scoped Go binding whose type cannot be read (`x :=
+# f()` shadowing a range variable): inside its span the name is untyped, and
+# never the type an outer declaration of it has.
+GO_UNTYPED_BINDING = ""
+# `for _, s := range xs` declares `s` alone: `_` binds nothing.
+GO_BLANK_IDENTIFIER = "_"
+# A result list read back from the graph's `return_type` text is parsed again
+# in this stub, so it yields the declarations the file's own parse read.
+GO_RESULT_STUB = "package p\n\nfunc f() {result} {{}}\n"
+# Statements that bind the identifiers in their `left` list (`a, b := ...`,
+# `for k, v := range m`, a select arm's `case v := <-ch`), the declarations
+# whose specs bind names, and a `for` clause's `initializer` (`for i := ...`):
+# what makes a bare name inside a function a local rather than the package's.
+TS_GO_LEFT_BINDING_STATEMENTS: frozenset[str] = frozenset(
+    {"short_var_declaration", "range_clause", "receive_statement"}
+)
+TS_GO_SPEC_DECLARATIONS: frozenset[str] = frozenset(
+    {"var_declaration", "const_declaration"}
+)
+TS_GO_BINDING_SPECS: frozenset[str] = frozenset({"var_spec", "const_spec"})
+TS_GO_VAR_SPEC_LIST = "var_spec_list"
+FIELD_GO_INITIALIZER = "initializer"
+TS_GO_FUNCTION_SCOPES: frozenset[str] = frozenset(
+    {"function_declaration", "method_declaration", "func_literal"}
+)

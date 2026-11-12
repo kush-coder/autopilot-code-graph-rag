@@ -1,0 +1,31 @@
+# ast-grep pattern config for Solidity (issue #1352).
+language: solidity
+ast_grep_id: solidity
+extensions:
+  - ".sol"
+# Functions are named under their contract and overloads stay distinct
+# nodes, the way the tree-sitter tier names them (issue #2589).
+scoped_names: true
+functions:
+  # visibility/mutability keywords follow the name, so the kind rule catches
+  # public/internal/pure/view variants uniformly
+  - kind: function_definition
+  - kind: constructor_definition
+  - kind: modifier_definition
+  # `receive()` / `fallback()` run when the contract is paid or called with
+  # unknown calldata; the node has no `name` field, only the keyword token
+  # (issue #3205). Overloaded fallbacks stay distinct like any overload.
+  - kind: fallback_receive_definition
+    name_child: receive
+  - kind: fallback_receive_definition
+    name_child: fallback
+classes:
+  - kind: contract_declaration
+  - kind: interface_declaration
+  - kind: library_declaration
+imports:
+  # the imported path is a string literal, not an identifier, so patterns
+  # capture it via $PATH (quotes are stripped by the tier)
+  - "import $PATH;"
+  - "import {$$$} from $PATH;"
+  - "import $PATH as $ALIAS;"

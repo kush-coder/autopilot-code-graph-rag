@@ -1,0 +1,190 @@
+EXTRACTING_CGR = "Building cgr graph for {target} (project={project})"
+CGR_GRAPH_DONE = "cgr graph: {nodes} python nodes, {edges} scored edges"
+EXTRACTING_ORACLE = "Building ast oracle for {target}"
+ORACLE_GRAPH_DONE = "ast oracle: {nodes} python nodes, {edges} scored edges"
+WROTE_SCORES = "Wrote scores to {path}"
+WROTE_DIFF = "Wrote diff to {path}"
+ORACLE_PARSE_FAILED = "Skipped unparseable file {path}: {error}"
+L3_STATIC = "Extracting cgr static CALLS for {target} (project={project})"
+L3_STATIC_DONE = "cgr static CALLS: {count} edges"
+L3_TRACING = "Tracing a workload through {target} to collect runtime call edges"
+L3_TRACED_DONE = "traced runtime call edges (first-party): {count}"
+GO_EXTRACTING_CGR = "Building cgr Go nodes for {target} (project={project})"
+GO_CGR_DONE = "cgr Go nodes: {count}"
+GO_EXTRACTING_ORACLE = "Running go/ast oracle ({binary}) over {target}"
+GO_ORACLE_DONE = "go/ast oracle nodes: {count}"
+GO_ORACLE_MISSING = "Go toolchain '{binary}' not found on PATH; cannot run the oracle"
+CPP_EXTRACTING_CGR = "Building cgr C/C++ nodes for {target} (project={project})"
+CPP_CGR_DONE = "cgr C/C++ nodes: {count}"
+CPP_CGR_SCOPED = "cgr C/C++ nodes scoped to compiled universe: {count}"
+CPP_EXTRACTING_ORACLE = "Running libclang oracle over {target} (compile_commands.json)"
+CPP_ORACLE_DONE = "libclang oracle nodes: {count}"
+CPP_ORACLE_GRADED_NOTHING = (
+    "the libclang oracle read {compdb} in {target} but produced no nodes, so "
+    "there is nothing to grade against (a 0-vs-0 score would report a clean "
+    "pass). Any of these produces it: the entries name sources outside "
+    "{target}; their command directories are stale; every translation unit "
+    "failed to parse; or the sources genuinely declare nothing. Check the "
+    "oracle node count above against the files you expect it to cover"
+)
+RS_EXTRACTING_CGR = "Building cgr Rust nodes for {target} (project={project})"
+RS_CGR_DONE = "cgr Rust nodes: {count}"
+RS_EXTRACTING_ORACLE = "Running syn oracle ({binary}) over {target}"
+RS_ORACLE_DONE = "syn oracle nodes: {count}"
+RS_ORACLE_MISSING = "Rust toolchain '{binary}' not found on PATH; cannot run the oracle"
+TS_EXTRACTING_CGR = "Building cgr TypeScript nodes for {target} (project={project})"
+TS_CGR_DONE = "cgr TypeScript nodes: {count}"
+TS_EXTRACTING_ORACLE = "Running TypeScript compiler oracle ({binary}) over {target}"
+TS_ORACLE_DONE = "TypeScript oracle nodes: {count}"
+JS_EXTRACTING_CGR = "Building cgr JavaScript nodes for {target} (project={project})"
+JS_CGR_DONE = "cgr JavaScript nodes: {count}"
+JS_EXTRACTING_ORACLE = "Running TypeScript compiler oracle ({binary}) over {target}"
+JS_ORACLE_DONE = "JavaScript oracle nodes: {count}"
+JAVA_EXTRACTING_CGR = "Building cgr Java nodes for {target} (project={project})"
+JAVA_CGR_DONE = "cgr Java nodes: {count}"
+JAVA_EXTRACTING_ORACLE = "Running JDK Compiler Tree API oracle ({binary}) over {target}"
+JAVA_ORACLE_DONE = "Java oracle nodes: {count}"
+CPP_ORACLE_MISSING = "libclang not available; cannot run the C++ oracle"
+CPP_ORACLE_NO_COMPILE_DB = (
+    "no compile_commands.json under {target}; the C++ oracle cannot grade a "
+    "target without a compilation database"
+)
+CPP_ORACLE_PARTIAL_COMPILE_DB = (
+    "{count} in-target entr{suffix} in {target}'s compile_commands.json could "
+    "not be read (stale directory, load error, or fatal diagnostic); grading "
+    "the rest would silently omit those files and still report a clean score"
+)
+CPP_ORACLE_EMPTY_COMPILE_DB = (
+    "compile_commands.json under {target} yielded no translation units; "
+    "the C++ oracle would grade nothing and report it as a clean empty result"
+)
+CSHARP_EXTRACTING_CGR = "Building cgr C# nodes for {target} (project={project})"
+CSHARP_CGR_DONE = "cgr C# nodes: {count}"
+CSHARP_EXTRACTING_ORACLE = "Running Roslyn syntax oracle ({binary}) over {target}"
+CSHARP_ORACLE_DONE = "C# oracle nodes: {count}"
+CSHARP_ORACLE_MISSING = "dotnet not found on PATH; cannot run the C# oracle"
+LUA_EXTRACTING_CGR = "Building cgr Lua nodes for {target} (project={project})"
+LUA_CGR_DONE = "cgr Lua nodes: {count}"
+LUA_EXTRACTING_ORACLE = "Running luaparse oracle ({binary}) over {target}"
+LUA_ORACLE_DONE = "luaparse oracle nodes: {count}"
+PHP_EXTRACTING_CGR = "Building cgr PHP nodes for {target} (project={project})"
+PHP_CGR_DONE = "cgr PHP nodes: {count}"
+PHP_EXTRACTING_ORACLE = "Running php-parser oracle ({binary}) over {target}"
+PHP_ORACLE_DONE = "php-parser oracle nodes: {count}"
+RETRIEVAL_SYMBOLS = "first-party symbol universe: {count} names"
+RETRIEVAL_EXTRACTING_ORACLE = "Building ast call oracle (file-level) for {target}"
+RETRIEVAL_ORACLE_DONE = "oracle call edges (first-party): {count}"
+RETRIEVAL_EXTRACTING_CGR = "Building cgr CALLS edges for {target} (project={project})"
+RETRIEVAL_CGR_DONE = "cgr call edges (first-party): {count}"
+RETRIEVAL_EXTRACTING_GREP = "Running ripgrep ({mode}) baseline over {target}"
+RETRIEVAL_GREP_DONE = "grep ({mode}) call edges: {count}"
+RETRIEVAL_RG_MISSING = (
+    "ripgrep '{binary}' not found on PATH; cannot run the grep baseline"
+)
+RETRIEVAL_SAMPLED = (
+    "scoring every condition on {count} of {total} symbols (seed={seed})"
+)
+RETRIEVAL_EMPTY_ORACLE = (
+    "the oracle has no call edges for these {count} symbols, so there is "
+    "nothing to grade; use a larger --sample or another --seed"
+)
+RETRIEVAL_COLGREP_MISSING = (
+    "'{binary}' not found on PATH; install ColGrep (lightonai/next-plaid) "
+    "or drop --colgrep"
+)
+RETRIEVAL_COLGREP_INDEXING = "Building the ColGrep index for {target}"
+RETRIEVAL_COLGREP_INDEXED = "ColGrep index ready in {seconds:.1f}s"
+RETRIEVAL_COLGREP_INDEX_FAILED = "ColGrep could not index {target}: {error}"
+RETRIEVAL_EXTRACTING_COLGREP = (
+    "Running ColGrep ({mode}, k={top_k}): {count} searches over {target}"
+)
+RETRIEVAL_COLGREP_QUERY_FAILED = (
+    "ColGrep ({mode}) search for '{name}' failed; stopping rather than score "
+    "its callers as misses: {error}"
+)
+RETRIEVAL_COLGREP_DONE = (
+    "colgrep ({mode}) call edges: {count} "
+    "({queries} searches in {seconds:.1f}s, {per_query:.2f}s each)"
+)
+INCREMENTAL_TARGET = "Incremental-update eval over {target} (project={project})"
+INCREMENTAL_SAMPLED = "probing {count} of {total} python files with a neutral edit"
+INCREMENTAL_NO_PY = "no python files found under {target}; nothing to probe"
+INCREMENTAL_PROBE = "probe {index}/{total}: edit {path}"
+INCREMENTAL_PROBE_DIVERGED = "DIVERGED on {path}: -{missing} edges, +{stale} edges"
+INCREMENTAL_DONE = "clean-equivalent probes: {clean}/{total}"
+IMPORTS_TARGET = "Import-resolution eval over {target} (project={project})"
+IMPORTS_ORACLE_DONE = "oracle import deps: {count} (internal+external)"
+IMPORTS_CGR_DONE = "cgr import deps: {count}"
+INHERITANCE_TARGET = "Inheritance eval over {target} (project={project})"
+INHERITANCE_ORACLE_DONE = "oracle: {inherits} INHERITS, {overrides} OVERRIDES"
+INHERITANCE_CGR_DONE = "cgr: {inherits} INHERITS, {overrides} OVERRIDES"
+INHERITANCE_SKIPPED_BASES = "oracle skipped {count} unresolved/ambiguous base refs"
+INSTANTIATION_TARGET = "Instantiation eval over {target} (project={project})"
+INSTANTIATION_ORACLE_DONE = "oracle constructor calls: {count}"
+INSTANTIATION_CGR_DONE = "cgr INSTANTIATES edges: {count}"
+DEAD_CODE_TARGET = "Dead-code eval over {target} (project={project})"
+DEAD_CODE_DONE = "cgr reports {count} unreachable functions/methods"
+DUPLICATES_TARGET = "Duplicates eval over {target} (project={project})"
+DUPLICATES_DONE = (
+    "cgr reports {groups} duplicate group(s) covering {members} definition(s)"
+    " ({skipped} skipped, truncated={truncated})"
+)
+LANG_RETRIEVAL_ORACLE = (
+    "Running {oracle} call oracle over the {language} sources in {target}"
+)
+LANG_RETRIEVAL_ORACLE_DONE = "{oracle} first-party {language} call edges: {count}"
+LANG_RETRIEVAL_COVERED = "cleanly-parsed {language} source files graded: {count}"
+LANG_RETRIEVAL_CGR = (
+    "Building cgr {language} CALLS edges for {target} (project={project})"
+)
+LANG_RETRIEVAL_CGR_DONE = "cgr {language} call edges (first-party): {count}"
+JAVA_ORACLE_MISSING = "Java toolchain '{binary}' not found on PATH; cannot run oracle"
+SCALA_ORACLE_MISSING = "Scala toolchain '{binary}' not found on PATH; cannot run oracle"
+SCALA_ORACLE_DECODE_FAILED = "scala-cli oracle did not emit JSON on stdout.\nstderr:\n{stderr}\nstdout:\n{stdout}"
+TS_ORACLE_MISSING = "Node toolchain '{binary}' not found on PATH; cannot run oracle"
+PHP_ORACLE_MISSING = "Node toolchain '{binary}' not found on PATH; cannot run oracle"
+LUA_ORACLE_MISSING = "Node toolchain '{binary}' not found on PATH; cannot run oracle"
+C_ORACLE_MISSING = "libclang (clang.cindex) not importable; cannot run the C oracle"
+CPP_RETRIEVAL_ORACLE_MISSING = (
+    "libclang (clang.cindex) not importable; cannot run the C++ oracle"
+)
+SEMANTIC_MISSING = "semantic dependencies not installed; cannot run semantic eval"
+SEMANTIC_TARGET = "Semantic-search eval over {target} (project={project})"
+SEMANTIC_DONE = "recall@{k}: {hits}/{total} queries retrieved the expected function"
+STATIC_CALLS_TARGET = "Static-calls eval over {target} (project={project})"
+STATIC_CALLS_ORACLE_DONE = "oracle direct first-party call edges: {count}"
+STATIC_CALLS_CGR_DONE = "cgr CALLS edges: {count}"
+INDEXING_FETCHING = "Fetching corpus {name} at {commit}"
+INDEXING_MEASURING = "Indexing {target} (project={project}) in a child interpreter"
+INDEXING_CHILD_FAILED = "indexing child process failed:\n{stderr}"
+INDEXING_UNKNOWN_CORPUS = "Unknown corpus {corpus!r}; known: {known}"
+INDEXING_ROW_HINT = "README benchmark-table row:"
+INDEXING_RESETTING = (
+    "Cached corpus {name} is dirty; restoring the pinned tree before indexing"
+)
+AGENTIC_QA_CASES = "Built {count} oracle-derived questions over corpus {corpus}"
+AGENTIC_QA_PROGRESS = "[{condition}] {done}/{total} {name}: f1={f1} in {seconds}s"
+AGENTIC_QA_REINDEXING = "Indexing corpus {corpus} into Memgraph (this can take a while)"
+AGENTIC_QA_RESUME_MISMATCH = (
+    "Cannot --resume from {path}: its fingerprint {stored} does not match the "
+    "current run {current}. Re-run without --resume to start fresh."
+)
+
+# The toolchain could not run the oracle: a stated RESULT, not a crash.
+# Carries the probe stderr so the operator sees why (issue #1639).
+ORACLE_UNAVAILABLE = "Oracle unavailable: {reason}"
+FIRST_TOOL_SUMMARY = (
+    "{graph_first}/{total} structural questions went to the graph first"
+)
+
+# --- graph backend parity (issue #386) ---------------------------------------
+PARITY_DUMPED = "Dumped {nodes} nodes and {rels} relationships (project {project})"
+PARITY_LOADED = "Loaded the dump into {engine} in {seconds:.1f}s"
+PARITY_RAN = "Ran {count} read queries on {engine}; wrote {path}"
+PARITY_SUMMARY = (
+    "{engine}: {same}/{total} queries return the same rows as {reference} "
+    "({differ} differ, {errors} error); query time {engine_s:.1f}s vs {reference_s:.1f}s"
+)
+PARITY_DIFFERS = "  differs: {name}"
+PARITY_ERRORS = "  error:   {name}: {error}"
+JARVIS_FETCHING = "Fetching the JARVIS micro-benchmark at {commit}"

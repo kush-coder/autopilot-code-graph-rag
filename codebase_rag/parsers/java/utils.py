@@ -1,0 +1,891 @@
+from __future__ import annotations
+
+from pathlib import Path
+from typing import TYPE_CHECKING, NamedTuple
+
+from tree_sitter import Node
+
+from ... import constants as cs
+from ...models import MethodModifiersAndAnnotations
+from ...types_defs import (
+    ASTNode,
+    JavaAnnotationInfo,
+    JavaClassInfo,
+    JavaFieldInfo,
+    JavaMethodCallInfo,
+    JavaMethodInfo,
+    JavaMethodReferenceParts,
+)
+from ..utils import safe_decode_text
+
+if TYPE_CHECKING:
+    from ...types_defs import ASTCacheProtocol
+
+
+class ClassContext(NamedTuple):
+    module_qn: str
+    target_class_name: str
+    root_node: Node
+
+
+def get_root_node_from_module_qn(
+    module_qn: str,
+    module_qn_to_file_path: dict[str, Path],
+    ast_cache: ASTCacheProtocol,
+    min_parts: int = 2,
+) -> Node | None:
+    parts = module_qn.split(cs.SEPARATOR_DOT)
+    if len(parts) < min_parts:
+        return None
+
+    file_path = module_qn_to_file_path.get(module_qn)
+    if file_path is None or not (entry := ast_cache.load(file_path)):
+        return None
+
+    root_node, _ = entry
+    return root_node
+
+
+def get_class_context_from_qn(
+    class_qn: str,
+    module_qn_to_file_path: dict[str, Path],
+    ast_cache: ASTCacheProtocol,
+) -> ClassContext | None:
+    parts = class_qn.split(cs.SEPARATOR_DOT)
+    if len(parts) < 2:
+        return None
+
+    module_qn = cs.SEPARATOR_DOT.join(parts[:-1])
+    target_class_name = parts[-1]
+
+    root_node = get_root_node_from_module_qn(
+        module_qn, module_qn_to_file_path, ast_cache, min_parts=1
+    )
+    if root_node is None:
+        return None
+
+    return ClassContext(module_qn, target_class_name, root_node)
+
+
+def extract_package_name(package_node: ASTNode) -> str | None:
+    if package_node.type != cs.TS_PACKAGE_DECLARATION:
+        return None
+
+    return next(
+        (
+            safe_decode_text(child)
+            for child in package_node.children
+            if child.type in [cs.TS_SCOPED_IDENTIFIER, cs.TS_IDENTIFIER]
+        ),
+        None,
+    )
+
+
+def extract_import_path(import_node: ASTNode) -> dict[str, str]:
+    if import_node.type != cs.TS_IMPORT_DECLARATION:
+        return {}
+
+    imports: dict[str, str] = {}
+    imported_path = None
+    is_wildcard = False
+
+    for child in import_node.children:
+        match child.type:
+            case cs.TS_SCOPED_IDENTIFIER | cs.TS_IDENTIFIER:
+                imported_path = safe_decode_text(child)
+            case cs.TS_ASTERISK:
+                is_wildcard = True
+
+    if not imported_path:
+        return imports
+
+    if is_wildcard:
+        wildcard_key = f"*{imported_path}"
+        imports[wildcard_key] = imported_path
+    elif parts := imported_path.split(cs.SEPARATOR_DOT):
+        imported_name = parts[-1]
+        imports[imported_name] = imported_path
+
+    return imports
+
+
+def _extract_superclass(class_node: ASTNode) -> str | None:
+    superclass_node = class_node.child_by_field_name(cs.TS_FIELD_SUPERCLASS)
+    if not superclass_node:
+        return None
+    return _extract_type_identifier_name(superclass_node)
+
+
+def _extract_type_identifier_name(node: ASTNode) -> str | None:
+    match node.type:
+        case cs.TS_TYPE_IDENTIFIER:
+            return safe_decode_text(node)
+        case cs.TS_SCOPED_TYPE_IDENTIFIER:
+            # `Outer.Base`/`pkg.Base`: keep the full scoped name rather than descend
+            # to the first segment (the outer/package), which would point resolution
+            # at the wrong class.
+            return safe_decode_text(node)
+        case cs.TS_GENERIC_TYPE:
+            # The base of a generic type is its first type_identifier/scoped child
+            # (`Box<T>` -> Box, `Outer.Base<T>` -> Outer.Base); ignore the
+            # type_arguments that follow.
+            for child in node.children:
+                if child.type in (
+                    cs.TS_TYPE_IDENTIFIER,
+                    cs.TS_SCOPED_TYPE_IDENTIFIER,
+                ):
+                    return safe_decode_text(child)
+            return None
+        case _:
+            # `extends X` exposes a `superclass` wrapper node, not the type itself;
+            # descend to reach the type_identifier/generic_type.
+            for child in node.children:
+                if name := _extract_type_identifier_name(child):
+                    return name
+            return None
+
+
+_JAVA_NAMED_TYPE_NODES = (cs.TS_TYPE_IDENTIFIER, cs.TS_SCOPED_TYPE_IDENTIFIER)
+
+
+def _extract_interface_name(type_child: ASTNode) -> str | None:
+    # A scoped name (`Outer.Inner`, `Map.Entry<K, V>`) stays whole, as the
+    # superclass does: its last segment alone may name another type.
+    match type_child.type:
+        case cs.TS_TYPE_IDENTIFIER | cs.TS_SCOPED_TYPE_IDENTIFIER:
+            return safe_decode_text(type_child)
+        case cs.TS_GENERIC_TYPE:
+            for sub_child in type_child.children:
+                if sub_child.type in _JAVA_NAMED_TYPE_NODES:
+                    return safe_decode_text(sub_child)
+    return None
+
+
+def _clause_types(clause: ASTNode | None) -> list[ASTNode]:
+    # The types an `extends` or `implements` clause writes, one node each;
+    # keywords, commas and comments are none.
+    if clause is None:
+        return []
+    types: list[ASTNode] = []
+    for child in clause.named_children:
+        if child.type == cs.TS_TYPE_LIST:
+            types.extend(entry for entry in child.named_children if not entry.is_extra)
+        elif not child.is_extra:
+            types.append(child)
+    return types
+
+
+def _extract_interfaces(class_node: ASTNode) -> list[str]:
+    return [
+        interface_name
+        for type_child in _clause_types(
+            class_node.child_by_field_name(cs.TS_FIELD_INTERFACES)
+        )
+        if (interface_name := _extract_interface_name(type_child))
+    ]
+
+
+def java_written_supertype_count(declaration: ASTNode) -> int:
+    # Every supertype a type declaration writes, whether or not a reader
+    # names it: its superclass, the interfaces it implements and, for an
+    # interface, the ones it extends.
+    extends_interfaces = next(
+        (
+            child
+            for child in declaration.children
+            if child.type == cs.TS_JAVA_EXTENDS_INTERFACES
+        ),
+        None,
+    )
+    return sum(
+        len(_clause_types(clause))
+        for clause in (
+            declaration.child_by_field_name(cs.TS_FIELD_SUPERCLASS),
+            declaration.child_by_field_name(cs.TS_FIELD_INTERFACES),
+            extends_interfaces,
+        )
+    )
+
+
+def _extract_type_parameters(declaration: ASTNode) -> list[str]:
+    type_params_node = declaration.child_by_field_name(cs.TS_FIELD_TYPE_PARAMETERS)
+    if not type_params_node:
+        return []
+
+    type_parameters: list[str] = []
+    for child in type_params_node.children:
+        if child.type != cs.TS_TYPE_PARAMETER:
+            continue
+        # The grammar gives a type parameter's name no field: it is the
+        # type_identifier after any annotations, before any bound.
+        name_node = child.child_by_field_name(cs.TS_FIELD_NAME) or next(
+            (c for c in child.children if c.type == cs.TS_TYPE_IDENTIFIER), None
+        )
+        if param_name := safe_decode_text(name_node):
+            type_parameters.append(param_name)
+    return type_parameters
+
+
+def extract_from_modifiers_node(
+    node: ASTNode, allowed_modifiers: frozenset[str]
+) -> MethodModifiersAndAnnotations:
+    result = MethodModifiersAndAnnotations()
+    modifiers_node = next(
+        (child for child in node.children if child.type == cs.TS_MODIFIERS), None
+    )
+    if not modifiers_node:
+        return result
+    for modifier_child in modifiers_node.children:
+        match modifier_child.type:
+            case _ if modifier_child.type in allowed_modifiers:
+                if modifier := safe_decode_text(modifier_child):
+                    result.modifiers.append(modifier)
+            case cs.TS_ANNOTATION | cs.TS_MARKER_ANNOTATION:
+                if annotation := safe_decode_text(modifier_child):
+                    result.annotations.append(annotation)
+    return result
+
+
+def _extract_class_modifiers(class_node: ASTNode) -> list[str]:
+    return extract_from_modifiers_node(class_node, cs.JAVA_CLASS_MODIFIERS).modifiers
+
+
+def extract_class_info(class_node: ASTNode) -> JavaClassInfo:
+    if class_node.type not in cs.JAVA_CLASS_NODE_TYPES:
+        return JavaClassInfo(
+            name=None,
+            type="",
+            superclass=None,
+            interfaces=[],
+            modifiers=[],
+            type_parameters=[],
+        )
+
+    name: str | None = None
+    if name_node := class_node.child_by_field_name(cs.TS_FIELD_NAME):
+        name = safe_decode_text(name_node)
+
+    return JavaClassInfo(
+        name=name,
+        type=class_node.type.replace(cs.JAVA_DECLARATION_SUFFIX, ""),
+        superclass=_extract_superclass(class_node),
+        interfaces=_extract_interfaces(class_node),
+        modifiers=_extract_class_modifiers(class_node),
+        type_parameters=_extract_type_parameters(class_node),
+    )
+
+
+def _get_method_type(method_node: ASTNode) -> str:
+    if method_node.type == cs.TS_CONSTRUCTOR_DECLARATION:
+        return cs.JAVA_TYPE_CONSTRUCTOR
+    return cs.JAVA_TYPE_METHOD
+
+
+def _extract_method_return_type(method_node: ASTNode) -> str | None:
+    if method_node.type != cs.TS_METHOD_DECLARATION:
+        return None
+    if type_node := method_node.child_by_field_name(cs.TS_FIELD_TYPE):
+        return safe_decode_text(type_node)
+    return None
+
+
+def _extract_formal_param_type(param_node: ASTNode) -> str | None:
+    if param_type_node := param_node.child_by_field_name(cs.TS_FIELD_TYPE):
+        return safe_decode_text(param_type_node)
+    return None
+
+
+# Inside a `spread_parameter` the element type is the child that is neither
+# the `modifiers` (`final`, an annotation) nor the declarator that carries
+# the name: a generic, array or primitive element is not a
+# `type_identifier`, and matching that alone yielded no parameter at all
+# for `List<String>... xs`, `String[]... xs` and `int... xs` (issue #1974).
+# A comment between the modifiers and the type is a child of the spread
+# parameter too, and is not the element type either. The walk below reads
+# `children` rather than `named_children`; the only anonymous child is the
+# `...` token, excluded by name.
+_JAVA_NOT_ELEMENT_TYPES = frozenset(
+    {
+        cs.TS_MODIFIERS,
+        cs.TS_VARIABLE_DECLARATOR,
+        cs.TS_LINE_COMMENT,
+        cs.TS_BLOCK_COMMENT,
+    }
+)
+
+
+def spread_element_type_node(spread_node: ASTNode) -> ASTNode | None:
+    """The element-type node of a `spread_parameter`, whatever its shape."""
+    # `children`, not `named_children`: the lightweight node doubles the Java
+    # tests build carry only `children`, and the one anonymous child here is
+    # the `...` token, excluded by name.
+    return next(
+        (
+            child
+            for child in spread_node.children
+            if child.type not in _JAVA_NOT_ELEMENT_TYPES
+            and child.type != cs.LANG_ELLIPSIS
+        ),
+        None,
+    )
+
+
+def _extract_spread_param_type(spread_node: ASTNode) -> str | None:
+    element = spread_element_type_node(spread_node)
+    if element is not None and (param_type_text := safe_decode_text(element)):
+        return f"{param_type_text}..."
+    return None
+
+
+def _extract_method_parameters(method_node: ASTNode) -> list[str]:
+    params_node = method_node.child_by_field_name(cs.TS_FIELD_PARAMETERS)
+    if not params_node:
+        return []
+
+    parameters: list[str] = []
+    for child in params_node.children:
+        param_type: str | None = None
+        match child.type:
+            case cs.TS_FORMAL_PARAMETER:
+                param_type = _extract_formal_param_type(child)
+            case cs.TS_SPREAD_PARAMETER:
+                param_type = _extract_spread_param_type(child)
+        if param_type:
+            parameters.append(param_type)
+    return parameters
+
+
+def is_main_declaration(method_node: ASTNode) -> bool:
+    """Whether the JVM launcher starts this declaration as `main`.
+
+    The launch protocol of JLS 12.1.4, as Java 25 runs it (JEP 512), applied
+    to what one class body shows (issue #2527):
+
+    - A candidate is a non-private `main` that returns void, has an
+      implementation, and takes nothing or one String array. The array may
+      be written on the type, on the name or as varargs; the recorded
+      parameter types cannot tell `String args[]` from a scalar `String arg`.
+    - A `main(String[])` candidate is chosen over a `main()` one, static or
+      not, and stays chosen even when it cannot run.
+    - The chosen method runs if it is static. An instance one also needs a
+      class the launcher can instantiate: concrete, with a non-private
+      zero-argument constructor (the implicit default counts).
+
+    A `main` the class inherits is not visible here.
+    """
+    arity = _main_candidate_arity(method_node)
+    body = method_node.parent
+    if arity is None or body is None:
+        return False
+    if arity == 0 and any(_main_candidate_arity(sib) == 1 for sib in body.children):
+        return False
+    return cs.JAVA_MODIFIER_STATIC in _modifier_types(
+        method_node
+    ) or _launcher_can_instantiate(body)
+
+
+def _main_candidate_arity(node: ASTNode) -> int | None:
+    # 0 or 1 for a `main` the launcher may choose, None for anything else.
+    return_type = node.child_by_field_name(cs.TS_FIELD_TYPE)
+    if not (
+        node.type == cs.TS_METHOD_DECLARATION
+        and safe_decode_text(node.child_by_field_name(cs.TS_FIELD_NAME))
+        == cs.JAVA_MAIN_METHOD_NAME
+        and return_type is not None
+        and return_type.type == cs.TS_VOID_TYPE
+        and cs.JAVA_MODIFIER_PRIVATE not in _modifier_types(node)
+        and _has_implementation(node)
+    ):
+        return None
+    params = _formal_params(node)
+    if not params:
+        return 0
+    return 1 if len(params) == 1 and _is_string_array_param(params[0]) else None
+
+
+def _formal_params(node: ASTNode) -> list[ASTNode]:
+    params_node = node.child_by_field_name(cs.TS_FIELD_PARAMETERS)
+    if params_node is None:
+        return []
+    return [
+        child
+        for child in params_node.children
+        if child.type in (cs.TS_FORMAL_PARAMETER, cs.TS_SPREAD_PARAMETER)
+    ]
+
+
+def _modifier_types(node: ASTNode) -> frozenset[str]:
+    # The keywords and annotations written before a declaration.
+    modifiers = next(
+        (child for child in node.children if child.type == cs.TS_MODIFIERS), None
+    )
+    if modifiers is None:
+        return frozenset()
+    return frozenset(child.type for child in modifiers.children)
+
+
+def _has_implementation(method_node: ASTNode) -> bool:
+    # An abstract `main`, or an interface's without `static`, has no body for
+    # the launcher to run; a native one is implemented outside Java.
+    return method_node.child_by_field_name(
+        cs.TS_FIELD_BODY
+    ) is not None or cs.TS_JAVA_NATIVE in _modifier_types(method_node)
+
+
+def _launcher_can_instantiate(body: ASTNode) -> bool:
+    # An instance `main` runs on an object the launcher builds with a
+    # non-private zero-argument constructor. An interface, an enum or an
+    # anonymous class has none it can call, and nor does an abstract class.
+    declaration = body.parent
+    if declaration is None or declaration.type not in (
+        cs.TS_CLASS_DECLARATION,
+        cs.TS_RECORD_DECLARATION,
+    ):
+        return False
+    if cs.JAVA_MODIFIER_ABSTRACT in _modifier_types(declaration):
+        return False
+    constructors = [
+        child for child in body.children if child.type == cs.TS_CONSTRUCTOR_DECLARATION
+    ]
+    if declaration.type == cs.TS_RECORD_DECLARATION and not _formal_params(declaration):
+        # A record without components has a public zero-argument canonical
+        # constructor whatever else it declares.
+        return True
+    if not constructors and declaration.type == cs.TS_CLASS_DECLARATION:
+        return True
+    return any(
+        not _formal_params(constructor)
+        and cs.JAVA_MODIFIER_PRIVATE not in _modifier_types(constructor)
+        for constructor in constructors
+    )
+
+
+def _is_string_array_param(param: ASTNode) -> bool:
+    if param.type == cs.TS_SPREAD_PARAMETER:
+        element = spread_element_type_node(param)
+        return element is not None and _is_main_element_type(element)
+    param_type = param.child_by_field_name(cs.TS_FIELD_TYPE)
+    dimensions = _dimension_count(
+        param.child_by_field_name(cs.TS_JAVA_FIELD_DIMENSIONS)
+    )
+    if param_type is not None and param_type.type == cs.TS_JAVA_ARRAY_TYPE:
+        dimensions += _dimension_count(
+            param_type.child_by_field_name(cs.TS_JAVA_FIELD_DIMENSIONS)
+        )
+        param_type = param_type.child_by_field_name(cs.TS_JAVA_FIELD_ELEMENT)
+    return (
+        dimensions == 1 and param_type is not None and _is_main_element_type(param_type)
+    )
+
+
+def _dimension_count(dimensions: ASTNode | None) -> int:
+    # Each `[` opens one dimension; annotations may sit between them
+    # (`String @NonNull [] a`).
+    if dimensions is None:
+        return 0
+    return sum(
+        1 for child in dimensions.children if child.type == cs.TS_JAVA_DIMENSION_OPEN
+    )
+
+
+def _is_main_element_type(type_node: ASTNode) -> bool:
+    text = "".join((safe_decode_text(type_node) or "").split())
+    return text in cs.JAVA_MAIN_PARAM_ELEMENT_TYPES
+
+
+def extract_method_info(method_node: ASTNode) -> JavaMethodInfo:
+    if method_node.type not in cs.JAVA_METHOD_NODE_TYPES:
+        return JavaMethodInfo(
+            name=None,
+            type="",
+            return_type=None,
+            parameters=[],
+            modifiers=[],
+            type_parameters=[],
+            annotations=[],
+        )
+
+    mods_and_annots = extract_from_modifiers_node(method_node, cs.JAVA_METHOD_MODIFIERS)
+
+    return JavaMethodInfo(
+        name=safe_decode_text(method_node.child_by_field_name(cs.TS_FIELD_NAME)),
+        type=_get_method_type(method_node),
+        return_type=_extract_method_return_type(method_node),
+        parameters=_extract_method_parameters(method_node),
+        modifiers=mods_and_annots.modifiers,
+        type_parameters=_extract_type_parameters(method_node),
+        annotations=mods_and_annots.annotations,
+    )
+
+
+def extract_field_info(field_node: ASTNode) -> JavaFieldInfo:
+    if field_node.type != cs.TS_FIELD_DECLARATION:
+        return JavaFieldInfo(
+            name=None,
+            type=None,
+            modifiers=[],
+            annotations=[],
+        )
+
+    field_type: str | None = None
+    if type_node := field_node.child_by_field_name(cs.TS_FIELD_TYPE):
+        field_type = safe_decode_text(type_node)
+
+    name: str | None = None
+    declarator_node = field_node.child_by_field_name(cs.TS_FIELD_DECLARATOR)
+    if declarator_node and declarator_node.type == cs.TS_VARIABLE_DECLARATOR:
+        if name_node := declarator_node.child_by_field_name(cs.TS_FIELD_NAME):
+            name = safe_decode_text(name_node)
+
+    mods_and_annots = extract_from_modifiers_node(field_node, cs.JAVA_FIELD_MODIFIERS)
+
+    return JavaFieldInfo(
+        name=name,
+        type=field_type,
+        modifiers=mods_and_annots.modifiers,
+        annotations=mods_and_annots.annotations,
+    )
+
+
+def _java_cast_target_type(object_node: ASTNode) -> str | None:
+    # The target type of a cast receiver: unwrap a parenthesised wrapper to the
+    # cast_expression, read its `type` field, strip generic args so
+    # `((a.b.Reader<T>) x)` -> `a.b.Reader`. The package is KEPT so a qualified cast
+    # resolves to the right class (the resolver handles dotted/alternate-module
+    # names); stripping it would collapse it onto a same-package/imported same-leaf
+    # type. None when there is no cast type.
+    cast = object_node
+    while cast.type == cs.TS_PARENTHESIZED_EXPRESSION:
+        cast = next(
+            (c for c in cast.children if c.type not in cs.DELIMITER_TOKENS), None
+        )
+        if cast is None:
+            return None
+    if cast.type != cs.TS_JAVA_CAST_EXPRESSION:
+        return None
+    type_node = cast.child_by_field_name(cs.FIELD_TYPE)
+    if type_node is None:
+        return None
+    type_text = safe_decode_text(type_node)
+    if not type_text:
+        return None
+    base = type_text.split(cs.CHAR_ANGLE_OPEN, 1)[0]
+    return base.strip() or None
+
+
+def _java_paren_receiver(object_node: ASTNode) -> str | None:
+    # A parenthesised NON-cast receiver `(reader).m()` (or nested `((reader))`):
+    # unwrap the parentheses and return the inner identifier/field-access text so the
+    # call resolves through that variable's type, instead of falling to the
+    # unqualified resolver and binding a same-named decoy. None when the inner
+    # expression is neither an identifier nor a field access.
+    node = object_node
+    while node.type == cs.TS_PARENTHESIZED_EXPRESSION:
+        node = next(
+            (c for c in node.children if c.type not in cs.DELIMITER_TOKENS), None
+        )
+        if node is None:
+            return None
+    if node.type in (cs.TS_IDENTIFIER, cs.TS_FIELD_ACCESS):
+        return safe_decode_text(node)
+    return None
+
+
+def _receiver_text(object_node: ASTNode) -> str | None:
+    match object_node.type:
+        case cs.TS_THIS:
+            return cs.TS_THIS
+        case cs.TS_SUPER:
+            return cs.TS_SUPER
+        case cs.TS_IDENTIFIER | cs.TS_FIELD_ACCESS:
+            return safe_decode_text(object_node)
+        case cs.TS_PARENTHESIZED_EXPRESSION | cs.TS_JAVA_CAST_EXPRESSION:
+            # A cast receiver `((T) x).m()`: the cast's target type is the
+            # receiver type, so m resolves on T. A parenthesised non-cast receiver
+            # `(reader).m()` keeps its inner identifier/field-access receiver.
+            # Without this the call falls to the unqualified path and never finds
+            # a cross-file/sibling T or the variable's type.
+            return _java_cast_target_type(object_node) or _java_paren_receiver(
+                object_node
+            )
+    return None
+
+
+def method_reference_parts(ref_node: ASTNode) -> JavaMethodReferenceParts | None:
+    if ref_node.type != cs.TS_JAVA_METHOD_REFERENCE:
+        return None
+    # Comments are extras the grammar lets sit between any two tokens, so they
+    # are not counted as the receiver or the name.
+    tokens = [
+        c
+        for c in ref_node.children
+        if c.type not in (cs.TS_LINE_COMMENT, cs.TS_BLOCK_COMMENT)
+    ]
+    if len(tokens) < 3:
+        return None
+    receiver, name_node = tokens[0], tokens[-1]
+    if name_node.type == cs.TS_JAVA_NEW_KEYWORD:
+        return JavaMethodReferenceParts(receiver=receiver, method_name=None)
+    if name_node.type != cs.TS_IDENTIFIER or not (name := safe_decode_text(name_node)):
+        return None
+    return JavaMethodReferenceParts(receiver=receiver, method_name=name)
+
+
+def method_reference_receiver_text(receiver: ASTNode) -> str | None:
+    # A method reference's receiver may also be a TYPE (`List<String>::size`,
+    # `Outer.Inner::new`), which a call's `object` never is; its generic
+    # arguments are dropped as `new T<A>()` drops them. An array type
+    # (`int[]::new`) names no class and yields None.
+    if receiver.type in (
+        cs.TS_TYPE_IDENTIFIER,
+        cs.TS_SCOPED_TYPE_IDENTIFIER,
+        cs.TS_GENERIC_TYPE,
+    ):
+        if not (text := safe_decode_text(receiver)):
+            return None
+        return text.split(cs.CHAR_ANGLE_OPEN, 1)[0].strip() or None
+    return _receiver_text(receiver)
+
+
+def extract_method_call_info(call_node: ASTNode) -> JavaMethodCallInfo | None:
+    if call_node.type != cs.TS_METHOD_INVOCATION:
+        return None
+
+    name: str | None = None
+    if name_node := call_node.child_by_field_name(cs.TS_FIELD_NAME):
+        name = safe_decode_text(name_node)
+
+    obj: str | None = None
+    if object_node := call_node.child_by_field_name(cs.TS_FIELD_OBJECT):
+        obj = _receiver_text(object_node)
+
+    arguments = 0
+    if args_node := call_node.child_by_field_name(cs.TS_FIELD_ARGUMENTS):
+        arguments = sum(
+            1 for child in args_node.children if child.type not in cs.DELIMITER_TOKENS
+        )
+
+    return JavaMethodCallInfo(name=name, object=obj, arguments=arguments)
+
+
+def enum_constants(enum_node: ASTNode) -> list[ASTNode]:
+    body = enum_node.child_by_field_name(cs.TS_FIELD_BODY)
+    if body is None:
+        return []
+    return [c for c in body.named_children if c.type == cs.TS_JAVA_ENUM_CONSTANT]
+
+
+def enum_constructors(enum_node: ASTNode) -> list[ASTNode]:
+    # Only the enum's own declarations: a nested type's constructor sits one
+    # class body deeper and is never run by these constants.
+    body = enum_node.child_by_field_name(cs.TS_FIELD_BODY)
+    if body is None:
+        return []
+    return [
+        member
+        for section in body.named_children
+        if section.type == cs.TS_JAVA_ENUM_BODY_DECLARATIONS
+        for member in section.named_children
+        if member.type == cs.TS_CONSTRUCTOR_DECLARATION
+    ]
+
+
+def argument_count(node: ASTNode) -> int:
+    # A comment between arguments is a named child of the list, not an argument.
+    args_node = node.child_by_field_name(cs.TS_FIELD_ARGUMENTS)
+    if args_node is None:
+        return 0
+    return sum(
+        1
+        for child in args_node.named_children
+        if child.type not in (cs.TS_LINE_COMMENT, cs.TS_BLOCK_COMMENT)
+    )
+
+
+def accepts_argument_count(callable_node: ASTNode, arg_count: int) -> bool:
+    # JLS 15.12.2.1: a fixed-arity callable is a candidate only for its exact
+    # arity; a variable-arity one for any count covering its fixed parameters.
+    params_node = callable_node.child_by_field_name(cs.TS_FIELD_PARAMETERS)
+    params = (
+        [
+            c
+            for c in params_node.named_children
+            if c.type in (cs.TS_FORMAL_PARAMETER, cs.TS_SPREAD_PARAMETER)
+        ]
+        if params_node is not None
+        else []
+    )
+    if params and params[-1].type == cs.TS_SPREAD_PARAMETER:
+        return arg_count >= len(params) - 1
+    return arg_count == len(params)
+
+
+def _has_main_method_modifiers(method_node: ASTNode) -> bool:
+    has_public = False
+    has_static = False
+
+    for child in method_node.children:
+        if child.type == cs.TS_MODIFIERS:
+            for modifier_child in child.children:
+                match modifier_child.type:
+                    case cs.JAVA_MODIFIER_PUBLIC:
+                        has_public = True
+                    case cs.JAVA_MODIFIER_STATIC:
+                        has_static = True
+
+    return has_public and has_static
+
+
+def _is_valid_main_formal_param(param_node: ASTNode) -> bool:
+    type_node = param_node.child_by_field_name(cs.TS_FIELD_TYPE)
+    if not type_node:
+        return False
+
+    type_text = safe_decode_text(type_node)
+    if not type_text:
+        return False
+
+    return (
+        cs.JAVA_MAIN_PARAM_ARRAY in type_text
+        or cs.JAVA_MAIN_PARAM_VARARGS in type_text
+        or type_text.endswith(cs.JAVA_MAIN_PARAM_ARRAY)
+        or type_text.endswith(cs.JAVA_MAIN_PARAM_VARARGS)
+    )
+
+
+def _is_valid_main_spread_param(spread_node: ASTNode) -> bool:
+    for subchild in spread_node.children:
+        if subchild.type == cs.TS_TYPE_IDENTIFIER:
+            type_text = safe_decode_text(subchild)
+            if type_text == cs.JAVA_MAIN_PARAM_TYPE:
+                return True
+    return False
+
+
+def _has_valid_main_parameter(method_node: ASTNode) -> bool:
+    parameters_node = method_node.child_by_field_name(cs.TS_FIELD_PARAMETERS)
+    if not parameters_node:
+        return False
+
+    param_count = 0
+    valid_param = False
+
+    for child in parameters_node.children:
+        match child.type:
+            case cs.TS_FORMAL_PARAMETER:
+                param_count += 1
+                if _is_valid_main_formal_param(child):
+                    valid_param = True
+            case cs.TS_SPREAD_PARAMETER:
+                param_count += 1
+                if _is_valid_main_spread_param(child):
+                    valid_param = True
+
+    return param_count == 1 and valid_param
+
+
+def is_main_method(method_node: ASTNode) -> bool:
+    if method_node.type != cs.TS_METHOD_DECLARATION:
+        return False
+
+    name_node = method_node.child_by_field_name(cs.TS_FIELD_NAME)
+    if not name_node or safe_decode_text(name_node) != cs.JAVA_MAIN_METHOD_NAME:
+        return False
+
+    type_node = method_node.child_by_field_name(cs.TS_FIELD_TYPE)
+    if not type_node or type_node.type != cs.TS_VOID_TYPE:
+        return False
+
+    if not _has_main_method_modifiers(method_node):
+        return False
+
+    return _has_valid_main_parameter(method_node)
+
+
+def get_java_visibility(node: ASTNode) -> str:
+    for child in node.children:
+        match child.type:
+            case cs.JAVA_VISIBILITY_PUBLIC:
+                return cs.JAVA_VISIBILITY_PUBLIC
+            case cs.JAVA_VISIBILITY_PROTECTED:
+                return cs.JAVA_VISIBILITY_PROTECTED
+            case cs.JAVA_VISIBILITY_PRIVATE:
+                return cs.JAVA_VISIBILITY_PRIVATE
+
+    return cs.JAVA_VISIBILITY_PACKAGE
+
+
+def build_qualified_name(
+    node: ASTNode,
+    include_classes: bool = True,
+    include_methods: bool = False,
+) -> list[str]:
+    path_parts: list[str] = []
+    current = node.parent
+
+    while current and current.type != cs.TS_PROGRAM:
+        if (
+            (current.type in cs.JAVA_CLASS_NODE_TYPES and include_classes)
+            or (current.type in cs.JAVA_METHOD_NODE_TYPES and include_methods)
+        ) and (name := _declared_name(current)):
+            path_parts.append(name)
+        current = current.parent
+
+    path_parts.reverse()
+    return path_parts
+
+
+def _declared_name(node: ASTNode) -> str | None:
+    name_node = node.child_by_field_name(cs.TS_FIELD_NAME)
+    return safe_decode_text(name_node) if name_node else None
+
+
+def extract_annotation_info(annotation_node: ASTNode) -> JavaAnnotationInfo:
+    if annotation_node.type != cs.TS_ANNOTATION:
+        return JavaAnnotationInfo(name=None, arguments=[])
+
+    name: str | None = None
+    if name_node := annotation_node.child_by_field_name(cs.TS_FIELD_NAME):
+        name = safe_decode_text(name_node)
+
+    arguments: list[str] = []
+    if args_node := annotation_node.child_by_field_name(cs.TS_FIELD_ARGUMENTS):
+        for child in args_node.children:
+            if child.type not in cs.DELIMITER_TOKENS:
+                if arg_value := safe_decode_text(child):
+                    arguments.append(arg_value)
+
+    return JavaAnnotationInfo(name=name, arguments=arguments)
+
+
+def find_package_start_index(parts: list[str]) -> int | None:
+    for i, part in enumerate(parts):
+        if part in cs.JAVA_JVM_LANGUAGES and i > 0:
+            return i + 1
+
+        if part == cs.JAVA_PATH_SRC and i + 1 < len(parts):
+            next_part = parts[i + 1]
+
+            if (
+                next_part not in cs.JAVA_JVM_LANGUAGES
+                and next_part not in cs.JAVA_SRC_FOLDERS
+            ):
+                return i + 1
+
+            if _is_non_standard_java_src_layout(parts, i):
+                return i + 1
+
+    return None
+
+
+def _is_non_standard_java_src_layout(parts: list[str], src_idx: int) -> bool:
+    if src_idx + 2 >= len(parts):
+        return False
+
+    next_part = parts[src_idx + 1]
+    part_after_next = parts[src_idx + 2]
+
+    return (
+        next_part in (cs.JAVA_PATH_MAIN, cs.JAVA_PATH_TEST)
+        and part_after_next not in cs.JAVA_JVM_LANGUAGES
+    )

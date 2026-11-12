@@ -1,0 +1,524 @@
+# Shared tree-sitter node types, field names, and query captures.
+
+from .languages import SupportedLanguage
+
+FUNCTION_NODES_BASIC = ("function_declaration", "function_definition")
+FUNCTION_NODES_LAMBDA = (
+    "lambda_expression",
+    "arrow_function",
+    "anonymous_function",
+    "closure_expression",
+)
+FUNCTION_NODES_METHOD = (
+    "method_declaration",
+    "constructor_declaration",
+    "destructor_declaration",
+)
+FUNCTION_NODES_TEMPLATE = (
+    "template_declaration",
+    "function_signature_item",
+    "function_signature",
+)
+FUNCTION_NODES_GENERATOR = ("generator_function_declaration", "function_expression")
+
+CLASS_NODES_BASIC = ("class_declaration", "class_definition")
+CLASS_NODES_STRUCT = ("struct_declaration", "struct_specifier", "struct_item")
+CLASS_NODES_INTERFACE = ("interface_declaration", "trait_declaration", "trait_item")
+CLASS_NODES_ENUM = ("enum_declaration", "enum_item", "enum_specifier")
+CLASS_NODES_TYPE_ALIAS = ("type_alias_declaration", "type_item")
+CLASS_NODES_UNION = ("union_specifier", "union_item")
+
+CALL_NODES_BASIC = ("call_expression", "function_call")
+CALL_NODES_METHOD = (
+    "method_invocation",
+    "member_call_expression",
+    "field_expression",
+)
+CALL_NODES_OPERATOR = ("binary_expression", "unary_expression", "update_expression")
+CALL_NODES_SPECIAL = ("new_expression", "delete_expression", "macro_invocation")
+
+IMPORT_NODES_STANDARD = ("import_declaration", "import_statement")
+IMPORT_NODES_FROM = ("import_from_statement",)
+# variable_declaration: CommonJS `var X = require(...)` (express) binds
+# imports like const/let lexical_declarations.
+IMPORT_NODES_MODULE = (
+    "lexical_declaration",
+    "variable_declaration",
+    "export_statement",
+)
+IMPORT_NODES_INCLUDE = ("preproc_include",)
+
+JS_TS_FUNCTION_NODES = (
+    "function_declaration",
+    "generator_function_declaration",
+    # The generator EXPRESSION (`const g = function* () {}`) is a function
+    # value like function_expression; omitting it left such nodes
+    # unregistered and unreferencable (issue #994).
+    "generator_function",
+    "function_expression",
+    "arrow_function",
+    "method_definition",
+)
+# The anonymous class-expression node type (`const X = class {...}`); the named
+# form is `class_declaration`.
+TS_CLASS_EXPRESSION = "class"
+JS_TS_CLASS_NODES = ("class_declaration", TS_CLASS_EXPRESSION)
+JS_TS_IMPORT_NODES = (
+    "import_statement",
+    "lexical_declaration",
+    "variable_declaration",
+    "export_statement",
+)
+JS_TS_LANGUAGES = frozenset(
+    {SupportedLanguage.JS, SupportedLanguage.TS, SupportedLanguage.TSX}
+)
+# Sets of languages whose sources reach each other directly: the JS family
+# compiles to one runtime, C++ calls C, and Scala calls Java on the JVM. A
+# call may cross between them, and their same-stem files (a C source and its
+# header, a `.js` beside its `.ts`) are halves of one module that importers
+# name without an extension. Any language absent here is a family of its own.
+LANGUAGE_FAMILIES: tuple[frozenset[SupportedLanguage], ...] = (
+    JS_TS_LANGUAGES,
+    frozenset({SupportedLanguage.C, SupportedLanguage.CPP}),
+    frozenset({SupportedLanguage.JAVA, SupportedLanguage.SCALA}),
+)
+# Languages where a definition in another file is reachable only through an
+# import (or a Rust `use`): a call the resolver could not bind there waits
+# on an import, which the importer lookup finds from the graph, so recording
+# the callee's name would only re-parse every module that calls a method of
+# that name (issue #1568; local review). Go, Java, C#, C++ and their like
+# see same-package or same-namespace definitions with no import at all, and
+# for them the recorded name is the only link.
+IMPORT_BOUND_CALL_LANGUAGES = frozenset(
+    {
+        SupportedLanguage.PYTHON,
+        SupportedLanguage.JS,
+        SupportedLanguage.TS,
+        SupportedLanguage.TSX,
+        SupportedLanguage.RUST,
+        SupportedLanguage.DART,
+        SupportedLanguage.LUA,
+    }
+)
+
+CPP_IMPORT_NODES = ("preproc_include", "template_function", "declaration")
+
+# AST field names for name extraction
+NAME_FIELDS = ("identifier", "name", "id")
+
+# Tree-sitter field name constants for child_by_field_name
+FIELD_OBJECT = "object"
+FIELD_PROPERTY = "property"
+FIELD_NAME = "name"
+FIELD_ALIAS = "alias"
+FIELD_SOURCE = "source"
+FIELD_MODULE_NAME = "module_name"
+FIELD_ARGUMENTS = "arguments"
+FIELD_BODY = "body"
+FIELD_RETURN_TYPE = "return_type"
+FIELD_CONSTRUCTOR = "constructor"
+FIELD_DECLARATOR = "declarator"
+FIELD_PARAMETERS = "parameters"
+# A JS/TS arrow with a single bare-identifier parameter (`x => ...`) carries it
+# in the singular `parameter` field, with no formal_parameters wrapper.
+FIELD_PARAMETER = "parameter"
+FIELD_KIND = "kind"
+FIELD_RECEIVER = "receiver"
+FIELD_TYPE = "type"
+# The wrapped function/class inside a Python decorated_definition node.
+FIELD_DEFINITION = "definition"
+# The declaration a JS/TS `export_statement` wraps (`export const X = ...`).
+FIELD_DECLARATION = "declaration"
+FIELD_RESULT = "result"
+# Rust impl `trait`/`type` fields and a trait's supertrait `bounds`.
+FIELD_TRAIT = "trait"
+FIELD_BOUNDS = "bounds"
+TS_RS_TRAIT_BOUNDS = "trait_bounds"
+FIELD_VALUE = "value"
+FIELD_DECLARATION = "declaration"
+FIELD_SOURCE = "source"
+FIELD_LEFT = "left"
+FIELD_RIGHT = "right"
+# A C-style for's post-iteration clause: Java/C++ hold it in an `update`
+# field on the loop node, Go inside its `for_clause`.
+FIELD_UPDATE = "update"
+FIELD_FIELD = "field"
+FIELD_SCOPE = "scope"
+FIELD_SUPERCLASS = "superclass"
+FIELD_SUPERCLASSES = "superclasses"
+FIELD_INTERFACES = "interfaces"
+
+# How the rename cross-check reads a name token (issue #2564). Each grammar
+# spells a binding its own way, so node types are matched by marker; a token
+# none of them recognises counts as a use, which refuses rather than misses.
+FIELD_PATTERN = "pattern"
+FIELD_DEFAULT = "default"
+# Fields whose content is evaluated, never bound: `x=helper`, `y: helper`.
+RENAME_VALUE_FIELDS = frozenset({FIELD_VALUE, FIELD_RIGHT, FIELD_DEFAULT, FIELD_TYPE})
+# Node types that only group the names one binding introduces: `a, helper = ...`.
+RENAME_WRAPPER_SUFFIXES = ("_pattern", "pattern_list", "expression_list")
+# A definition or declaration naming the token: `def helper`, `let helper`.
+RENAME_DEFINITION_SUFFIXES = (
+    "definition",
+    "declaration",
+    "declarator",
+    "_item",
+    "signature",
+    "_spec",
+)
+RENAME_DEFINITION_FIELDS = frozenset(
+    {FIELD_NAME, FIELD_PATTERN, FIELD_DECLARATOR, FIELD_PROPERTY}
+)
+# An assignment or loop target: `helper = 3`, `for helper in xs`.
+RENAME_REBINDING_MARKERS = ("assignment", "for", "declaration", "range")
+RENAME_REBINDING_FIELDS = frozenset({FIELD_LEFT, FIELD_PATTERN})
+# The assignment among them: a JS name it targets is not declared by it.
+RENAME_ASSIGNMENT_MARKER = "assignment"
+# Where a JS `const`, `let`, class, function name or catch binding holds:
+# the block around it. A `var` holds in its whole function.
+RENAME_JS_BLOCKS = frozenset(
+    {
+        "statement_block",
+        "program",
+        "for_statement",
+        "for_in_statement",
+        "catch_clause",
+        "switch_body",
+    }
+)
+RENAME_JS_FUNCTION_SCOPED = "variable_declaration"
+RENAME_JS_CLASS_BODY = "class_body"
+RENAME_PARAMETER_MARKER = "parameter"
+RENAME_AS_TARGET = "as_pattern_target"
+# The JS/TS imports that bind a name the importer chooses, with no `alias`
+# field to say so: the default import (`import mul from`), a namespace
+# import (`import * as mul from`) and TypeScript's `import mul =
+# require(...)` and `import mul = a.b`. Their first named child is a local
+# of the file, as an alias is, not the exported symbol's own name.
+RENAME_JS_IMPORT_BINDINGS = frozenset(
+    {"import_clause", "namespace_import", "import_require_clause", "import_alias"}
+)
+# A name that labels an argument or a key instead of naming a value.
+RENAME_KEYWORD_ARGUMENT_MARKER = "keyword_argument"
+RENAME_LABEL_TYPES = frozenset({"label", "name_colon"})
+RENAME_PAIR = "pair"
+RENAME_INITIALIZER_MARKER = "initializer"
+# What opens a scope a local binding shadows; a class body does not, since a
+# method's bare names never resolve to its class's attributes in Python.
+RENAME_SCOPE_MARKERS = (
+    "func",
+    "lambda",
+    "method",
+    "closure",
+    "comprehension",
+    "generator_expression",
+)
+RENAME_CLASS_MARKER = "class"
+RENAME_NOT_SCOPE_MARKERS = ("call", "invocation", "type", "signature")
+RENAME_MEMBER_ACCESS = (".", "->")
+# `->` reaches a member only in these languages; elsewhere it marks a return
+# type (`def make() -> Widget`, `fn new() -> Parse`) or a lambda's body.
+RENAME_ARROW_ACCESS = "->"
+RENAME_ARROW_MEMBER_LANGUAGES = frozenset(
+    {
+        SupportedLanguage.C,
+        SupportedLanguage.CPP,
+        SupportedLanguage.PHP,
+        SupportedLanguage.CSHARP,
+    }
+)
+# A node whose body holds methods, so `self`, `this` and a bare call inside
+# it reach the methods of the class its header names (it carries `body`).
+RENAME_TYPE_SCOPE_MARKERS = (
+    "class",
+    "impl",
+    "trait",
+    "interface",
+    "struct",
+    "enum",
+    "record",
+    "mixin",
+    "extension",
+)
+RENAME_IMPORT_MARKER = "import"
+# The statement that brings a name in from another module, by marker:
+# `import` and `from ... import` (Python, JS/TS, Java, Go, Scala, Dart),
+# `use` (Rust, PHP) and `using` (C#, C++).
+RENAME_IMPORT_STATEMENTS = (
+    "import",
+    "use_declaration",
+    "using_directive",
+    "using_declaration",
+)
+# What a path into the project may start with in place of a package name:
+# `use crate::Parse`, `use super::Parse`.
+RENAME_RUST_CRATE = "crate"
+RENAME_RUST_SELF = "self"
+RENAME_RUST_SUPER = "super"
+RENAME_PROJECT_ROOT_WORDS = frozenset(
+    {RENAME_RUST_CRATE, RENAME_RUST_SELF, RENAME_RUST_SUPER}
+)
+# The files that root a Rust crate: `crate::` starts in their directory.
+RENAME_RUST_CRATE_ROOTS = ("lib.rs", "main.rs")
+# `mod parse;` declares the child module `parse` of the file's own module.
+RENAME_RUST_MOD_ITEM = "mod_item"
+# A file that is its directory's module rather than one of its own:
+# `pkg/__init__.py` is `pkg`, `src/cmd/mod.rs` is `cmd`, `lib/index.js` is
+# `lib`, and `src/lib.rs` the crate root.
+RENAME_PACKAGE_FILES: dict[SupportedLanguage, frozenset[str]] = {
+    SupportedLanguage.PYTHON: frozenset({"__init__"}),
+    SupportedLanguage.RUST: frozenset({"mod", "lib", "main"}),
+    **dict.fromkeys(JS_TS_LANGUAGES, frozenset({"index"})),
+}
+# Words of an import statement that never name a module or a binding.
+RENAME_IMPORT_KEYWORDS = frozenset(
+    {
+        "import",
+        "from",
+        "use",
+        "as",
+        "static",
+        "pub",
+        "package",
+        "type",
+        "typeof",
+        "using",
+        "namespace",
+        "require",
+        "export",
+        "default",
+        "extern",
+        "in",
+        "*",
+    }
+)
+RENAME_IMPORT_ALIAS = "as"
+RENAME_IMPORT_ALL = "*"
+# Where a bare name reaches a function of another file only through an
+# import: a bare `sorted(xs)` there that imports no project `sorted` is the
+# builtin. Go, Java, C#, Scala and their like see a same-package function
+# with no import, Dart imports a library whole, and a Lua global is shared
+# by every file, so there a bare name is held to the plan as before.
+# What makes a JS/TS file a module: without either it is a classic script,
+# and its top-level names are globals every other script reaches bare.
+RENAME_JS_MODULE_STATEMENTS = frozenset({"import_statement", "export_statement"})
+RENAME_IMPORT_REQUIRED_LANGUAGES = frozenset(
+    {SupportedLanguage.PYTHON, SupportedLanguage.RUST, *JS_TS_LANGUAGES}
+)
+# How far above a binding its declaration's type and value may sit:
+# `Parse* p = ...` puts `p` three levels under the declaration.
+RENAME_DECLARATION_DEPTH = 3
+# Characters around a declared type that do not change which class it
+# names: `: Parse`, `*Parse`, `'Parse'`, `Parse?`.
+RENAME_TYPE_DECORATION = " \t\r\n:&*?'\""
+# What separates a qualified name's segments: `a::Parse`, `a.Parse`, `A\Parse`.
+RENAME_TYPE_SEPARATORS = ("::", ".", "\\")
+# Expressions that hand on their operand's value: `Parse::new(frame)?`.
+RENAME_TRANSPARENT_EXPRESSIONS = frozenset(
+    {"try_expression", "await_expression", "await", "parenthesized_expression"}
+)
+# An expression that builds an object: `Parse(x)`, `new Parse()`,
+# `Parse { .. }`, and `Parse::new(x)` by convention.
+RENAME_CONSTRUCTION_MARKERS = (
+    "call",
+    "new_expression",
+    "creation_expression",
+    "struct_expression",
+)
+RENAME_CONSTRUCTOR_SUFFIXES = ("::new", ".new")
+RENAME_PHP_RECEIVERS = frozenset({"$this", "self", "static", "parent"})
+
+QUERY_FUNCTIONS = "functions"
+QUERY_CLASSES = "classes"
+QUERY_CALLS = "calls"
+QUERY_IMPORTS = "imports"
+QUERY_LOCALS = "locals"
+QUERY_CONFIG = "config"
+QUERY_LANGUAGE = "language"
+QUERY_HIGHLIGHTS = "highlights"
+
+CAPTURE_FUNCTION = "function"
+CAPTURE_CLASS = "class"
+CAPTURE_CALL = "call"
+CAPTURE_IMPORT = "import"
+CAPTURE_IMPORT_FROM = "import_from"
+CAPTURE_KEYWORD_MODIFIER = "keyword.modifier"
+CAPTURE_KEYWORD = "keyword"
+CAPTURE_ATTRIBUTE = "attribute"
+CAPTURE_FUNCTION_DECORATOR = "function.decorator"
+
+EXCLUDED_KEYWORDS = frozenset(
+    {
+        "def",
+        "class",
+        "fn",
+        "struct",
+        "impl",
+        "interface",
+        "enum",
+        "function",
+        "trait",
+        "type",
+        "void",
+        "None",
+        "True",
+        "False",
+        "null",
+        "true",
+        "false",
+        "return",
+        "import",
+        "from",
+        "as",
+        "where",
+    }
+)
+
+TS_IMPORT_STATEMENT = "import_statement"
+TS_IMPORT_FROM_STATEMENT = "import_from_statement"
+TS_DOTTED_NAME = "dotted_name"
+TS_ALIASED_IMPORT = "aliased_import"
+TS_RELATIVE_IMPORT = "relative_import"
+TS_IMPORT_PREFIX = "import_prefix"
+TS_WILDCARD_IMPORT = "wildcard_import"
+
+TS_STRING = "string"
+# JS/TS string literals hold their text in a string_fragment child (like
+# Python's string_content), used for I/O target extraction.
+TS_STRING_FRAGMENT = "string_fragment"
+# The node type for an escaped char, spelled the same in every grammar we load
+# but placed differently, so check the shape before reusing this anywhere new:
+# JS/TS, Go, Rust, C/C++, C# and Java make it a SIBLING that splits the
+# surrounding content into separate fragments, and a reader joining content
+# children alone drops it and fuses the fragments either side (issue #944);
+# Python and Lua nest it inside their content node, which needs no handling;
+# Dart and Scala expose the escape as the only named child, with the plain
+# text in hidden tokens, so a content-plus-escape join would return the escape
+# ALONE (neither has an io_access descriptor today).
+TS_ESCAPE_SEQUENCE = "escape_sequence"
+# Modern Node builtin imports carry a node: scheme (`import fs from 'node:fs'`);
+# stripped when checking whether an imported name is the builtin module.
+NODE_BUILTIN_PREFIX = "node:"
+# `return_statement` node type (shared by Python and JS/TS grammars); used by
+# the language-agnostic flow walk.
+TS_RETURN_STATEMENT = "return_statement"
+# `await fetch(...)` wraps the call in an await_expression; the flow walk
+# unwraps it to see the inner source expression.
+TS_AWAIT_EXPRESSION = "await_expression"
+# tree-sitter parses comments as named children, so the flow walk filters them
+# out before indexing arguments or reading a single sub-expression.
+TS_COMMENT = "comment"
+# `(expr)` wraps its value in a parenthesized_expression; the flow walk unwraps
+# it (like await) to reach the inner source/tainted expression.
+TS_PARENTHESIZED_EXPRESSION = "parenthesized_expression"
+TS_IMPORT_CLAUSE = "import_clause"
+TS_LEXICAL_DECLARATION = "lexical_declaration"
+TS_VARIABLE_DECLARATION = "variable_declaration"
+TS_EXPORT_STATEMENT = "export_statement"
+TS_NAMED_IMPORTS = "named_imports"
+TS_IMPORT_SPECIFIER = "import_specifier"
+TS_NAMESPACE_IMPORT = "namespace_import"
+TS_IDENTIFIER = "identifier"
+# `import.meta` (and `new.target`): a module's own URL in ESM.
+TS_META_PROPERTY = "meta_property"
+TS_VARIABLE_DECLARATOR = "variable_declarator"
+TS_CALL_EXPRESSION = "call_expression"
+TS_EXPORT_CLAUSE = "export_clause"
+TS_EXPORT_SPECIFIER = "export_specifier"
+TS_EXPORT_DEFAULT = "default"
+TS_ACCESSIBILITY_MODIFIER = "accessibility_modifier"
+TS_PRIVATE = "private"
+TS_PRIVATE_PROPERTY_IDENTIFIER = "private_property_identifier"
+
+TS_IMPORT_DECLARATION = "import_declaration"
+TS_STATIC = "static"
+TS_READONLY = "readonly"
+TS_SCOPED_IDENTIFIER = "scoped_identifier"
+TS_ASTERISK = "asterisk"
+
+TS_USE_DECLARATION = "use_declaration"
+
+TS_IMPORT_SPEC = "import_spec"
+TS_IMPORT_SPEC_LIST = "import_spec_list"
+TS_PACKAGE_IDENTIFIER = "package_identifier"
+TS_INTERPRETED_STRING_LITERAL = "interpreted_string_literal"
+
+TS_PREPROC_INCLUDE = "preproc_include"
+TS_TEMPLATE_FUNCTION = "template_function"
+TS_DECLARATION = "declaration"
+TS_STRING_LITERAL = "string_literal"
+TS_SYSTEM_LIB_STRING = "system_lib_string"
+TS_TEMPLATE_ARGUMENT_LIST = "template_argument_list"
+# Plain call/constructor argument list (C++ `in("x.txt")` init_declarator
+# value, Java `new FileWriter("x")` arguments).
+TS_ARGUMENT_LIST = "argument_list"
+# `do { .. } while (cond)`: same node type in the Java and C++ grammars.
+TS_DO_STATEMENT = "do_statement"
+# Shared verbatim by the JS/TS, Java, and C++ grammars.
+TS_BREAK_STATEMENT = "break_statement"
+TS_TYPE_DESCRIPTOR = "type_descriptor"
+TS_TYPE_IDENTIFIER = "type_identifier"
+
+TS_RETURN_STATEMENT = "return_statement"
+TS_RETURN = "return"
+TS_NEW_EXPRESSION = "new_expression"
+
+# Tree-sitter class/module node types for class_ingest
+TS_MODULE_DECLARATION = "module_declaration"
+TS_IMPL_ITEM = "impl_item"
+TS_INTERFACE_DECLARATION = "interface_declaration"
+TS_ENUM_DECLARATION = "enum_declaration"
+TS_ENUM_SPECIFIER = "enum_specifier"
+TS_ENUM_CLASS_SPECIFIER = "enum_class_specifier"
+TS_TYPE_ALIAS_DECLARATION = "type_alias_declaration"
+TS_STRUCT_SPECIFIER = "struct_specifier"
+TS_UNION_SPECIFIER = "union_specifier"
+TS_CLASS_DECLARATION = "class_declaration"
+TS_NAMESPACE_DEFINITION = "namespace_definition"
+TS_ABSTRACT_CLASS_DECLARATION = "abstract_class_declaration"
+TS_INTERNAL_MODULE = "internal_module"
+
+TS_BASE_CLASS_CLAUSE = "base_class_clause"
+TS_TEMPLATE_TYPE = "template_type"
+TS_ACCESS_SPECIFIER = "access_specifier"
+TS_VIRTUAL = "virtual"
+TS_TYPE_LIST = "type_list"
+TS_CLASS_HERITAGE = "class_heritage"
+# TS class `implements I, J` clause (a child of class_heritage).
+TS_IMPLEMENTS_CLAUSE = "implements_clause"
+TS_EXTENDS_CLAUSE = "extends_clause"
+TS_MEMBER_EXPRESSION = "member_expression"
+TS_SELECTOR_EXPRESSION = "selector_expression"
+TS_EXTENDS = "extends"
+TS_ARGUMENTS = "arguments"
+TS_EXTENDS_TYPE_CLAUSE = "extends_type_clause"
+
+TS_METHOD_DEFINITION = "method_definition"
+TS_DECORATOR = "decorator"
+TS_ERROR = "ERROR"
+TS_EXPRESSION_STATEMENT = "expression_statement"
+TS_STATEMENT_BLOCK = "statement_block"
+TS_PARENTHESIZED_EXPRESSION = "parenthesized_expression"
+TS_BINARY_EXPRESSION = "binary_expression"
+
+TS_ATTRIBUTE = "attribute"
+
+TS_FUNCTION_SIGNATURE = "function_signature"
+# `declare function f(): void;` wraps its signature the way `export` wraps a
+# declaration in an export_statement (and `export declare` nests both).
+TS_AMBIENT_DECLARATION = "ambient_declaration"
+# Bodiless TS members (issue #2524): an interface's `find(id: string): T;` and a
+# class's `abstract area(): number;`. The same `method_signature` node also
+# spells a class overload signature (the bodied implementation below it is the
+# member) and an object-type member inside an annotation (`x: { run(): void }`,
+# which declares a value's shape, not a member of anything), so a signature
+# counts as a member only as a direct child of these bodies.
+TS_METHOD_SIGNATURE = "method_signature"
+TS_ABSTRACT_METHOD_SIGNATURE = "abstract_method_signature"
+TS_INTERFACE_BODY = "interface_body"
+TS_BODILESS_METHOD_TYPES = frozenset(
+    {TS_METHOD_SIGNATURE, TS_ABSTRACT_METHOD_SIGNATURE}
+)
+# The keyword an `abstract_method_signature` keeps in its stored modifiers, which
+# is how an incremental run tells the member apart without its tree.
+TS_ABSTRACT_MODIFIER = "abstract"

@@ -1,0 +1,131 @@
+from __future__ import annotations
+
+# Generic error wrapper
+ERROR_WRAPPER = "Error: {message}"
+
+
+class ToolFailure(str):
+    """A tool's failure message. An agent reads it as the text it always
+    was; the MCP server also reports it with `isError: true`, so a client
+    can tell a failed edit from a successful one without parsing prose
+    (issue #2650)."""
+
+    __slots__ = ()
+
+
+def failure(message: str | Exception | None) -> ToolFailure:
+    return ToolFailure(ERROR_WRAPPER.format(message=message))
+
+
+# File operation errors
+FILE_NOT_FOUND = "File not found."
+FILE_NOT_FOUND_OR_DIR = "File not found or is a directory: {path}"
+BINARY_FILE = "File '{path}' is a binary file. Ask the user to attach it inline if they want it analyzed."
+UNICODE_DECODE = (
+    "File '{path}' could not be read as text. It may be a binary file. "
+    "If it is a document (e.g., PDF), ask the user to attach it inline."
+)
+
+# Directory errors
+DIRECTORY_INVALID = "Error: '{path}' is not a valid directory."
+DIRECTORY_EMPTY = "Error: The directory '{path}' is empty."
+DIRECTORY_LIST_FAILED = "Error: Could not list contents of '{path}'."
+DIRECTORY_PATH_OUTSIDE_ROOT = (
+    "Error: '{path}' is outside the project root ({root}). "
+    "Use a relative path from the project root, or the full absolute path within it."
+)
+
+# Shell command errors
+COMMAND_NOT_ALLOWED = "Command '{cmd}' is not in the allowlist.{suggestion} Available commands: {available}"
+COMMAND_EMPTY = "Empty command provided."
+COMMAND_DANGEROUS = "Rejected dangerous command: {cmd}"
+COMMAND_DANGEROUS_BLOCKED = "Blocked dangerous command '{cmd}': {reason}"
+COMMAND_DANGEROUS_PATTERN = "Command matches dangerous pattern: {reason}"
+COMMAND_TIMEOUT = "Command '{cmd}' timed out after {timeout} seconds."
+COMMAND_SUBSHELL_NOT_ALLOWED = "Subshell execution not allowed: {pattern}"
+COMMAND_NONINTERACTIVE_DENIED = (
+    "Command '{command}' is not permitted in this non-interactive session: "
+    "{reason}. Use read-only commands with repo-relative paths."
+)
+NONINTERACTIVE_NOT_READ_ONLY = "only read-only commands are available"
+NONINTERACTIVE_WRITE_FORM = "file-writing options are not available"
+NONINTERACTIVE_REDIRECT = "redirection is not available"
+NONINTERACTIVE_FOLLOW_SYMLINKS = "symlink-following traversal is not available"
+NONINTERACTIVE_FIND_MUTATES = "find's mutating actions are not available"
+NONINTERACTIVE_PATH_ESCAPES = "absolute and parent-traversal paths are not available"
+NONINTERACTIVE_SENSITIVE_FILE = "reading files that may hold credentials needs approval"
+NONINTERACTIVE_OPTION_CARRIED_INPUT = (
+    "options that read file lists or run programs are not available"
+)
+NONINTERACTIVE_UNKNOWN_OPTION = (
+    "'{option}' is not among the options a confined read may use"
+)
+COMMAND_INVALID_SYNTAX = "Invalid command syntax: {segment}"
+COMMAND_SPAWN_FAILED = "Failed to spawn '{segment}' (executable: {executable}): {error}"
+COMMAND_NOT_INSTALLED = (
+    "'{cmd}' is not installed on this machine (not found on PATH), so "
+    "'{segment}' did not run ({error}). Use the graph and file tools instead."
+)
+COMMAND_WINDOWS_NAMESAKE = (
+    "'{cmd}' here is {executable}, the Windows program of that name, not the "
+    "POSIX '{cmd}', so '{segment}' did not run. Git for Windows provides the "
+    "POSIX tools; otherwise use the graph and file tools."
+)
+
+# Code retrieval errors
+CODE_ENTITY_NOT_FOUND = "Entity not found in graph."
+CODE_MISSING_LOCATION = "Graph entry is missing location data."
+CODE_STALE_PROJECT_ROOT = (
+    "Project '{project}' was indexed at '{root}', which no longer exists; "
+    "re-index the project to read its source."
+)
+CODE_SOURCE_FILE_MISSING = (
+    "Source file not found on disk for '{path}' "
+    "(checked the stored absolute path and the current project root)."
+)
+
+# File writer errors
+FILE_WRITER_SECURITY = (
+    "Security risk: Attempted to create file outside of project root: {path}"
+)
+FILE_WRITER_CREATE = "Error creating file {path}: {error}"
+# Git runs the commands its config and hooks name (see is_git_internal).
+GIT_INTERNAL_WRITE_REFUSED = (
+    "Refusing to write {path}: it is inside .git, where git keeps the config "
+    "and hooks it runs commands from. Change it with git itself."
+)
+
+# Export errors
+EXPORT_FAILED = "Failed to export graph: {error}"
+
+# MCP tool errors
+MCP_TOOL_RETURNED_NONE = "Tool returned None"
+MCP_INVALID_RESPONSE = "Code snippet tool returned an invalid response"
+MCP_PATH_NOT_EXISTS = "Target repository path does not exist: {path}"
+MCP_PATH_NOT_DIR = "Target repository path is not a directory: {path}"
+MCP_ROOT_TOO_BROAD = (
+    "The MCP server was started in {path}, which holds your home directory "
+    "or is a disk root, and TARGET_REPO_PATH names no project. Serving it "
+    "would let the client read and change every file under it. Set "
+    "TARGET_REPO_PATH to the project's directory."
+)
+MCP_PROJECT_NOT_FOUND = (
+    "Project '{project_name}' not found. Available projects: {projects}"
+)
+
+WEB_SEARCH_EMPTY_QUERY = "Error: The search query is empty."
+WEB_SEARCH_UNREACHABLE = "Error: The web search service could not be reached."
+WEB_SEARCH_FAILED = "Error: Web search failed (HTTP {status})."
+WEB_SEARCH_BAD_RESPONSE = (
+    "Error: The web search service returned an unreadable response."
+)
+WEB_SEARCH_NO_RESULTS = "No web results found for '{query}'."
+WEB_SEARCH_TAINTED_QUERY = (
+    "Error: Query refused: it contains a verbatim span of repository content "
+    "read this session, and web search queries must not carry local data off "
+    "the machine. Rephrase the query without quoting local content."
+)
+RESEARCH_FAILED = (
+    "Error: Web research failed. The cause was logged; it is withheld here "
+    "because provider error text is untrusted external content."
+)

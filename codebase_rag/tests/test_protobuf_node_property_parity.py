@@ -1,0 +1,396 @@
+# Guards node properties in NODE_SCHEMAS against codec/schema.proto (#1490).
+#
+# The sibling `test_protobuf_relationship_parity.py` guards the relationship
+# ENUM. Nothing guarded node PROPERTIES, and the failure mode is the same
+# shape: a property added to `NODE_SCHEMAS` is written at ingestion and read by
+# queries, but silently dropped on protobuf export. No error, no warning -- the
+# exported index is simply missing a field the schema says exists.
+#
+# Found while adding `Module.front_matter` (#1488): review flagged that it
+# would not survive export, and checking whether an existing guard would have
+# caught it turned up dozens of other properties in the same position. So the
+# specific finding was an instance of a general gap, and this guard is filed
+# separately -- it stands on its own and #1488 need not land first.
+#
+# DEFAULT-DENY, deliberately. An inventory of "properties to check" cannot fail
+# for the property nobody remembered to list -- the same inversion the MCP lock
+# guard needed in #1475. Here every declared property must either have a proto
+# field or be named in `_NOT_EXPORTED` below, so forgetting fails.
+from __future__ import annotations
+
+from collections.abc import Iterable
+from typing import Any
+
+from codebase_rag.schema_parse import parse_properties
+from codebase_rag.types_defs import NODE_SCHEMAS
+from codec import schema_pb2 as pb
+
+# Properties that exist in NODE_SCHEMAS and deliberately have no proto field.
+#
+# `absolute_path` and `root_path` name where THIS checkout lives (#2671):
+# exported, two checkouts of one commit would differ. The other entries are
+# call- or run-specific, or are read back only by an incremental run and
+# degrade safely when absent, each with its reason below. Everything else
+# the graph carries is exported (#3206): an index that dropped an
+# interface's line span, docstring or `is_exported` could neither locate it
+# nor show `diff-index` that it moved, changed or stopped being exported.
+#
+# The set is closed: a new absence fails this test and has to be argued for
+# explicitly, rather than joining the pile unnoticed. Removing an entry (by
+# adding the proto field) is always safe; adding one needs a reason of the
+# same kind.
+_NOT_EXPORTED: dict[str, frozenset[str]] = {
+    # `captured_relationships` (issue #2521) says which edges the endpoint
+    # tools can trust an empty answer for. An exported index records the
+    # same selection in its provenance manifest (`capture`), and a graph
+    # loaded without the property reads as "capture unknown", which the
+    # tools answer as before rather than flagging.
+    # `last_synced_at` (issue #2444) records when a sync last completed into
+    # the graph holding the node, for `cgr status`. It is stamped only on a
+    # graph cgr can write back to, which the protobuf sink is not, and as a
+    # per-run time it would make two exports of an unchanged project differ.
+    "Project": frozenset({"root_path", "captured_relationships", "last_synced_at"}),
+    # `write_id` is the per-call nonce the write tool reads back to prove its
+    # statement ran; it means nothing outside that call. `mention_qns` is the
+    # note's own record of what it mentions, from which the MENTIONS edges are
+    # rebuilt after a sync; the edges themselves are exported, so the list is
+    # redundant on the wire (issue #1808). `candidate_qns` is the repair
+    # pass's record of where an AMBIGUOUS note could belong, recomputed from
+    # the graph after every sync, so exporting it would only freeze a verdict
+    # the next run replaces (stage four of #1808). `mention_hashes` and
+    # `mention_quotes` are each mention's anchors, positional beside
+    # `mention_qns` and meaningless without it; `mentions_lost` is the
+    # mention pass's verdict, recomputed after every sync like
+    # `candidate_qns` (issue #3230).
+    "Gloss": frozenset(
+        {
+            "write_id",
+            "mention_qns",
+            "candidate_qns",
+            "mention_hashes",
+            "mention_quotes",
+            "mentions_lost",
+        }
+    ),
+    "Package": frozenset({"absolute_path"}),
+    "Folder": frozenset({"absolute_path"}),
+    "File": frozenset({"absolute_path"}),
+    # `broken_links` (issue #2458) is a document's record of the link targets
+    # it is waiting on. A graph round-tripped through protobuf loses it, and
+    # absent reads as "no broken links", so an imported graph nominates no
+    # waiting document when the missing file appears, until the next parse
+    # rewrites the list.
+    # `interface_fingerprint` (issue #2531) degrades the same safe way: a
+    # graph round-tripped through protobuf has no stored fingerprint to
+    # compare against, so a sync re-parses every dependent caller, as it did
+    # before the property existed, and the re-parse writes it back.
+    # `go_package` (issue #3272) is the Go package clause, read back only by
+    # an incremental run's rehydration; absent reads as "not rehydrated",
+    # which is how every run behaved before #3272, and the next parse of the
+    # file rewrites it.
+    # `php_namespace` (issue #3277) is read back only by an incremental run's
+    # rehydration; absent reads as "no namespace recorded", as every run did
+    # before #3277, until the file is next parsed.
+    "Module": frozenset(
+        {
+            "absolute_path",
+            "broken_links",
+            "go_package",
+            "interface_fingerprint",
+            "php_namespace",
+        }
+    ),
+    # `decorated_start_line` (issue #2428): a graph round-tripped through
+    # protobuf answers `definition` with the span below the decorators,
+    # exactly as a graph indexed before the property existed does; the
+    # Class, Function and Method `decorators` lists still travel.
+    # `non_method_members` (issue #2620) lets an incremental run re-register
+    # the names an unchanged class body binds to a value (`run = None`), which
+    # hide a base class's `run`. A graph round-tripped through protobuf loses
+    # them (and `member_aliases` with them), so until that file is parsed
+    # again `Sub().run()` reaches the base's `def run` as it did before #2620.
+    # `type_checking_only` marks a class declared under `if TYPE_CHECKING:`
+    # so dead-code roots its stubs. It degrades the same safe way: a graph
+    # round-tripped through protobuf reads as "not marked", so those stubs
+    # are reported again exactly as before the property existed, and the
+    # next parse writes the mark back.
+    "Class": frozenset(
+        {
+            "absolute_path",
+            "decorated_start_line",
+            "non_method_members",
+            "type_checking_only",
+        }
+    ),
+    "Field": frozenset({"absolute_path"}),
+    "EnumVariant": frozenset({"absolute_path"}),
+    "Constant": frozenset({"absolute_path"}),
+    # `decorated_start_line`: as on Class (issue #2428).
+    # `first_return_type` and `chain_return_type` (issue #3272) are a Go
+    # function's result type names, read back the same way and degrading the
+    # same way as `go_package` on Module.
+    "Function": frozenset(
+        {
+            "absolute_path",
+            "chain_return_type",
+            "decorated_start_line",
+            "first_return_type",
+        }
+    ),
+    # `member_aliases` (issue #2620) lets an incremental run re-register the
+    # class-body aliases (`run = _plain`) of a file it does not re-parse. A
+    # graph round-tripped through protobuf loses them, so until that file is
+    # parsed again a call through the alias binds to nothing, exactly as it
+    # did before #2620; absent reads as "no aliases", never a wrong target.
+    # `extension_receiver`, `extension_namespace` and
+    # `extension_receiver_arity` (issue #3275) are a C# extension method's
+    # index entry, read back only by an incremental run's rehydration;
+    # absent reads as "not an extension", as every run did before #3275,
+    # until the declaring file is next parsed.
+    # `chain_return_type` (issue #3272): as on Function, for a Go method.
+    "Method": frozenset(
+        {
+            "absolute_path",
+            "chain_return_type",
+            "decorated_start_line",
+            "extension_namespace",
+            "extension_receiver",
+            "extension_receiver_arity",
+            "member_aliases",
+        }
+    ),
+    # `embeds` (issue #2483) is read back only by an incremental run's
+    # registry rehydration, to know an unchanged Go interface's method set
+    # whole. A graph round-tripped through protobuf loses it, and an absent
+    # list reads as unknown, so the interface gains no implementer by name
+    # until its file is parsed again.
+    "Interface": frozenset({"decorated_start_line", "embeds"}),
+    "Enum": frozenset({"decorated_start_line"}),
+    "Type": frozenset({"absolute_path", "decorated_start_line"}),
+    "Union": frozenset({"absolute_path", "decorated_start_line"}),
+    "ModuleInterface": frozenset({"absolute_path"}),
+    "ModuleImplementation": frozenset({"absolute_path"}),
+}
+
+
+def _declared_properties(schema_text: str) -> set[str]:
+    """Property names, read with the SCHEMA'S OWN parser.
+
+    An earlier version used `re.findall(r"(\\w+):")`, which silently mangles
+    any name containing a non-word character: `my-prop` matched as `prop`, so
+    the guard checked a name that does not exist while the real one went
+    unexamined -- the guard failing OPEN, which is the failure this file
+    exists to prevent (reported on #1497).
+
+    `parse_properties` is the parser `schema_parse` already provides for these
+    declarations. Writing a second, looser grammar for the same strings was
+    the mistake: two parsers for one format disagree exactly where it matters.
+    """
+    return {spec.name for spec in parse_properties(schema_text)}
+
+
+def _proto_fields(label: str) -> set[str] | None:
+    """Field names of the proto message for `label`, or None if absent."""
+    message = pb.DESCRIPTOR.message_types_by_name.get(label)
+    return None if message is None else {field.name for field in message.fields}
+
+
+def _unexported_properties(schemas: Iterable[Any]) -> list[str]:
+    """Declared properties with no proto field and no exemption.
+
+    Extracted so a test can run the REAL comparison over a stand-in schema.
+    An inline copy inside a test would be a mirror -- mutating this function
+    would leave the copy passing, which is what the first attempt at covering
+    the missing-message branch actually did (#1491).
+    """
+    undeclared: list[str] = []
+    for schema in schemas:
+        label = schema.label.value
+        fields = _proto_fields(label)
+        if fields is None:
+            # A node label with NO proto message at all exports nothing, which
+            # is a larger loss than a single missing property. Skipping it here
+            # would let a whole label slip through the check written to catch
+            # exactly this -- the inventory-fails-open shape (#1490).
+            #
+            # Unreachable today: every label has a message. That is a fact
+            # about the current proto, not a promise, so the branch is
+            # reported rather than assumed away.
+            undeclared.append(f"{label} (no proto message at all)")
+            continue
+        allowed = _NOT_EXPORTED.get(label, frozenset())
+        for prop in sorted(_declared_properties(schema.properties)):
+            if prop not in fields and prop not in allowed:
+                undeclared.append(f"{label}.{prop}")
+    return undeclared
+
+
+def test_every_declared_property_is_exported_or_declared_unexported() -> None:
+    """Default-deny: a new property must be exported or explicitly excluded.
+
+    Reading the generated DESCRIPTORS rather than the `.proto` text, because a
+    text search answers "does this name appear in the file" -- which a comment
+    or an unrelated message satisfies -- and the question is "does this message
+    carry this field".
+    """
+    undeclared = _unexported_properties(NODE_SCHEMAS)
+
+    assert not undeclared, (
+        f"{len(undeclared)} node propert(ies) are declared in NODE_SCHEMAS but "
+        "have no field in codec/schema.proto and are not listed in "
+        "_NOT_EXPORTED:\n"
+        + "\n".join(undeclared)
+        + "\n\nAdd the proto field and regenerate the bindings, or add the "
+        "property to _NOT_EXPORTED with a reason (issue #1490)."
+    )
+
+
+def test_a_label_without_a_proto_message_is_reported() -> None:
+    """A whole missing message must fail, not be skipped.
+
+    The guard originally did `if fields is None: continue`, so a node label
+    with no proto message at all passed silently -- exporting nothing, which
+    is a larger loss than any single absent property. That is the
+    inventory-fails-open shape the test exists to prevent, reproduced inside
+    the test itself (reported on #1491).
+
+    Exercised through `_proto_fields` on a label the proto does not carry,
+    since every real label currently has a message. Unreachable today is a
+    fact about the current proto, not a promise.
+    """
+    assert _proto_fields("NoSuchNodeLabel") is None, (
+        "a label absent from the proto must report None, so the caller can "
+        "distinguish it from a message that exists with no matching fields"
+    )
+
+    # The paired positive: a real label resolves, so the None above is the
+    # absence rather than the helper being inert.
+    assert _proto_fields("Module") is not None
+
+    # And the COMPARISON must act on that None rather than skipping. Asserting
+    # on `_proto_fields` alone left the silent-skip revert PASSING, because no
+    # real label lacks a message -- so that assertion cannot reach the branch
+    # it is about. Calls the real function; an inline copy would be a mirror.
+    class _StandInSchema:
+        class label:  # noqa: N801 - mimics the NodeSchema attribute shape
+            value = "NoSuchNodeLabel"
+
+        properties = "{qualified_name: string}"
+
+    assert _unexported_properties([_StandInSchema()]) == [
+        "NoSuchNodeLabel (no proto message at all)"
+    ], "a label with no proto message must be reported, not skipped"
+
+
+def test_a_property_name_with_a_hyphen_is_read_whole() -> None:
+    """A non-word character must not truncate the name.
+
+    The regex this replaced matched `(\\w+):`, so `my-prop` was read as
+    `prop` -- the guard then checked a name that does not exist while the real
+    property went unexamined. A guard that fails OPEN on a name it cannot
+    parse is the failure this file exists to prevent (reported on #1497).
+
+    Calls the real `_declared_properties` and the real comparison, so a change
+    back to a hand-rolled grammar fails here rather than passing against a
+    second parser that disagrees with the schema's own.
+    """
+    assert _declared_properties("{qualified_name: string, my-prop: string}") == {
+        "qualified_name",
+        "my-prop",
+    }
+
+    class _StandInSchema:
+        class label:  # noqa: N801 - mimics the NodeSchema attribute shape
+            value = "Module"
+
+        properties = "{my-prop: string}"
+
+    # `Module` has a proto message but no `my-prop` field and no exemption, so
+    # the property must be REPORTED rather than silently skipped.
+    assert _unexported_properties([_StandInSchema()]) == ["Module.my-prop"]
+
+
+def test_the_unexported_list_names_only_real_absences() -> None:
+    """A control: an entry that IS exported must be removed from the list.
+
+    Without this the allow-list only grows. A property gains a proto field,
+    its entry here becomes a lie, and the next reader cannot tell which
+    entries are current -- the same staleness that makes an unmaintained
+    exclusion list worse than none.
+    """
+    stale: list[str] = []
+    for label, properties in _NOT_EXPORTED.items():
+        fields = _proto_fields(label)
+        if fields is None:
+            continue
+        stale.extend(f"{label}.{prop}" for prop in sorted(properties & fields))
+
+    assert not stale, (
+        f"{len(stale)} entr(ies) in _NOT_EXPORTED now HAVE a proto field and "
+        "should be removed:\n" + "\n".join(stale)
+    )
+
+
+def test_the_unexported_list_names_only_declared_properties() -> None:
+    """A second control: the list may not name properties that do not exist.
+
+    A renamed or removed property would leave an entry that suppresses
+    nothing, and a future property reusing that name would be silently
+    exempted from the check above.
+    """
+    declared_by_label = {
+        schema.label.value: _declared_properties(schema.properties)
+        for schema in NODE_SCHEMAS
+    }
+
+    unknown: list[str] = []
+    for label, properties in _NOT_EXPORTED.items():
+        declared = declared_by_label.get(label)
+        if declared is None:
+            unknown.append(f"{label} (no such node schema)")
+            continue
+        unknown.extend(f"{label}.{prop}" for prop in sorted(properties - declared))
+
+    assert not unknown, (
+        f"{len(unknown)} entr(ies) in _NOT_EXPORTED do not name a declared "
+        "property:\n" + "\n".join(unknown)
+    )
+
+
+def test_the_guard_is_actually_inspecting_something() -> None:
+    """A control on the INSTRUMENT rather than on the schemas.
+
+    The default-deny check above iterates `NODE_SCHEMAS` and asserts the
+    result is empty. If that collection were ever empty -- renamed, moved,
+    or built lazily -- it would iterate nothing, find nothing, and PASS. A
+    green default-deny guard that inspected zero properties is
+    indistinguishable from one that inspected all of them and approved.
+
+    Measured rather than assumed: emptying `NODE_SCHEMAS` leaves
+    `test_every_declared_property_is_exported_or_declared_unexported`
+    passing. One sibling test does catch it, but the main guard -- the one
+    this file exists for -- does not, so its green tick becomes a claim
+    about whether the check ran rather than about the proto being in sync.
+
+    The opposite emptiness needs no control: a generated module carrying no
+    messages makes every label report "no proto message at all" and fails
+    loudly, which is the safe direction.
+    """
+    assert NODE_SCHEMAS, (
+        "NODE_SCHEMAS is empty; the default-deny guard passes vacuously"
+    )
+
+    labels = {schema.label.value for schema in NODE_SCHEMAS}
+    assert {"Function", "Method"} <= labels, sorted(labels)
+
+    unparsed = sorted(
+        schema.label.value
+        for schema in NODE_SCHEMAS
+        if not _declared_properties(schema.properties)
+    )
+    assert not unparsed, (
+        "these labels parsed to ZERO properties, so nothing about them was "
+        "checked:\n" + "\n".join(unparsed)
+    )
+
+    assert _proto_fields("Function"), "the generated proto module carries no fields"

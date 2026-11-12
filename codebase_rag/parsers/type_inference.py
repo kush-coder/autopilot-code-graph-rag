@@ -1,0 +1,1574 @@
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
+from pathlib import Path
+from typing import TYPE_CHECKING, NamedTuple
+
+from .. import constants as cs
+from ..types_defs import (
+    ASTNode,
+    CSharpCallShape,
+    FunctionLocation,
+    FunctionRegistryTrieProtocol,
+    FunctionSpanKey,
+    LanguageQueries,
+    NodeType,
+    SimpleNameLookup,
+)
+from .cpp import CppTypeInferenceEngine
+from .csharp.type_inference import CSharpTypeInferenceEngine
+from .csharp_frontend import CallSiteKey
+from .dart.type_inference import DartTypeInferenceEngine
+from .frontends.protocol import ResolvedCallSite
+from .go import GoTypeInferenceEngine
+from .go import utils as go_utils
+from .import_processor import ImportProcessor
+from .java import JavaTypeInferenceEngine
+from .js_ts import JsTypeInferenceEngine
+from .js_ts import utils as js_ts_utils
+from .lua import LuaTypeInferenceEngine
+from .py import PythonTypeInferenceEngine, resolve_class_name
+from .rs import RustTypeInferenceEngine
+from .rs import utils as rs_utils
+from .rs.type_inference import is_constructor_guess
+from .utils import follow_reexports, function_span_key
+
+if TYPE_CHECKING:
+    from .factory import ASTCacheProtocol
+
+# Registry kinds a Rust type name can land on.
+_RS_TYPE_NODE_TYPES = frozenset(
+    {NodeType.CLASS, NodeType.ENUM, NodeType.TYPE, NodeType.INTERFACE}
+)
+
+
+class _RustCallScope(NamedTuple):
+    """Where a Rust caller looks a helper's name up, innermost first.
+
+    `uses` are the `use` maps of the fn bodies and blocks around the caller,
+    its own body first, up to the `mod` it is in: a nested fn sees the
+    body it is declared in, but a `mod` sees none of the bodies around it.
+    `scopes` are the qns of the `mod` blocks around it, found through any
+    fn body (a fn declared in a body is still in the body's module). `span`
+    is the caller's byte range: a `use` in a block of its own body serves
+    the calls written in that block alone, so those are looked up per call.
+    """
+
+    uses: tuple[Mapping[str, str], ...]
+    scopes: tuple[str, ...]
+    span: tuple[int, int]
+
+
+def _shared[T](value: T | None, empty: Callable[[], T]) -> T:
+    # Keep the caller's container (a shared reference populated after
+    # construction); only a missing one gets a fresh empty container. `or`
+    # would swap an empty-but-shared dict for a new one and lose later writes.
+    return value if value is not None else empty()
+
+
+class TypeInferenceEngine:
+    __slots__ = (
+        "import_processor",
+        "function_registry",
+        "repo_path",
+        "project_name",
+        "ast_cache",
+        "queries",
+        "module_qn_to_file_path",
+        "class_inheritance",
+        "simple_name_lookup",
+        "class_field_types",
+        "class_field_guard_inner",
+        "class_field_element_types",
+        "method_return_types",
+        "go_function_return_types",
+        "go_package_names",
+        "go_declaration_variants",
+        "go_call_sites",
+        "go_external_sites",
+        "java_call_sites",
+        "java_external_sites",
+        "python_call_sites",
+        "python_external_sites",
+        "csharp_partial_groups",
+        "csharp_extension_methods",
+        "csharp_call_sites",
+        "csharp_arg_flows",
+        "csharp_bind_flows",
+        "csharp_out_writes",
+        "csharp_external_sites",
+        "csharp_local_functions",
+        "csharp_generic_methods",
+        "csharp_call_shapes",
+        "csharp_class_generic_arity",
+        "csharp_class_owner_module",
+        "csharp_class_namespaced",
+        "csharp_namespaced_qns",
+        "csharp_method_return_types",
+        "function_locations",
+        "_java_type_inference",
+        "_csharp_type_inference",
+        "_lua_type_inference",
+        "_js_type_inference",
+        "_python_type_inference",
+        "_go_type_inference",
+        "_go_free_fn_index",
+        "_go_free_fn_index_size",
+        "_rust_type_inference",
+        "_cpp_type_inference",
+        "_dart_type_inference",
+        "dart_extends_type_args",
+        "dart_constructor_qns",
+        "dart_extension_on_types",
+    )
+
+    def __init__(
+        self,
+        import_processor: ImportProcessor,
+        function_registry: FunctionRegistryTrieProtocol,
+        repo_path: Path,
+        project_name: str,
+        ast_cache: "ASTCacheProtocol",
+        queries: Mapping[cs.SupportedLanguage, LanguageQueries],
+        module_qn_to_file_path: dict[str, Path],
+        class_inheritance: dict[str, list[str]],
+        simple_name_lookup: SimpleNameLookup,
+        class_field_types: dict[str, dict[str, str]] | None = None,
+        class_field_guard_inner: dict[str, dict[str, str]] | None = None,
+        class_field_element_types: dict[str, dict[str, str]] | None = None,
+        method_return_types: dict[str, str] | None = None,
+        go_function_return_types: dict[str, str] | None = None,
+        go_package_names: dict[str, str] | None = None,
+        go_declaration_variants: dict[str, tuple[str, ...]] | None = None,
+        go_call_sites: dict[CallSiteKey, ResolvedCallSite] | None = None,
+        go_external_sites: set[CallSiteKey] | None = None,
+        java_call_sites: dict[CallSiteKey, ResolvedCallSite] | None = None,
+        java_external_sites: set[CallSiteKey] | None = None,
+        python_call_sites: dict[CallSiteKey, ResolvedCallSite] | None = None,
+        python_external_sites: set[CallSiteKey] | None = None,
+        csharp_partial_groups: dict[str, list[str]] | None = None,
+        csharp_extension_methods: dict[str, list[tuple[str, str, str, int]]]
+        | None = None,
+        csharp_call_sites: dict[CallSiteKey, ResolvedCallSite] | None = None,
+        csharp_arg_flows: dict[CallSiteKey, dict[int, frozenset[str]]] | None = None,
+        csharp_bind_flows: dict[CallSiteKey, frozenset[str]] | None = None,
+        csharp_out_writes: dict[CallSiteKey, dict[int, str]] | None = None,
+        csharp_external_sites: set[CallSiteKey] | None = None,
+        csharp_local_functions: dict[str, tuple[FunctionSpanKey, int]] | None = None,
+        csharp_generic_methods: set[str] | None = None,
+        csharp_call_shapes: dict[str, CSharpCallShape] | None = None,
+        csharp_class_generic_arity: dict[str, int] | None = None,
+        csharp_class_owner_module: dict[str, str] | None = None,
+        csharp_class_namespaced: dict[str, str] | None = None,
+        csharp_namespaced_qns: dict[str, set[str]] | None = None,
+        csharp_method_return_types: dict[str, tuple[str, int]] | None = None,
+        function_locations: dict[FunctionSpanKey, FunctionLocation] | None = None,
+        dart_extends_type_args: dict[str, list[str]] | None = None,
+        dart_constructor_qns: set[str] | None = None,
+        dart_extension_on_types: dict[str, str] | None = None,
+    ):
+        self.import_processor = import_processor
+        self.function_registry = function_registry
+        self.repo_path = repo_path
+        self.project_name = project_name
+        self.ast_cache = ast_cache
+        self.queries = queries
+        self.module_qn_to_file_path = module_qn_to_file_path
+        self.class_inheritance = class_inheritance
+        self.simple_name_lookup = simple_name_lookup
+        # Must preserve the shared dict reference: the factory passes the
+        # DefinitionProcessor's map, empty at construction and populated later during
+        # ingestion. `or {}` would swap it for a new dict and silently lose every
+        # field type written afterward.
+        self.class_field_types = _shared(class_field_types, dict)
+        # Shared reference (as with class_field_types): Rust guard-field inner types
+        # (`Shared.state` -> State for a `Mutex<State>` field), applied only at a
+        # guard-accessor hop so a direct wrapper call isn't mis-resolved to it.
+        self.class_field_guard_inner = _shared(class_field_guard_inner, dict)
+        # Shared reference (as with class_field_types): Rust sequence-field
+        # element types (`Pool.workers` -> Worker for a `Vec<Worker>` field),
+        # applied only when an iterator adaptor's closure parameter binds the
+        # element (issue #1045).
+        self.class_field_element_types = _shared(class_field_element_types, dict)
+        # Shared reference (as with class_field_types): DefinitionProcessor's
+        # func_qn -> return-type map, populated during ingestion and read by the
+        # resolver's chained-call path.
+        self.method_return_types = _shared(method_return_types, dict)
+        # Shared reference (as with class_field_types): Go free-fn qn ->
+        # FIRST return type, read only by the single-segment binding path.
+        self.go_function_return_types = _shared(go_function_return_types, dict)
+        # Shared reference (as with class_field_types): each Go file module's
+        # `package` clause, recorded as the file is parsed. A directory can
+        # hold two packages, `p` and the external test package `p_test`, so
+        # the free-function index keys by both (#2616 review).
+        self.go_package_names = _shared(go_package_names, dict)
+        # Go interface -> the declarations of its name each build makes
+        # (shared, filled by the interface link before any call is typed).
+        self.go_declaration_variants = _shared(go_declaration_variants, dict)
+        # Shared references (as with csharp_call_sites): the go/types call-site
+        # facts and external sites, populated after construction and read by the
+        # Go resolver's semantic path (issue #1179).
+        self.go_call_sites = _shared(go_call_sites, dict)
+        self.go_external_sites = _shared(go_external_sites, set)
+        self.java_call_sites = _shared(java_call_sites, dict)
+        self.java_external_sites = _shared(java_external_sites, set)
+        # Shared references, same discipline: the Jedi call-site facts and
+        # external proofs (issue #1183), populated after construction.
+        self.python_call_sites = _shared(python_call_sites, dict)
+        self.python_external_sites = _shared(python_external_sites, set)
+        # (directory package, name) -> {(file's `package` clause, None when
+        # unrecorded; whether the file is the external test package): the
+        # return types its functions of that name declare}.
+        self._go_free_fn_index: dict[
+            tuple[str, str], dict[tuple[str | None, bool], set[str]]
+        ] = {}
+        self._go_free_fn_index_size = -1
+        # Shared reference (as with class_field_types): C# partial-class part
+        # groups, populated during ingestion and read by the C# resolver to
+        # span all parts of a split type.
+        self.csharp_partial_groups = _shared(csharp_partial_groups, dict)
+        # Shared reference (as with class_field_types): C# extension-method
+        # index, populated during ingestion and read by the C# resolver's
+        # receiver-binding fallback.
+        self.csharp_extension_methods = _shared(csharp_extension_methods, dict)
+        # Shared references (as with class_field_types): the Roslyn call-site
+        # facts and the Pass-2 function-location registry, both populated
+        # after construction and read by the C# resolver's semantic path.
+        self.csharp_call_sites = _shared(csharp_call_sites, dict)
+        # Shared reference (as with csharp_call_sites): Roslyn argument-flow
+        # facts, read by the C# path of the lean flow walk (issue #1187).
+        self.csharp_arg_flows = _shared(csharp_arg_flows, dict)
+        self.csharp_out_writes = _shared(csharp_out_writes, dict)
+        self.csharp_bind_flows = _shared(csharp_bind_flows, dict)
+        self.csharp_external_sites = _shared(csharp_external_sites, set)
+        # Shared reference (as with class_field_types): C# local-function
+        # host/arity index, populated during ingestion and read by the C#
+        # resolver's bare-name path.
+        self.csharp_local_functions = _shared(csharp_local_functions, dict)
+        # Shared reference (as with class_field_types): generic-method qn
+        # set, populated during ingestion, read by C# bare-call dispatch.
+        self.csharp_generic_methods = _shared(csharp_generic_methods, set)
+        self.csharp_call_shapes = _shared(csharp_call_shapes, dict)
+        self.csharp_class_generic_arity = _shared(csharp_class_generic_arity, dict)
+        # The module qn of the file that DECLARED each class, recorded at
+        # ingest because it cannot be recovered from the class qn: a C#
+        # class qn embeds its namespace, so `proj/Core.cs` declaring
+        # `namespace Util` yields `proj.Core.Util.Helper`, which sits under
+        # the sibling module `proj.Core.Util` (`Core/Util.cs`). Inferring
+        # the owner by longest module prefix therefore attributes the class
+        # to the wrong file (#1769 review).
+        # Deliberately NOT forwarded to `CSharpTypeInferenceEngine` below:
+        # resolution never consults it. Only `remove_file_from_state`'s prune
+        # reads it, and it reads it from here. Passing it raised
+        # `unexpected keyword argument` inside the call pass, where the
+        # exception was SWALLOWED -- the arity map is populated earlier, so a
+        # probe checking only that map still looked correct (#1769 review).
+        self.csharp_class_owner_module = _shared(csharp_class_owner_module, dict)
+        self.csharp_class_namespaced = _shared(csharp_class_namespaced, dict)
+        self.csharp_namespaced_qns = _shared(csharp_namespaced_qns, dict)
+        self.csharp_method_return_types = _shared(csharp_method_return_types, dict)
+        self.function_locations = _shared(function_locations, dict)
+        # Shared reference (as with class_field_types): Dart `extends Base<T>`
+        # type arguments per class qn, read by the resolver's undeclared
+        # receiver fallback (#875).
+        self.dart_extends_type_args = _shared(dart_extends_type_args, dict)
+        # Constructor qns, read by the call pass to record a named
+        # constructor call as a construction (#2012).
+        self.dart_constructor_qns = _shared(dart_constructor_qns, set)
+        # Extension qn -> its `on` type as written, read by the resolver when
+        # a typed receiver's class lacks the member (#2482).
+        self.dart_extension_on_types = _shared(dart_extension_on_types, dict)
+
+        self._java_type_inference: JavaTypeInferenceEngine | None = None
+        self._csharp_type_inference: CSharpTypeInferenceEngine | None = None
+        self._dart_type_inference: DartTypeInferenceEngine | None = None
+        self._lua_type_inference: LuaTypeInferenceEngine | None = None
+        self._js_type_inference: JsTypeInferenceEngine | None = None
+        self._python_type_inference: PythonTypeInferenceEngine | None = None
+        self._go_type_inference: GoTypeInferenceEngine | None = None
+        self._rust_type_inference: RustTypeInferenceEngine | None = None
+        self._cpp_type_inference: CppTypeInferenceEngine | None = None
+
+    @property
+    def go_type_inference(self) -> GoTypeInferenceEngine:
+        if self._go_type_inference is None:
+            self._go_type_inference = GoTypeInferenceEngine(
+                go_call_sites=self.go_call_sites,
+                go_external_sites=self.go_external_sites,
+                function_locations=self.function_locations,
+                module_qn_to_file_path=self.module_qn_to_file_path,
+                repo_path=self.repo_path,
+            )
+        return self._go_type_inference
+
+    @property
+    def rust_type_inference(self) -> RustTypeInferenceEngine:
+        if self._rust_type_inference is None:
+            self._rust_type_inference = RustTypeInferenceEngine()
+        return self._rust_type_inference
+
+    @property
+    def cpp_type_inference(self) -> CppTypeInferenceEngine:
+        if self._cpp_type_inference is None:
+            self._cpp_type_inference = CppTypeInferenceEngine()
+        return self._cpp_type_inference
+
+    @property
+    def java_type_inference(self) -> JavaTypeInferenceEngine:
+        if self._java_type_inference is None:
+            self._java_type_inference = JavaTypeInferenceEngine(
+                import_processor=self.import_processor,
+                function_registry=self.function_registry,
+                repo_path=self.repo_path,
+                project_name=self.project_name,
+                ast_cache=self.ast_cache,
+                queries=self.queries,
+                module_qn_to_file_path=self.module_qn_to_file_path,
+                class_inheritance=self.class_inheritance,
+                simple_name_lookup=self.simple_name_lookup,
+                java_call_sites=self.java_call_sites,
+                java_external_sites=self.java_external_sites,
+                function_locations=self.function_locations,
+            )
+        return self._java_type_inference
+
+    @property
+    def csharp_type_inference(self) -> CSharpTypeInferenceEngine:
+        if self._csharp_type_inference is None:
+            self._csharp_type_inference = CSharpTypeInferenceEngine(
+                import_processor=self.import_processor,
+                function_registry=self.function_registry,
+                repo_path=self.repo_path,
+                project_name=self.project_name,
+                ast_cache=self.ast_cache,
+                queries=self.queries,
+                module_qn_to_file_path=self.module_qn_to_file_path,
+                class_inheritance=self.class_inheritance,
+                simple_name_lookup=self.simple_name_lookup,
+                class_field_types=self.class_field_types,
+                csharp_partial_groups=self.csharp_partial_groups,
+                csharp_extension_methods=self.csharp_extension_methods,
+                csharp_call_sites=self.csharp_call_sites,
+                csharp_external_sites=self.csharp_external_sites,
+                csharp_local_functions=self.csharp_local_functions,
+                csharp_generic_methods=self.csharp_generic_methods,
+                csharp_call_shapes=self.csharp_call_shapes,
+                csharp_class_generic_arity=self.csharp_class_generic_arity,
+                csharp_class_namespaced=self.csharp_class_namespaced,
+                csharp_namespaced_qns=self.csharp_namespaced_qns,
+                csharp_method_return_types=self.csharp_method_return_types,
+                method_return_types=self.method_return_types,
+                function_locations=self.function_locations,
+            )
+        return self._csharp_type_inference
+
+    @property
+    def dart_type_inference(self) -> DartTypeInferenceEngine:
+        if self._dart_type_inference is None:
+            self._dart_type_inference = DartTypeInferenceEngine()
+        return self._dart_type_inference
+
+    def reset_semantic_join_memos(self) -> None:
+        # The Go, Java and C# engines each memoise rel-path -> module qn for
+        # the semantic join and rebuild it only when module_qn_to_file_path
+        # changes SIZE. A rename on a reused updater removes one qn and adds
+        # one, so the size holds and the memo would keep the old path; it
+        # is cleared with the resolver's other memos at the start of Pass 3.
+        for engine in (
+            self._go_type_inference,
+            self._java_type_inference,
+            self._csharp_type_inference,
+        ):
+            if engine is not None:
+                engine._rel_to_module.clear()
+
+    @property
+    def lua_type_inference(self) -> LuaTypeInferenceEngine:
+        if self._lua_type_inference is None:
+            self._lua_type_inference = LuaTypeInferenceEngine(
+                import_processor=self.import_processor,
+                function_registry=self.function_registry,
+                project_name=self.project_name,
+            )
+        return self._lua_type_inference
+
+    @property
+    def js_type_inference(self) -> JsTypeInferenceEngine:
+        if self._js_type_inference is None:
+            self._js_type_inference = JsTypeInferenceEngine(
+                import_processor=self.import_processor,
+                function_registry=self.function_registry,
+                project_name=self.project_name,
+                find_method_ast_node_func=self.python_type_inference._find_method_ast_node,
+                queries=self.queries,
+            )
+        return self._js_type_inference
+
+    @property
+    def python_type_inference(self) -> PythonTypeInferenceEngine:
+        if self._python_type_inference is None:
+            self._python_type_inference = PythonTypeInferenceEngine(
+                import_processor=self.import_processor,
+                function_registry=self.function_registry,
+                repo_path=self.repo_path,
+                project_name=self.project_name,
+                ast_cache=self.ast_cache,
+                queries=self.queries,
+                module_qn_to_file_path=self.module_qn_to_file_path,
+                class_inheritance=self.class_inheritance,
+                simple_name_lookup=self.simple_name_lookup,
+                js_type_inference_getter=lambda: self.js_type_inference,
+            )
+        return self._python_type_inference
+
+    def build_local_variable_type_map(
+        self,
+        caller_node: ASTNode,
+        module_qn: str,
+        language: cs.SupportedLanguage,
+        class_context: str | None = None,
+    ) -> dict[str, str]:
+        local = self._build_local_variable_type_map(
+            caller_node, module_qn, language, class_context
+        )
+        if language == cs.SupportedLanguage.GO:
+            self._resolve_go_qualified_locals(module_qn, local)
+        # When the caller is a method, overlay its class's member-field types as a
+        # base so a bare `field_.method()` receiver resolves; a same-named parameter
+        # or local shadows a field, so the local map wins on conflict.
+        fields = self._collect_field_types(class_context) if class_context else {}
+        if fields:
+            local = {**fields, **local}
+        if language == cs.SupportedLanguage.GO:
+            self._enrich_go_call_locals(caller_node, module_qn, local)
+        elif language == cs.SupportedLanguage.RUST:
+            if class_context:
+                # Rust member calls carry the explicit `self` receiver: type `self`
+                # to the impl target (so `self.accept()` dispatches) and each
+                # `self.<field>` to its field type (`self.shutdown.is_shutdown()`
+                # hops through it). setdefault: a same-named local wins.
+                local.setdefault(cs.KEYWORD_SELF, class_context)
+                for field, ftype in fields.items():
+                    local.setdefault(
+                        f"{cs.KEYWORD_SELF}{cs.SEPARATOR_DOT}{field}", ftype
+                    )
+            # Substitute BEFORE enrichment: params, lets, and fields spell
+            # generic names from the caller's own scope chain, but an
+            # enriched call-return type (`let x = Maker::make()` with
+            # `fn make() -> M`) spells the CALLEE's generic parameter, which
+            # the caller's bounds must not capture. Sole exception: a
+            # `self.<method>()` return spells the caller's own impl-header
+            # generics, handled inside enrichment.
+            self._substitute_rust_generic_bounds(caller_node, module_qn, local)
+            self._enrich_rust_call_locals(caller_node, module_qn, local)
+        elif language == cs.SupportedLanguage.DART:
+            self._enrich_dart_call_locals(caller_node, local)
+        return local
+
+    def collect_go_span_bindings(
+        self,
+        caller_node: ASTNode,
+        module_qn: str,
+        var_types: dict[str, str] | None = None,
+    ) -> list[tuple[int, int, str, str]]:
+        """Go range variables and the locals shadowing them (issue #2483),
+        each typed as the resolver reads it in `module_qn`. A local bound to
+        a call (`s := makeOther()`) takes the call's return type, as the flat
+        map's does. A qualified `geo.Shape` is the type of the package this
+        file imports as `geo`. One naming no indexed type (an external
+        package's), or no type at all, stays a binding, untyped: its bare
+        name would bind whatever this package calls Shape, and dropping it
+        would let an outer declaration of the name answer for it."""
+        engine = self.go_type_inference
+
+        def value_type(value: ASTNode) -> str | None:
+            if (typed := engine.infer_value_type(value)) is not None:
+                return typed
+            segments = (
+                engine.callee_segments(value)
+                if value.type == cs.TS_GO_CALL_EXPRESSION
+                else None
+            )
+            return (
+                self._infer_go_call_return_type(segments, module_qn, var_types or {})
+                if segments
+                else None
+            )
+
+        return [
+            (start, end, name, self._go_span_type(type_name, module_qn))
+            for start, end, name, type_name in engine.collect_range_span_bindings(
+                caller_node, value_type
+            )
+        ]
+
+    def _go_span_type(self, type_name: str, module_qn: str) -> str:
+        # A qn a call's return type resolved to already is one; a written type
+        # resolves through this file's imports.
+        if not type_name:
+            return cs.GO_UNTYPED_BINDING
+        if type_name in self.function_registry:
+            return type_name
+        return self._go_written_type(type_name, module_qn) or cs.GO_UNTYPED_BINDING
+
+    def _resolve_go_qualified_locals(
+        self, module_qn: str, var_types: dict[str, str]
+    ) -> None:
+        # A local declared with another package's type (`s geo.Shape`) is that
+        # package's type, not whatever this package calls Shape (issue #2483).
+        # One this index cannot place (an external package's) keeps the bare
+        # name the walker gave it before.
+        for name, type_name in var_types.items():
+            if cs.SEPARATOR_DOT in type_name:
+                var_types[name] = (
+                    self._go_written_type(type_name, module_qn)
+                    or type_name.rpartition(cs.SEPARATOR_DOT)[2]
+                )
+
+    def _go_written_type(self, type_name: str, module_qn: str) -> str | None:
+        qualifier, _, name = type_name.rpartition(cs.SEPARATOR_DOT)
+        if not qualifier:
+            return type_name
+        package_qn = self._go_imported_package(qualifier, module_qn)
+        return self._go_type_in_package(package_qn, name) if package_qn else None
+
+    def collect_rust_span_bindings(
+        self, caller_node: ASTNode, module_qn: str, class_context: str | None
+    ) -> list[tuple[int, int, str, str]]:
+        """Span-scoped Rust bindings overlaid at each call's position.
+
+        Match-arm variant bindings plus iterator-adaptor closure-parameter
+        bindings (issue #1045): both rebind one name to different types at
+        different byte ranges, which the flat map cannot express. Element
+        types come from the caller's own collection-typed params/lets plus
+        its class's sequence fields, keyed `self.<field>` exactly as the
+        flat map spells field receivers. Closure bindings whose type does
+        NOT resolve to a registered class from this module are dropped: a
+        type parameter (`Vec<T>`) or a name invisible here would let the
+        external-receiver guard delete the edge the trie fallback still
+        finds, so an unresolvable binding is strictly worse than none.
+        """
+        engine = self.rust_type_inference
+        bindings = engine.collect_match_arm_bindings(caller_node)
+        element_entries = engine.collect_element_entries(caller_node)
+        if class_context:
+            span = (caller_node.start_byte, caller_node.end_byte)
+            for field, elem in self.class_field_element_types.get(
+                class_context, {}
+            ).items():
+                element_entries.append(
+                    (f"{cs.KEYWORD_SELF}{cs.SEPARATOR_DOT}{field}", elem, *span, 0)
+                )
+        bindings.extend(
+            binding
+            for binding in engine.collect_closure_param_bindings(
+                caller_node, element_entries
+            )
+            if self._rust_binding_type_resolves(binding[3], module_qn)
+        )
+        return bindings
+
+    def _substitute_rust_generic_bounds(
+        self, caller_node: ASTNode, module_qn: str, var_types: dict[str, str]
+    ) -> None:
+        # A receiver typed as a bare generic parameter (`m: M`, a field `M` of
+        # an `impl<M: Matcher>` block) dispatches through the parameter's trait
+        # bound, so rewrite the recorded type to the qn of the first bound that
+        # resolves strictly first-party (issue #1047). A parameter whose bounds
+        # resolve to nothing keeps the generic name: the known-external
+        # receiver guard then suppresses the name-based fallback instead of
+        # letting it fabricate an edge onto an unrelated same-named method.
+        if not var_types:
+            # Nothing recorded to rewrite, so the ancestor walk that collects
+            # the bounds is pure waste.
+            return
+        bounds = self.rust_type_inference.collect_generic_bounds(caller_node)
+        if not bounds:
+            return
+        for name in var_types:
+            self._apply_rust_generic_bound(bounds, module_qn, var_types, name)
+
+    def _apply_rust_generic_bound(
+        self,
+        bounds: dict[str, list[str]],
+        module_qn: str,
+        var_types: dict[str, str],
+        name: str,
+    ) -> None:
+        for spelling in bounds.get(var_types[name], ()):
+            if trait_qn := self._rust_bound_trait_qn(spelling, module_qn):
+                var_types[name] = trait_qn
+                break
+
+    def _rust_bound_trait_qn(self, spelling: str, module_qn: str) -> str | None:
+        # Resolve a bound spelling STRICTLY to a registered first-party qn;
+        # anything looser fabricates edges: the simple-name fallbacks would
+        # bind `use std::io::Write` + `W: Write` (or a bare prelude `Clone`)
+        # to an arbitrary first-party type sharing the leaf name. The qn goes
+        # into the map directly, so the consumer cannot re-resolve it fuzzily.
+        if cs.SEPARATOR_DOUBLE_COLON in spelling:
+            # A scoped bound substitutes only on an exact module-path match.
+            parts = [
+                p
+                for p in spelling.split(cs.SEPARATOR_DOUBLE_COLON)
+                if p not in cs.RS_PATH_KEYWORDS
+            ]
+            qn = self._resolve_rust_import_path(
+                spelling, node_types=(NodeType.INTERFACE,)
+            )
+            suffix = cs.SEPARATOR_DOT + cs.SEPARATOR_DOT.join(parts)
+            if qn.endswith(suffix) and self._rust_registered_trait(qn):
+                return qn
+            return None
+        import_map = self.import_processor.import_mapping.get(module_qn, {})
+        if (target := import_map.get(spelling)) is not None:
+            # An external `use` target is a raw `::` path; a first-party one
+            # arrives as an already-resolved project qn.
+            if cs.SEPARATOR_DOUBLE_COLON in target:
+                return None
+            return target if self._rust_registered_trait(target) else None
+        # No import in scope: a bare name is only visible when defined in
+        # this module (a prelude trait lands here and resolves to None).
+        local_qn = f"{module_qn}{cs.SEPARATOR_DOT}{spelling}"
+        return local_qn if self._rust_registered_trait(local_qn) else None
+
+    def _rust_registered_trait(self, qn: str) -> bool:
+        # A Rust bound always names a trait, which registers as INTERFACE;
+        # a same-named struct/enum must never satisfy it.
+        return self.function_registry.get(qn) == NodeType.INTERFACE
+
+    def _rust_binding_type_resolves(self, type_name: str, module_qn: str) -> bool:
+        qn = self._resolve_rust_type_qn(type_name, module_qn)
+        return self.function_registry.get(qn) is not None
+
+    def _enrich_dart_call_locals(
+        self, caller_node: ASTNode, var_types: dict[str, str]
+    ) -> None:
+        # A local bound from a class-qualified call (`var s = Base.member(args)`)
+        # was heuristically typed as Base; when the member is a REGISTERED method
+        # with a recorded return type, that type wins (a named constructor or
+        # same-class factory keeps Base, a `static String describe()` local becomes
+        # a String whose member calls then drop as external). A registered member
+        # WITHOUT a recorded return (void) untypes the local; an unregistered member
+        # keeps the heuristic.
+        bindings = self.dart_type_inference.collect_static_call_bindings(caller_node)
+        for name, (base, member) in bindings.items():
+            if var_types.get(name) != base:
+                continue
+            method_qn = self._dart_unique_class_member(base, member)
+            if method_qn is None:
+                continue
+            recorded = self.method_return_types.get(method_qn)
+            if recorded is None:
+                var_types.pop(name, None)
+            else:
+                var_types[name] = recorded
+
+    def _dart_unique_class_member(self, base: str, member: str) -> str | None:
+        suffix = f"{cs.SEPARATOR_DOT}{base}{cs.SEPARATOR_DOT}{member}"
+        matches = [
+            qn
+            for qn in self.function_registry.find_ending_with(member)
+            if qn.endswith(suffix)
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        return None
+
+    def _enrich_go_call_locals(
+        self, caller_node: ASTNode, module_qn: str, var_types: dict[str, str]
+    ) -> None:
+        # Type a Go local bound from a method call (`root := engine.trees.get(m)`)
+        # with the call's return type, so a later `root.addRoute()` resolves to the
+        # real type (node) instead of the enclosing class's same-named method.
+        # Resolves the callee selector hop by hop: base local type, struct-field
+        # types for middle hops, then the final method's recorded return type. Only
+        # fills names not already typed.
+        scopes: go_utils.GoLocalScopes | None = None
+        for (
+            name,
+            segments,
+            call_point,
+        ) in self.go_type_inference.collect_call_var_bindings(caller_node):
+            if name in var_types:
+                continue
+            if len(segments) == 2 and not var_types.get(segments[0]):
+                # `r := router.New()` where a local `router` the walker could
+                # not type is in scope calls that local's method: the import it
+                # hides says nothing about `r` (#2616 review). A local declared
+                # only after the call, or in a block already closed, hides
+                # nothing there.
+                scopes = scopes or go_utils.local_binding_scopes(caller_node)
+                if go_utils.bound_at(scopes, segments[0], call_point):
+                    continue
+            if return_type := self._infer_go_call_return_type(
+                segments, module_qn, var_types
+            ):
+                var_types[name] = return_type
+
+    def _infer_go_call_return_type(
+        self, segments: list[str], module_qn: str, var_types: dict[str, str]
+    ) -> str | None:
+        # `['e','trees','get']`: base `e` -> Engine (a typed local), field `trees`
+        # -> its struct-field type, then method `get` -> its recorded return type.
+        # A plain function (`['f']`) types from the free-fn return map: same-module
+        # first, then a same-package sibling file (Go package scope spans the
+        # directory, viper's remote.go shape).
+        if len(segments) == 1:
+            return self._go_free_fn_return_type(segments[0], module_qn)
+        if len(segments) < 2:
+            return None
+        base_type = var_types.get(segments[0])
+        if not base_type:
+            if len(segments) == 2:
+                return self._go_package_call_return_type(
+                    segments[0], segments[1], module_qn
+                )
+            return None
+        class_qn = self._resolve_class_name(base_type, module_qn) or base_type
+        for field in segments[1:-1]:
+            field_type = self.class_field_types.get(class_qn, {}).get(field)
+            if not field_type:
+                return None
+            class_qn = self._resolve_class_name(field_type, module_qn) or field_type
+        method_qn = f"{class_qn}{cs.SEPARATOR_DOT}{segments[-1]}"
+        return_type = self.method_return_types.get(method_qn)
+        # Another package's type (`model.Item`) is spelled for the METHOD's
+        # file; a local typed with that spelling resolves to nothing here and
+        # would lose the edge its calls get by name, so it stays untyped.
+        if return_type and cs.SEPARATOR_DOT in return_type:
+            return None
+        return return_type
+
+    def drop_go_return_types(self, qns: Collection[str]) -> None:
+        """Forget the Go return types recorded under `qns` and drop the index.
+
+        `GraphUpdater.remove_file_from_state` calls this for a deleted or
+        re-parsed file's definitions. The map used to keep them (issue #1668),
+        and the `(package, name)` index below is filled with `setdefault`, so a
+        surviving or new sibling defining a free function of the same name lost
+        to the stale entry and its return type was never recorded.
+
+        The index is invalidated outright rather than left to the size check:
+        one deletion followed by one addition leaves the size unchanged, and
+        the check would then serve the stale index over a map that no longer
+        holds the entry.
+        """
+        for qn in qns:
+            self.go_function_return_types.pop(qn, None)
+        self._go_free_fn_index = {}
+        self._go_free_fn_index_size = -1
+
+    def drop_csharp_side_tables(
+        self, function_qns: Collection[str], class_qns: Collection[str]
+    ) -> None:
+        """Forget the C# side-table entries owned by removed definitions.
+
+        `GraphUpdater.remove_file_from_state` reached the registry, both
+        return-type maps and `csharp_partial_groups`, but never these four
+        (issue #1769): a deleted file's generic methods, class arities, local
+        functions and extension methods outlived it on a reused updater and
+        went on steering resolution towards a definition that is gone.
+
+        `function_qns` are the method and function qns the caller determined
+        this file owned, under the same filter the registry sweep uses;
+        `class_qns` are the class qns, which carry no span records of their
+        own and are owned by the module recorded for them at ingest
+        (`csharp_class_owner_module`) -- their qn embeds a namespace and so
+        cannot be attributed by prefix.
+        `csharp_extension_methods` is keyed by simple NAME with a list of
+        owners, so its prune drops the owning entries from each list and
+        removes the key only once nothing is left under it.
+
+        The maps are mutated in place: the lazily built
+        `CSharpTypeInferenceEngine` shares these same objects by reference,
+        so rebinding any of them here would leave that engine reading the
+        pre-prune state.
+        """
+        function_qns = set(function_qns)
+        self.csharp_generic_methods -= function_qns
+        for qn in function_qns:
+            self.csharp_local_functions.pop(qn, None)
+            self.csharp_call_shapes.pop(qn, None)
+        for qn in class_qns:
+            self.csharp_class_generic_arity.pop(qn, None)
+            # Dropped together: an owner record for a class whose arity is
+            # gone names a file this updater no longer has, and would keep
+            # the entry alive across the next deletion of the same qn.
+            self.csharp_class_owner_module.pop(qn, None)
+        for name in list(self.csharp_extension_methods):
+            kept = [
+                entry
+                for entry in self.csharp_extension_methods[name]
+                if entry[0] not in function_qns
+            ]
+            if kept:
+                self.csharp_extension_methods[name] = kept
+            else:
+                del self.csharp_extension_methods[name]
+
+    def drop_method_return_types(self, qns: Collection[str]) -> None:
+        """Forget the return types recorded under `qns` (issues #1738, #1753).
+
+        `GraphUpdater.remove_file_from_state` calls this for a deleted or
+        re-parsed file's definitions, beside `drop_go_return_types`. Both
+        maps, the general one and the C# `(type, arity)` one, are read
+        directly, with no derived index to invalidate.
+        """
+        for qn in qns:
+            self.method_return_types.pop(qn, None)
+            self.csharp_method_return_types.pop(qn, None)
+        # A Dart constructor's qn is written by the same ingest step as its
+        # return type, so it leaves with it; a stale one would keep stamping
+        # INSTANTIATES on a call that now reaches a static factory (#2012).
+        self.dart_constructor_qns.difference_update(qns)
+
+    def js_callable_return_type(self, callable_qn: str, static: bool) -> str | None:
+        """The class a JS/TS method or function returns, read in its own file.
+
+        Unlike the languages that record a hop's return in
+        `method_return_types` as they ingest, TS needs its whole module scope
+        (imports included) to say which class a return names (issue #2468).
+        A method is found through its class's own qn path (a namespace, a
+        function or a method may hold the class); only a module-level
+        function is read. `static` picks a class's static member over an
+        instance one of the same name.
+        """
+        kind = self.function_registry.get(callable_qn)
+        if (
+            kind not in (NodeType.METHOD, NodeType.FUNCTION)
+            or (located := self._js_qn_path(callable_qn)) is None
+        ):
+            return None
+        root, language, module_qn, path = located
+        # A method's path holds its class; a function is read at module level.
+        if (kind == NodeType.FUNCTION) != (len(path) == 1):
+            return None
+        return self.js_type_inference.callable_return_type(
+            root, path, module_qn, language, static
+        )
+
+    def js_static_member(
+        self, class_qn: str, member_name: str
+    ) -> tuple[bool, int | None]:
+        """Whether a JS/TS class declares a static `member_name`, and its
+        method's line (see `JsTypeInferenceEngine.static_member`)."""
+        located = self._js_qn_path(class_qn)
+        body = (
+            js_ts_utils.find_class_body_at(located[0], located[3]) if located else None
+        )
+        if body is None:
+            return False, None
+        return self.js_type_inference.static_member(body, member_name)
+
+    def js_member_sides(
+        self, class_qn: str, member_name: str
+    ) -> tuple[bool, bool] | None:
+        """Whether a JS/TS class body declares `member_name` for instances
+        and statically (see `JsTypeInferenceEngine.member_sides`), or None
+        when the qn names no class body this can read."""
+        located = self._js_qn_path(class_qn)
+        body = (
+            js_ts_utils.find_class_body_at(located[0], located[3]) if located else None
+        )
+        if body is None:
+            return None
+        return self.js_type_inference.member_sides(body, member_name)
+
+    def _js_qn_path(
+        self, qualified_name: str
+    ) -> tuple[ASTNode, cs.SupportedLanguage, str, list[str]] | None:
+        """The parsed JS/TS module a qn lives in (the longest prefix naming
+        one), and the qn's segments below it."""
+        module_qn = qualified_name
+        while cs.SEPARATOR_DOT in module_qn:
+            module_qn = module_qn.rsplit(cs.SEPARATOR_DOT, 1)[0]
+            if (file_path := self.module_qn_to_file_path.get(module_qn)) is None:
+                continue
+            entry = self.ast_cache.load(file_path)
+            if entry is None or entry[1] not in cs.JS_TS_LANGUAGES:
+                return None
+            path = qualified_name[len(module_qn) + 1 :].split(cs.SEPARATOR_DOT)
+            return entry[0], entry[1], module_qn, path
+        return None
+
+    def _go_free_fn_return_type(self, name: str, module_qn: str) -> str | None:
+        # Same module (file) first; then the enclosing package's sibling files
+        # (same parent dir), since Go free functions are package-scoped, not
+        # file-scoped. The sibling lookup goes through a lazily rebuilt (package,
+        # name) index: the shared map fills DURING ingestion, so an init-time index
+        # would be empty; the size check rebuilds only when entries were added.
+        if hit := self.go_function_return_types.get(
+            f"{module_qn}{cs.SEPARATOR_DOT}{name}"
+        ):
+            return hit
+        if cs.SEPARATOR_DOT not in module_qn:
+            return None
+        clause = self.go_package_names.get(module_qn)
+        return self._go_package_fn_return_type(
+            self._go_file_package(module_qn),
+            name,
+            lambda other, _external: go_utils.shares_package_clause(clause, other),
+        )
+
+    def _go_file_package(self, module_qn: str) -> str:
+        return go_utils.file_package_qn(
+            module_qn,
+            self.module_qn_to_file_path.get(module_qn),
+            self.repo_path,
+            self.project_name,
+        )
+
+    def _go_package_fn_return_type(
+        self,
+        package_qn: str,
+        name: str,
+        admits: Callable[[str | None, bool], bool],
+    ) -> str | None:
+        # The one return type the package's functions named `name` declare, or
+        # None when they disagree: build-tag variants (`router_linux.go`,
+        # `router_windows.go`) each declare it, and neither variant's type is
+        # the call's in every build. The directory alone is not the package:
+        # `p_test`'s `NewRouter` beside `p`'s is another package's function,
+        # no variant of it, so the index keeps each file's `package` clause
+        # and whether it is that external test package, and `admits` picks
+        # the asking package's files by them (#2616 review).
+        if len(self.go_function_return_types) != self._go_free_fn_index_size:
+            self._go_free_fn_index = {}
+            for qn, return_type in self.go_function_return_types.items():
+                module_qn, _, fn_name = qn.rpartition(cs.SEPARATOR_DOT)
+                if package := self._go_file_package(module_qn):
+                    by_clause = self._go_free_fn_index.setdefault(
+                        (package, fn_name), {}
+                    )
+                    scope = (
+                        self.go_package_names.get(module_qn),
+                        self._go_external_test(module_qn),
+                    )
+                    by_clause.setdefault(scope, set()).add(return_type)
+            self._go_free_fn_index_size = len(self.go_function_return_types)
+        returns = {
+            return_type
+            for (clause, external), types in self._go_free_fn_index.get(
+                (package_qn, name), {}
+            ).items()
+            if admits(clause, external)
+            for return_type in types
+        }
+        return next(iter(returns)) if len(returns) == 1 else None
+
+    def _go_package_call_return_type(
+        self, qualifier: str, name: str, module_qn: str
+    ) -> str | None:
+        # `r := gotest.NewRouter()`: the callee's bare `*Mux` names a type of
+        # the package the import binds `gotest` to, not of the caller's, so it
+        # is qualified here to that package's one type of that name. Left
+        # bare, it resolved against the caller's package (an external
+        # `_test` package has no Mux) and `r.Get` fell to the name trie
+        # (#2571). A return type naming yet another package stays untyped.
+        package_qn = self._go_imported_package(qualifier, module_qn)
+        if not package_qn:
+            return None
+        return_type = self._go_package_fn_return_type(
+            package_qn, name, lambda _clause, external: not external
+        )
+        if not return_type or cs.SEPARATOR_DOT in return_type:
+            return None
+        return self._go_type_in_package(package_qn, return_type)
+
+    def _go_imported_package(self, qualifier: str, module_qn: str) -> str | None:
+        # The package Go file `module_qn` imports as `qualifier`.
+        return (self.import_processor.import_mapping.get(module_qn) or {}).get(
+            qualifier
+        )
+
+    def _go_type_in_package(self, package_qn: str, name: str) -> str | None:
+        # The one type `name` of the package an import binds `package_qn`
+        # names: a type whose file sits in its directory and is no external
+        # test file, the same test its functions pass.
+        declared = go_utils.package_level_definitions(
+            self.function_registry,
+            name,
+            go_utils.TYPE_DECLARATION_TYPES,
+            lambda qn: self._go_imported_file(
+                qn.rpartition(cs.SEPARATOR_DOT)[0], package_qn
+            ),
+        )
+        return go_utils.one_declaration(declared, self.go_declaration_variants)
+
+    def _go_imported_file(self, module_qn: str, package_qn: str) -> bool:
+        # Whether Go file `module_qn` is a file of the package an import
+        # binding `package_qn` names: in its directory, and not in the
+        # external test package `p_test` that `go test` builds beside it.
+        return self._go_file_package(module_qn) == package_qn and not (
+            self._go_external_test(module_qn)
+        )
+
+    def _go_external_test(self, module_qn: str) -> bool:
+        # Whether Go file `module_qn` is in its directory's external test
+        # package, judged by its `_test.go` file name and `_test` clause
+        # together. A module with no recorded file (an unchanged file on an
+        # incremental run) is judged by its qn's last segment, the stem.
+        path = self.module_qn_to_file_path.get(module_qn)
+        stem = path.stem if path else module_qn.rpartition(cs.SEPARATOR_DOT)[2]
+        return go_utils.is_external_test(
+            self.go_package_names.get(module_qn),
+            stem.endswith(cs.GO_TEST_FILE_SUFFIX),
+        )
+
+    def _enrich_rust_call_locals(
+        self, caller_node: ASTNode, module_qn: str, var_types: dict[str, str]
+    ) -> None:
+        # Type a Rust local bound from an associated-function call
+        # (`let cmd = Command::from_frame(f)?`) with the call's return type, so a
+        # later `cmd.apply()` resolves to the real type, not the ambiguous name-only
+        # trie fallback. Only fills names not already typed, or typed only by
+        # their initializer's constructor-like spelling (#3168).
+        bounds: dict[str, list[str]] | None = None
+        # Walked once, and only when a binding needs typing.
+        scope: _RustCallScope | None = None
+        for (
+            name,
+            segments,
+            call_point,
+        ) in self.rust_type_inference.collect_call_var_bindings(caller_node):
+            if name in var_types and not is_constructor_guess(
+                var_types[name], segments
+            ):
+                continue
+            if scope is None:
+                scope = self._rust_call_scope(caller_node, module_qn)
+            return_type = self._infer_rust_call_return_type(
+                segments, module_qn, var_types, call_point, scope
+            )
+            if not return_type:
+                continue
+            var_types[name] = return_type
+            # A `let m = self.get()` callee lives in the caller's own impl,
+            # whose header generics a method cannot shadow (E0403): a generic
+            # return spells the CALLER's own parameter, so its bound applies.
+            # Any other callee's generic return stays uncaptured (issue #1047).
+            if len(segments) != 2 or segments[0] != cs.KEYWORD_SELF:
+                continue
+            if bounds is None:
+                bounds = self.rust_type_inference.collect_generic_bounds(caller_node)
+            self._apply_rust_generic_bound(bounds, module_qn, var_types, name)
+
+    def _rust_call_scope(self, caller_node: ASTNode, module_qn: str) -> _RustCallScope:
+        # Read from the AST, as the ingest pass records a fn's own module
+        # (`record_effective_module`), so the lookup agrees with the
+        # resolver's `self::`/`super::` (issue #2942).
+        # One entry per `use`, so a block with several has several: merge
+        # them, or the last `use` hides the earlier ones from a nested fn
+        # (Greptile, PR #3010). rustc rejects two binding one name (E0252).
+        blocks: dict[tuple[int, int], dict[str, str]] = {}
+        for (
+            start,
+            end,
+            block_uses,
+            *_,
+        ) in self.import_processor.rust_block_scope_imports.get(module_qn, ()):
+            blocks.setdefault((start, end), {}).update(block_uses)
+        uses: list[Mapping[str, str]] = []
+        node: ASTNode | None = caller_node
+        while node is not None and node.type not in (
+            cs.TS_RS_MOD_ITEM,
+            cs.TS_RS_SOURCE_FILE,
+        ):
+            if found := self._rust_body_uses(node, module_qn, blocks):
+                uses.append(found)
+            node = node.parent
+        path = rs_utils.build_module_path(caller_node)
+        scopes = tuple(
+            cs.SEPARATOR_DOT.join([module_qn, *path[:depth]])
+            for depth in range(len(path), 0, -1)
+        )
+        return _RustCallScope(
+            tuple(uses), scopes, (caller_node.start_byte, caller_node.end_byte)
+        )
+
+    def _rust_body_uses(
+        self,
+        node: ASTNode,
+        module_qn: str,
+        blocks: Mapping[tuple[int, int], Mapping[str, str]],
+    ) -> Mapping[str, str] | None:
+        # The `use`s written directly in `node`'s body: a fn's are kept under
+        # the qn it registered as, a block's (an inner or initializer block)
+        # under its span.
+        if node.type == cs.TS_RS_FUNCTION_ITEM:
+            location = self.function_locations.get(function_span_key(module_qn, node))
+            if location is None:
+                return None
+            return self.import_processor.rust_fn_scope_imports.get(
+                location.qualified_name
+            )
+        if node.type == cs.TS_RS_BLOCK:
+            return blocks.get((node.start_byte, node.end_byte))
+        return None
+
+    def _rust_local_use(
+        self,
+        name: str,
+        module_qn: str,
+        call_point: int | None,
+        scope: _RustCallScope,
+    ) -> str | None:
+        # What a `use` in the blocks and bodies around a call binds `name`
+        # to. Any of them shadows every `mod`-level binding of the name.
+        if (
+            inner := self._rust_inner_block_use(name, module_qn, call_point, scope)
+        ) is not None:
+            return inner
+        return next((uses[name] for uses in scope.uses if name in uses), None)
+
+    def _rust_inner_block_use(
+        self,
+        name: str,
+        module_qn: str,
+        call_point: int | None,
+        scope: _RustCallScope,
+    ) -> str | None:
+        # The `use` of the innermost block of the caller's own body that holds
+        # the call, unless a `mod` written in that block holds it instead.
+        if call_point is None:
+            return None
+        first, last = scope.span
+        best: tuple[int, str] | None = None
+        for (
+            start,
+            end,
+            uses,
+            mod_holes,
+            *_,
+        ) in self.import_processor.rust_block_scope_imports.get(module_qn, ()):
+            if (
+                name in uses
+                and first <= start <= call_point < end <= last
+                and not any(s <= call_point < e for s, e in mod_holes)
+                and (best is None or end - start < best[0])
+            ):
+                best = (end - start, uses[name])
+        return best[1] if best else None
+
+    def _infer_rust_call_return_type(
+        self,
+        segments: list[str],
+        module_qn: str,
+        var_types: dict[str, str],
+        call_point: int | None,
+        scope: _RustCallScope,
+    ) -> str | None:
+        # Walk a flattened chain to the type it yields:
+        #   ['Command','from_frame']  -> base type Command, method from_frame
+        #   ['self','shared','state','lock','unwrap'] -> base local self (Db),
+        #     field shared (Arc<Shared>->Shared), field state (Mutex<State>, guard
+        #     inner State), lock unwraps the guard -> State, unwrap identity -> State.
+        # Each hop tries guard-unwrap (a guard accessor right after a guard-wrapped
+        # field) -> field-type -> method-return -> identity.
+        if not segments:
+            return None
+        # Base of the chain: a typed local (self/var), else a free fn called by
+        # bare name (`let s = make()`).
+        base = var_types.get(segments[0]) or self._rust_free_fn_return_type(
+            segments[0], module_qn, call_point, scope
+        )
+        if base is not None:
+            return self._walk_rust_hops(base, segments[1:], module_qn)
+        # A bare unresolved name types nothing. With hops, the head is a type
+        # (`Command::from_frame`), else a module the fn is reached through
+        # (`util::tmpdir()`, `crate::util::tmpdir()`, `inner::make()`).
+        if len(segments) == 1:
+            return None
+        if (
+            walked := self._walk_rust_hops(segments[0], segments[1:], module_qn)
+        ) is not None:
+            return walked
+        fn_type = self._rust_module_fn_return_type(
+            segments[0], segments[1], module_qn, call_point, scope
+        )
+        if fn_type is None:
+            return None
+        return self._walk_rust_hops(fn_type, segments[2:], module_qn)
+
+    def _walk_rust_hops(
+        self, current_type: str | None, hops: list[str], module_qn: str
+    ) -> str | None:
+        # Inner type of the guard-wrapped field just hopped through, pending a guard
+        # accessor to unwrap it (None otherwise).
+        guard_inner: str | None = None
+        for hop in hops:
+            if current_type is None:
+                return None
+            if guard_inner is not None and hop in cs.RS_GUARD_ACCESSORS:
+                current_type, guard_inner = guard_inner, None
+                continue
+            guard_inner = None
+            # A bare guard-wrapper type not immediately guard-accessed can't
+            # continue: its inner is only reachable at runtime, unrecoverable from
+            # the bare name. Bail so the trie fallback resolves the downstream call
+            # (matching a direct wrapper-method call).
+            if current_type in cs.RS_GUARD_WRAPPERS:
+                return None
+            class_qn = self._resolve_rust_type_qn(current_type, module_qn)
+            step = self._rust_member_hop(current_type, class_qn, hop)
+            if step is None:
+                return None
+            current_type, guard_inner = step
+        return current_type
+
+    def _rust_member_hop(
+        self, current_type: str, class_qn: str, hop: str
+    ) -> tuple[str, str | None] | None:
+        # One field-type -> method-return -> identity hop off `class_qn`: the
+        # type it yields, plus the inner type of a guard-wrapped field for a
+        # guard accessor to unwrap next. None when the hop names nothing known.
+        if field_type := self.class_field_types.get(class_qn, {}).get(hop):
+            return field_type, self.class_field_guard_inner.get(class_qn, {}).get(hop)
+        next_type = self.method_return_types.get(f"{class_qn}{cs.SEPARATOR_DOT}{hop}")
+        if next_type:
+            # A method returning its own type (`fn new() -> Get`) keeps the
+            # caller's spelling of it: through `pub use inner::Get as
+            # Fetch;` the caller only has `Fetch` in scope (issue #2542).
+            if next_type == class_qn.rsplit(cs.SEPARATOR_DOT, 1)[-1]:
+                return current_type, None
+            return next_type, None
+        if hop in cs.RS_IDENTITY_METHODS:
+            return current_type, None
+        return None
+
+    def _resolve_rust_type_qn(self, type_name: str, module_qn: str) -> str:
+        # Resolve a Rust type name to its class-node qn, honoring imports: an
+        # external `use` target is a raw `::`-path (`std::io::Read`) matched by
+        # simple name, a local one an already-resolved project qn. Falls back to
+        # same-module resolution for a locally-defined type. A fully-qualified
+        # inline base (`crate::cmd::Command`) carries its own path, and a
+        # helper's return type read in the helper's own module arrives as
+        # the qn it resolved to there.
+        if cs.SEPARATOR_DOT in type_name and type_name in self.function_registry:
+            return type_name
+        if cs.SEPARATOR_DOUBLE_COLON in type_name:
+            return self._resolve_rust_import_path(type_name)
+        import_map = self.import_processor.import_mapping.get(module_qn, {})
+        if target := import_map.get(type_name):
+            if cs.SEPARATOR_DOUBLE_COLON in target:
+                return self._resolve_rust_import_path(target)
+            # A crate::/super::/self:: use target arrives as an already
+            # resolved project qn; use it when it names a registered type,
+            # after following any `pub use` re-export that qn names (issue
+            # #2542). Otherwise fall through with require_registered so the
+            # SAME unregistered map value cannot come back verbatim.
+            target = follow_reexports(
+                target, self.import_processor.import_mapping, self.function_registry
+            )
+            if self.function_registry.get(target) is not None:
+                return target
+            return (
+                resolve_class_name(
+                    type_name,
+                    module_qn,
+                    self.import_processor,
+                    self.function_registry,
+                    require_registered=True,
+                )
+                or type_name
+            )
+        return self._resolve_class_name(type_name, module_qn) or type_name
+
+    def _rust_free_fn_return_type(
+        self,
+        name: str,
+        module_qn: str,
+        call_point: int | None,
+        scope: _RustCallScope,
+    ) -> str | None:
+        # Return type of a free fn called by bare name: same-module first, then a
+        # `use`-imported fn resolved through its raw `::` path. A type-name base
+        # (`Maker::make`) misses here because a bare type is never a recorded key
+        # (fns and types share a name only across Rust's separate fn/type namespaces,
+        # which idiomatic code never does).
+        # A body-local fn shadows the module's own for the block it is written
+        # in, and it registers under a `@<line>` variant when the module item
+        # owns the natural qn, so the site decides which of the two is meant
+        # (issue #1069).
+        if shadowing := rs_utils.block_item_at(
+            self.import_processor.rust_block_items.get(module_qn, ()),
+            self.function_registry,
+            name,
+            call_point,
+        ):
+            # The site names the block item, so the module item of that name is
+            # not what is meant, whatever comes of the block item's own return.
+            # A unit or tuple return records nothing, and a generic return
+            # records a type parameter that resolves to no class here; either
+            # way the answer is no type rather than the module item's, since
+            # the known-external guard would delete the edge the trie fallback
+            # still finds and an unresolvable binding is worse than none.
+            shadow_type = self.method_return_types.get(shadowing)
+            if shadow_type and self._rust_binding_type_resolves(shadow_type, module_qn):
+                return shadow_type
+            return None
+        if (
+            target := self._rust_local_use(name, module_qn, call_point, scope)
+        ) is not None:
+            return self._rust_imported_fn_return_type(target, module_qn)
+        # Each enclosing `mod`, innermost first, then the file module: a fn
+        # defined in a scope, or a `use` there, shadows every outer one
+        # (`mod tests { fn tmpdir() ... }`, issue #2942).
+        import_mapping = self.import_processor.import_mapping
+        for owner in (*scope.scopes, module_qn):
+            if (item := self._rust_scope_item(owner, name, call_point)) is not None:
+                return self._rust_fn_return_type(item)
+            if target := import_mapping.get(owner, {}).get(name):
+                return self._rust_imported_fn_return_type(target, module_qn)
+        return None
+
+    def _rust_scope_item(
+        self, scope: str, name: str, call_point: int | None
+    ) -> str | None:
+        # The item `scope` declares as `name`. It decides even when it records
+        # no return type (a unit fn), since it shadows every outer one. A
+        # body-local fn that took the scope's flat qn is in scope in its own
+        # block alone, which `block_item_at` has already tried for this site
+        # (issue #1061); a site with no position keeps it, as the resolver
+        # does.
+        qn = f"{scope}{cs.SEPARATOR_DOT}{name}"
+        if qn not in self.function_registry:
+            return None
+        if call_point is not None and qn in self.import_processor.rust_block_item_qns:
+            return None
+        return qn
+
+    def _rust_imported_fn_return_type(self, target: str, module_qn: str) -> str | None:
+        if cs.SEPARATOR_DOUBLE_COLON in target:
+            # `use std::env::vars;` names a fn outside the repo, which the
+            # name search below would swap for a same-named project fn and
+            # type the local from it (Greptile, PR #3010).
+            head = target.split(cs.SEPARATOR_DOUBLE_COLON, 1)[0]
+            if self.import_processor.rust_crate_is_external(head, module_qn):
+                return None
+            target = self._resolve_rust_import_path(
+                target, node_types=(NodeType.FUNCTION,)
+            )
+        # A crate::/super::/self:: use target is already a project qn.
+        return self._rust_fn_return_type(target)
+
+    def _rust_fn_return_type(self, fn_qn: str) -> str | None:
+        # A helper's recorded return type is the name as the helper's module
+        # spells it, so it is read there: the caller may have a same-named
+        # type of its own in scope. Left bare when that module neither
+        # defines it nor imports it from the project, as before.
+        return_type = self.method_return_types.get(fn_qn)
+        if return_type is None:
+            return None
+        owner = fn_qn.rpartition(cs.SEPARATOR_DOT)[0]
+        # A type the helper's module imports from an outside crate (`use
+        # tempfile::TempDir;`) is no project type: left bare, the caller would
+        # read it in its own module and could take a same-named one there
+        # (CodeRabbit, PR #3010).
+        imported = self.import_processor.import_mapping.get(owner, {}).get(return_type)
+        if imported is not None and cs.SEPARATOR_DOUBLE_COLON in imported:
+            head = imported.split(cs.SEPARATOR_DOUBLE_COLON, 1)[0]
+            if self.import_processor.rust_crate_is_external(head, owner):
+                return None
+        return self._rust_owner_type_qn(return_type, owner) or return_type
+
+    def _rust_owner_type_qn(self, type_name: str, owner: str) -> str | None:
+        # The first-party type `type_name` names in module `owner`: one it
+        # defines, or one a project `use` there binds (re-exports followed).
+        imports = self.import_processor.import_mapping
+        target = imports.get(owner, {}).get(type_name)
+        if target is None:
+            target = f"{owner}{cs.SEPARATOR_DOT}{type_name}"
+        elif cs.SEPARATOR_DOUBLE_COLON in target:
+            return None
+        target = follow_reexports(target, imports, self.function_registry)
+        if self.function_registry.get(target) in _RS_TYPE_NODE_TYPES:
+            return target
+        return None
+
+    def _rust_module_fn_return_type(
+        self,
+        path: str,
+        item: str,
+        module_qn: str,
+        call_point: int | None,
+        scope: _RustCallScope,
+    ) -> str | None:
+        # Return type of `path::item()` where `path` names a module: the
+        # first candidate module holding `item`, itself or through a `pub
+        # use`, decides, in the order `_rust_module_path_candidates` yields
+        # them. A candidate module that has `use`s of its own decides even
+        # without it, since it shadows every outer same-named module, as in
+        # the call resolver.
+        imports = self.import_processor.import_mapping
+        for module in self._rust_module_path_candidates(
+            path, module_qn, call_point, scope
+        ):
+            fn_qn = follow_reexports(
+                f"{module}{cs.SEPARATOR_DOT}{item}", imports, self.function_registry
+            )
+            if fn_qn in self.function_registry:
+                return self._rust_fn_return_type(fn_qn)
+            if module in imports:
+                return None
+        return None
+
+    def _rust_module_path_candidates(
+        self,
+        path: str,
+        module_qn: str,
+        call_point: int | None,
+        scope: _RustCallScope,
+    ) -> Iterator[str]:
+        # Where a module path written at a call can point, in the order the
+        # call resolver binds its head (`_try_resolve_rust_module_qualified`):
+        # crate::/self::/super:: rewritten as a `use` path is; else a `use`
+        # in a block or body around the call; else, per `mod` innermost
+        # first, a `use path::{self}`, a child module, then a `use` binding
+        # (which decides); last, the file's submodule tree. An external
+        # `use` (a `::` path) speaks for the name too.
+        parts = path.split(cs.SEPARATOR_DOUBLE_COLON)
+        head, rest = parts[0], parts[1:]
+        if head in (cs.RUST_CRATE_KEYWORD, cs.KEYWORD_SELF, cs.KEYWORD_SUPER):
+            yield from self._rust_prefixed_module(path, head, module_qn, scope.scopes)
+            return
+        if (
+            local := self._rust_local_use(head, module_qn, call_point, scope)
+        ) is not None:
+            if cs.SEPARATOR_DOUBLE_COLON not in local:
+                yield cs.SEPARATOR_DOT.join([local, *rest])
+            return
+        import_mapping = self.import_processor.import_mapping
+        self_modules = self.import_processor.rust_self_module_imports
+        for owner in (*scope.scopes, module_qn):
+            if mapped := self_modules.get(owner, {}).get(head):
+                yield cs.SEPARATOR_DOT.join([mapped, *rest])
+                return
+            yield cs.SEPARATOR_DOT.join([owner, *parts])
+            if mapped := import_mapping.get(owner, {}).get(head):
+                if cs.SEPARATOR_DOUBLE_COLON not in mapped:
+                    yield cs.SEPARATOR_DOT.join([mapped, *rest])
+                return
+        yield self.import_processor._rust_resolve_relative(module_qn, parts, module_qn)
+
+    def _rust_prefixed_module(
+        self, path: str, head: str, module_qn: str, scopes: Sequence[str]
+    ) -> Iterator[str]:
+        # The module a crate::/self::/super:: path names. self::/super::
+        # count from the innermost `mod` the call is written in, which the
+        # file module alone does not tell.
+        effective = scopes[0] if scopes and head != cs.RUST_CRATE_KEYWORD else module_qn
+        base = self.import_processor._rewrite_rust_local_use_path(path, effective)
+        if base != cs.RUST_UNRESOLVABLE_QN and cs.SEPARATOR_DOUBLE_COLON not in base:
+            yield base
+
+    def _resolve_rust_import_path(
+        self,
+        target: str,
+        node_types: tuple[NodeType, ...] = (
+            NodeType.CLASS,
+            NodeType.ENUM,
+            NodeType.TYPE,
+        ),
+    ) -> str:
+        # Map a `use` target (`crate::cmd::Command`) to its registry qn. Prefer the
+        # candidate whose qn ends with the import's module path (`.cmd.Command`), so
+        # two same-named types in different modules disambiguate by path; fall back
+        # to the deterministic-min simple-name match when the path (a crate-root
+        # re-export `crate::Command`) can't pinpoint one.
+        parts = [
+            p
+            for p in target.split(cs.SEPARATOR_DOUBLE_COLON)
+            if p not in cs.RS_PATH_KEYWORDS
+        ]
+        if not parts:
+            return target
+        simple = parts[-1]
+        candidates = [
+            qn
+            for qn in self.function_registry.find_ending_with(simple)
+            if self.function_registry.get(qn) in node_types
+        ]
+        if not candidates:
+            return target
+        path_suffix = cs.SEPARATOR_DOT + cs.SEPARATOR_DOT.join(parts)
+        matching = [qn for qn in candidates if qn.endswith(path_suffix)]
+        return min(matching) if matching else min(candidates)
+
+    def _collect_field_types(self, class_qn: str) -> dict[str, str]:
+        # Collect member-field types along the inheritance chain so a derived class
+        # method can resolve a field inherited from a base. Bases are visited first
+        # and the class's own fields applied last, so a derived field shadows a
+        # same-named base field. Guards against inheritance cycles.
+        fields: dict[str, str] = {}
+        seen: set[str] = set()
+
+        def collect(qn: str) -> None:
+            if qn in seen:
+                return
+            seen.add(qn)
+            for base in self.class_inheritance.get(qn, []):
+                collect(base)
+            if own := self.class_field_types.get(qn):
+                fields.update(own)
+
+        collect(class_qn)
+        return fields
+
+    def _build_local_variable_type_map(
+        self,
+        caller_node: ASTNode,
+        module_qn: str,
+        language: cs.SupportedLanguage,
+        class_context: str | None = None,
+    ) -> dict[str, str]:
+        match language:
+            case cs.SupportedLanguage.PYTHON:
+                # The Python builder seeds `self`/`cls` from the class itself,
+                # ahead of its assignment walk (issue #1901).
+                return self.python_type_inference.build_local_variable_type_map(
+                    caller_node, module_qn, class_context
+                )
+            case (
+                cs.SupportedLanguage.JS
+                | cs.SupportedLanguage.TS
+                | cs.SupportedLanguage.TSX
+            ):
+                return self.js_type_inference.build_local_variable_type_map(
+                    caller_node, module_qn, language
+                )
+            case cs.SupportedLanguage.JAVA:
+                return self.java_type_inference.build_variable_type_map(
+                    caller_node, module_qn
+                )
+            case cs.SupportedLanguage.CSHARP:
+                return self.csharp_type_inference.build_variable_type_map(caller_node)
+            case cs.SupportedLanguage.DART:
+                return self.dart_type_inference.build_local_variable_type_map(
+                    caller_node
+                )
+            case cs.SupportedLanguage.LUA:
+                return self.lua_type_inference.build_local_variable_type_map(
+                    caller_node, module_qn
+                )
+            case cs.SupportedLanguage.GO:
+                return self.go_type_inference.build_local_variable_type_map(caller_node)
+            case cs.SupportedLanguage.RUST:
+                return self.rust_type_inference.build_local_variable_type_map(
+                    caller_node
+                )
+            case cs.SupportedLanguage.CPP:
+                return self.cpp_type_inference.build_local_variable_type_map(
+                    caller_node
+                )
+            case _:
+                return {}
+
+    def _resolve_class_name(self, class_name: str, module_qn: str) -> str | None:
+        return resolve_class_name(
+            class_name, module_qn, self.import_processor, self.function_registry
+        )
+
+    def _build_java_variable_type_map(
+        self, caller_node: ASTNode, module_qn: str
+    ) -> dict[str, str]:
+        return self.java_type_inference.build_variable_type_map(caller_node, module_qn)

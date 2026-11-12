@@ -1,0 +1,603 @@
+# C/C++ tree-sitter node types, module markers, and operator maps.
+
+from enum import StrEnum
+
+from .ast_nodes import (
+    TS_ENUM_SPECIFIER,
+    TS_STRUCT_SPECIFIER,
+    TS_TEMPLATE_ARGUMENT_LIST,
+    TS_UNION_SPECIFIER,
+)
+
+
+class CppNodeType(StrEnum):
+    TRANSLATION_UNIT = "translation_unit"
+    NAMESPACE_DEFINITION = "namespace_definition"
+    NAMESPACE_IDENTIFIER = "namespace_identifier"
+    IDENTIFIER = "identifier"
+    EXPORT = "export"
+    EXPORT_KEYWORD = "export_keyword"
+    PRIMITIVE_TYPE = "primitive_type"
+    DECLARATION = "declaration"
+    FUNCTION_DEFINITION = "function_definition"
+    TEMPLATE_DECLARATION = "template_declaration"
+    CLASS_SPECIFIER = "class_specifier"
+    FUNCTION_DECLARATOR = "function_declarator"
+    VARIADIC_PARAMETER = "variadic_parameter"
+    POINTER_DECLARATOR = "pointer_declarator"
+    ARRAY_DECLARATOR = "array_declarator"
+    ABSTRACT_POINTER_DECLARATOR = "abstract_pointer_declarator"
+    ABSTRACT_ARRAY_DECLARATOR = "abstract_array_declarator"
+    FIELD_DECLARATION_LIST = "field_declaration_list"
+    REFERENCE_DECLARATOR = "reference_declarator"
+    # An attribute MACRO before a definition (`JSON_HEDLEY_NON_NULL(3)
+    # bool sax_parse(...)`) parses as a parenthesized_declarator wrapping
+    # an ERROR plus the real function_declarator; the name walk descends it.
+    PARENTHESIZED_DECLARATOR = "parenthesized_declarator"
+    FIELD_DECLARATION = "field_declaration"
+    FIELD_IDENTIFIER = "field_identifier"
+    FIELD_INITIALIZER_LIST = "field_initializer_list"
+    FIELD_INITIALIZER = "field_initializer"
+    TEMPLATE_METHOD = "template_method"
+    QUALIFIED_IDENTIFIER = "qualified_identifier"
+    OPERATOR_NAME = "operator_name"
+    DESTRUCTOR_NAME = "destructor_name"
+    CONSTRUCTOR_OR_DESTRUCTOR_DEFINITION = "constructor_or_destructor_definition"
+    CONSTRUCTOR_OR_DESTRUCTOR_DECLARATION = "constructor_or_destructor_declaration"
+    INLINE_METHOD_DEFINITION = "inline_method_definition"
+    OPERATOR_CAST_DEFINITION = "operator_cast_definition"
+    TYPE_IDENTIFIER = "type_identifier"
+    PARAMETER_LIST = "parameter_list"
+    PARAMETER_DECLARATION = "parameter_declaration"
+    OPTIONAL_PARAMETER_DECLARATION = "optional_parameter_declaration"
+    # `Args&&... args`: a template parameter pack, one variadic slot whose
+    # name sits inside the variadic_declarator.
+    VARIADIC_PARAMETER_DECLARATION = "variadic_parameter_declaration"
+    VARIADIC_DECLARATOR = "variadic_declarator"
+    INIT_DECLARATOR = "init_declarator"
+    TEMPLATE_TYPE = "template_type"
+    FIELD_EXPRESSION = "field_expression"
+    COMPOUND_STATEMENT = "compound_statement"
+    THIS = "this"
+    TYPE_DEFINITION = "type_definition"
+    ALIAS_DECLARATION = "alias_declaration"
+    TYPE_DESCRIPTOR = "type_descriptor"
+    REF_QUALIFIER = "ref_qualifier"
+    FRIEND_DECLARATION = "friend_declaration"
+
+
+CPP_MODULE_PATH_MARKERS = frozenset({"interfaces", "modules"})
+
+# An optional parameter's `= value`, which is not part of its type.
+CPP_FIELD_DEFAULT_VALUE = "default_value"
+# `f(void)` declares no parameter: the same overload as `f()`.
+CPP_VOID_PARAMETER = "void"
+# Names no typedef can stand behind: the built-in type keywords and the cv
+# words written with them. Two parameter types spelled only with these, and
+# differently, are two types; one written with any other name may be an
+# alias of the other.
+CPP_BUILTIN_TYPE_WORDS = frozenset(
+    {
+        "void",
+        "bool",
+        "char",
+        "wchar_t",
+        "char8_t",
+        "char16_t",
+        "char32_t",
+        "short",
+        "int",
+        "long",
+        "float",
+        "double",
+        "signed",
+        "unsigned",
+        "const",
+        "volatile",
+    }
+)
+# A standard library type that is its own type, bare or as `std::name`.
+# `size_t`, `ptrdiff_t` and the <cstdint> names are left out on purpose: each
+# is an implementation-defined alias of a built-in integer type.
+CPP_STD_FIXED_TYPE_NAMES = frozenset({"nullptr_t"})
+# Standard string aliases, the template each instantiates and its character
+# type: `std::string` is `std::basic_string<char>`, so it is that spelling's
+# alias and no other type's.
+CPP_STD_STRING_ALIAS_TEMPLATES: dict[str, tuple[str, str]] = {
+    "string": ("basic_string", "char"),
+    "wstring": ("basic_string", "wchar_t"),
+    "u8string": ("basic_string", "char8_t"),
+    "u16string": ("basic_string", "char16_t"),
+    "u32string": ("basic_string", "char32_t"),
+    "string_view": ("basic_string_view", "char"),
+    "wstring_view": ("basic_string_view", "wchar_t"),
+    "u8string_view": ("basic_string_view", "char8_t"),
+    "u16string_view": ("basic_string_view", "char16_t"),
+    "u32string_view": ("basic_string_view", "char32_t"),
+}
+CPP_STD_NAMESPACE = "std"
+# The cv-qualifiers: on a by-value parameter they are no part of the
+# function's type; on what a pointer or reference refers to they are.
+CPP_CV_QUALIFIER_WORDS = frozenset({"const", "volatile"})
+# The pointer declarator: a `const` after it qualifies the pointer itself.
+CPP_POINTER_DECLARATOR = "*"
+
+# C++ module declaration prefixes
+CPP_EXPORT_MODULE_PREFIX = "export module "
+CPP_MODULE_PREFIX = "module "
+CPP_MODULE_PRIVATE_PREFIX = "module ;"
+CPP_IMPL_SUFFIX = "_impl"
+
+# C++ module type values
+CPP_MODULE_TYPE_INTERFACE = "interface"
+CPP_MODULE_TYPE_IMPLEMENTATION = "implementation"
+
+# C++ export prefixes for class detection
+CPP_EXPORT_CLASS_PREFIX = "export class "
+CPP_EXPORT_STRUCT_PREFIX = "export struct "
+CPP_EXPORT_UNION_PREFIX = "export union "
+CPP_EXPORT_TEMPLATE_PREFIX = "export template"
+CPP_EXPORT_PREFIXES = (
+    CPP_EXPORT_CLASS_PREFIX,
+    CPP_EXPORT_STRUCT_PREFIX,
+    CPP_EXPORT_UNION_PREFIX,
+    CPP_EXPORT_TEMPLATE_PREFIX,
+)
+
+# C++ keywords for class detection
+CPP_KEYWORD_CLASS = "class"
+CPP_KEYWORD_STRUCT = "struct"
+# `static` storage on a declaration: internal linkage, TU-local symbol.
+CPP_KEYWORD_STATIC = "static"
+TS_CPP_STORAGE_CLASS_SPECIFIER = "storage_class_specifier"
+# A class member's access when no `access_specifier` precedes it: a `class`
+# starts private, a `struct` or `union` public (issue #2707).
+CPP_PRIVATE_BY_DEFAULT = frozenset({"class_specifier"})
+CPP_ACCESS_PRIVATE = "private"
+CPP_ACCESS_PUBLIC = "public"
+TS_FIELD_DECLARATION_LIST = "field_declaration_list"
+TS_CPP_TYPE_QUALIFIER = "type_qualifier"
+CPP_EXPORTED_CLASS_KEYWORDS = frozenset({CPP_KEYWORD_CLASS, CPP_KEYWORD_STRUCT})
+
+# A C/C++ class/struct/union tag with no body is a forward declaration
+# (`class Widget;`); making it its own node collides with the real
+# definition's qn and fragments the class into same-named nodes.
+CPP_TYPE_SPECIFIER_NODE_TYPES = frozenset(
+    {"class_specifier", "struct_specifier", "union_specifier"}
+)
+# The tags that can also name a type without defining it: `struct Table *mt;`,
+# `f(struct stat *st)`, `enum color c;` (issue #2615).
+C_ELABORATED_TYPE_NODE_TYPES = CPP_TYPE_SPECIFIER_NODE_TYPES | {TS_ENUM_SPECIFIER}
+# A bodyless tag as the whole of one of these, with no declarator, is a
+# forward declaration (`class Inner;` in a class body), not a use.
+C_FORWARD_DECLARING_NODE_TYPES = frozenset(
+    {CppNodeType.DECLARATION, CppNodeType.FIELD_DECLARATION}
+)
+
+# A `.` inside a specialization's template arguments (`decltype(x.data())`,
+# a pack expansion `Ts...`) is not a qualified-name separator, yet every
+# consumer splits qns on `.` (issue #2434). It is written as U+2024 ONE DOT
+# LEADER, the glyph `sql_names` uses for a dot inside a quoted identifier, so
+# the name still reads as a dot. A C++ identifier cannot contain it.
+CPP_TEMPLATE_ARG_DOT = "\u2024"
+# How a U+2024 already inside a literal argument is written, so the two
+# never collide (review of PR 3356).
+CPP_TEMPLATE_ARG_DOT_ESCAPE = "\\u2024"
+
+CPP_FALLBACK_OPERATOR = "operator_unknown"
+CPP_FALLBACK_DESTRUCTOR = "~destructor"
+CPP_OPERATOR_TEXT_PREFIX = "operator"
+CPP_DESTRUCTOR_PREFIX = "~"
+
+CPP_OPERATOR_SYMBOL_MAP: dict[str, str] = {
+    "+": "operator_plus",
+    "-": "operator_minus",
+    "*": "operator_multiply",
+    "/": "operator_divide",
+    "%": "operator_modulo",
+    "=": "operator_assign",
+    "==": "operator_equal",
+    "!=": "operator_not_equal",
+    "<": "operator_less",
+    ">": "operator_greater",
+    "<=": "operator_less_equal",
+    ">=": "operator_greater_equal",
+    "&&": "operator_logical_and",
+    "||": "operator_logical_or",
+    "&": "operator_bitwise_and",
+    "|": "operator_bitwise_or",
+    "^": "operator_bitwise_xor",
+    "~": "operator_bitwise_not",
+    "!": "operator_not",
+    "<<": "operator_left_shift",
+    ">>": "operator_right_shift",
+    "++": "operator_increment",
+    "--": "operator_decrement",
+    "+=": "operator_plus_assign",
+    "-=": "operator_minus_assign",
+    "*=": "operator_multiply_assign",
+    "/=": "operator_divide_assign",
+    "%=": "operator_modulo_assign",
+    "&=": "operator_and_assign",
+    "|=": "operator_or_assign",
+    "^=": "operator_xor_assign",
+    "<<=": "operator_left_shift_assign",
+    ">>=": "operator_right_shift_assign",
+    "[]": "operator_subscript",
+    "()": "operator_call",
+}
+# The member a call on an object of class type runs (`enter_state(n)` on a
+# functor local, `Cmp{}(a, b)`, a comparator handed to std::sort): its
+# operator(), under the name the map above gives it (issue #2555).
+CPP_OPERATOR_CALL_NAME = CPP_OPERATOR_SYMBOL_MAP["()"]
+
+# Tree-sitter C++ node types for language_spec
+TS_CPP_FUNCTION_DEFINITION = "function_definition"
+TS_CPP_DECLARATION = "declaration"
+TS_CPP_FIELD_DECLARATION = "field_declaration"
+TS_CPP_TEMPLATE_DECLARATION = "template_declaration"
+TS_CPP_TEMPLATE_PARAMETER_LIST = "template_parameter_list"
+# The template TYPE-parameter declaration node types. A value/non-type param
+# (`parameter_declaration`, e.g. `int N` / `MyEnum E`) and a template-template param
+# are deliberately excluded: their type name is a concrete type, not a stand-in that
+# a call receiver could be instantiated as, so it must not enter the template-param set.
+CPP_TYPE_PARAMETER_DECL_TYPES = frozenset(
+    {
+        "type_parameter_declaration",
+        "optional_type_parameter_declaration",
+        "variadic_type_parameter_declaration",
+    }
+)
+TS_CPP_LAMBDA_EXPRESSION = "lambda_expression"
+# A class/struct/union body; a function definition directly in one is a
+# member function.
+TS_CPP_FIELD_DECLARATION_LIST = "field_declaration_list"
+# `Cmp{}` / `Point{1, 2}`: a braced temporary of the named type.
+TS_CPP_COMPOUND_LITERAL_EXPRESSION = "compound_literal_expression"
+# Nodes that hold namespace-scope declarations without opening a function
+# scope: a namespace body, a template's declaration, preprocessor blocks.
+TS_CPP_DECLARATION_LIST = "declaration_list"
+CPP_DECLARATION_CONTAINER_TYPES = frozenset(
+    {
+        TS_CPP_DECLARATION_LIST,
+        TS_CPP_TEMPLATE_DECLARATION,
+        "preproc_if",
+        "preproc_ifdef",
+        "preproc_else",
+        "preproc_elif",
+        "preproc_elifdef",
+    }
+)
+TS_CPP_TRANSLATION_UNIT = "translation_unit"
+TS_CPP_LINKAGE_SPECIFICATION = "linkage_specification"
+# The body of a namespace or an `extern "C++" { }` block.
+TS_CPP_DECLARATION_LIST = "declaration_list"
+CPP_NAMESPACE_SCOPE_TYPES = frozenset(
+    {TS_CPP_TRANSLATION_UNIT, TS_CPP_DECLARATION_LIST, TS_CPP_LINKAGE_SPECIFICATION}
+)
+TS_CPP_CALL_EXPRESSION = "call_expression"
+TS_CPP_FIELD_EXPRESSION = "field_expression"
+TS_CPP_SUBSCRIPT_EXPRESSION = "subscript_expression"
+TS_CPP_NEW_EXPRESSION = "new_expression"
+TS_CPP_DELETE_EXPRESSION = "delete_expression"
+TS_CPP_BINARY_EXPRESSION = "binary_expression"
+TS_CPP_UNARY_EXPRESSION = "unary_expression"
+TS_CPP_UPDATE_EXPRESSION = "update_expression"
+TS_CPP_FUNCTION_DECLARATOR = "function_declarator"
+# Substring shared by C++ declarator node types (pointer_declarator,
+# reference_declarator, ...), used to unwrap a parameter declarator down
+# to its bound identifier.
+CPP_DECLARATOR_SUFFIX = "declarator"
+
+FIELD_OPERATOR = "operator"
+FIELD_MACRO = "macro"
+
+# C++ I/O direct-sink walk node types (issue #714). call_expression keeps a
+# `function` field so call_name works unchanged. The stdout write path is the
+# stream-insertion operator `std::cout << x` -- a `binary_expression` with a `<<`
+# operator whose left-spine base is cout/cerr (no call node), handled via
+# stream_sink_type like Rust's macro sinks. A string_literal wraps string_content;
+# `compound_statement` is the block scope; `declaration` holds init_declarator
+# locals whose bound name is nested under the `declarator` field.
+TS_CPP_STRING_LITERAL = "string_literal"
+TS_CPP_RAW_STRING_LITERAL = "raw_string_literal"
+TS_CPP_CHAR_LITERAL = "char_literal"
+# A literal template argument (a C++20 fixed string, a character) is one value
+# whose spaces belong to it: `Box<"a b">` and `Box<"a  b">` are two
+# specializations, so a name renders the literal whole (review of PR 3356).
+CPP_LITERAL_ARGUMENT_TYPES = frozenset(
+    {TS_CPP_STRING_LITERAL, TS_CPP_RAW_STRING_LITERAL, TS_CPP_CHAR_LITERAL}
+)
+# A raw literal's line break or tab, written as its escape, keeps the name on
+# one line.
+CPP_LITERAL_LINE_ESCAPES = {"\n": "\\n", "\r": "\\r", "\t": "\\t"}
+CPP_LITERAL_BACKSLASH = "\\"
+# A CRLF source line ending, which translation phase 1 reads as one new-line.
+CPP_SOURCE_CRLF = "\r\n"
+CPP_SOURCE_NEWLINE = "\n"
+CPP_LITERAL_ESCAPED_BACKSLASH = "\\\\"
+# Every C++ punctuator longer than one character (digraphs and C++26's
+# reflection `^^` included) and the two comment openers. Where the end of one
+# token and the start of the next spell one of these, or begin one, writing
+# them together lexes differently (maximal munch): `a + ++b` would read
+# `a+++b`, which is `a++ + b`. A specialization's rendered name keeps a space
+# there (review of PR 3356).
+CPP_MULTI_CHAR_PUNCTUATORS = frozenset(
+    "<: :> <% %> %: %:%: ... :: .* -> ->* ++ -- += -= *= /= %= ^= &= |= "
+    "== != <= >= <=> && || << >> <<= >>= ## ^^ /* //".split()
+)
+# Only a template list's own `<` and `>` are exempt: two closers written
+# together (`A<B<C>>`) still close two lists, and an opener before a leading
+# `::` (`A<::T>`) is not the digraph `<:` ([temp.names], [lex.pptoken]).
+CPP_TEMPLATE_LIST_TYPES = frozenset(
+    {TS_TEMPLATE_ARGUMENT_LIST, TS_CPP_TEMPLATE_PARAMETER_LIST}
+)
+CPP_TEMPLATE_LIST_DELIMITERS = frozenset({"<", ">"})
+# A number ending in an exponent letter (`0x1E`, or `1_E` whose suffix is a
+# token of its own) runs on into a following sign as one preprocessing
+# number: `0x1E+1`. A string's suffix matches too, and only gains a space.
+CPP_PP_NUMBER_TOKEN_TYPES = frozenset({"number_literal", "literal_suffix"})
+CPP_PP_NUMBER_EXPONENTS = frozenset("eEpP")
+CPP_PP_NUMBER_SIGNS = frozenset("+-")
+TS_CPP_STRING_CONTENT = "string_content"
+TS_CPP_COMPOUND_STATEMENT = "compound_statement"
+# `if (int x = 1)` / `switch (int q = f())`: the condition declaration nests
+# inside this wrapper, one level below the statement node.
+TS_CPP_CONDITION_CLAUSE = "condition_clause"
+# A lambda's parameter list hangs off this declarator (no name to declare).
+TS_CPP_ABSTRACT_FUNCTION_DECLARATOR = "abstract_function_declarator"
+TS_CPP_DECLARATION = "declaration"
+TS_CPP_INIT_DECLARATOR = "init_declarator"
+TS_CPP_PARAMETER_DECLARATION = "parameter_declaration"
+TS_CPP_IDENTIFIER = "identifier"
+TS_CPP_QUALIFIED_IDENTIFIER = "qualified_identifier"
+# `Reader<T>(...)` as a call target: the callee wraps name + template args.
+TS_CPP_TEMPLATE_FUNCTION = "template_function"
+# `&fn` / `*p`: the unary address-of or dereference, told apart by its
+# `operator` field. Only address-of names a function it hands over.
+TS_CPP_POINTER_EXPRESSION = "pointer_expression"
+CPP_ADDRESS_OF = "&"
+CPP_DEREFERENCE = "*"
+# Declarators that put a pointer or an array between a declared type and its
+# name (or its unnamed slot): it holds an address, not a value of that type.
+CPP_INDIRECT_DECLARATOR_TYPES = frozenset(
+    {
+        CppNodeType.POINTER_DECLARATOR,
+        CppNodeType.ARRAY_DECLARATOR,
+        CppNodeType.ABSTRACT_POINTER_DECLARATOR,
+        CppNodeType.ABSTRACT_ARRAY_DECLARATOR,
+    }
+)
+# Parameter declarations a C++ parameter list holds, a pack among them.
+CPP_PARAMETER_DECLARATION_TYPES = frozenset(
+    {
+        CppNodeType.PARAMETER_DECLARATION,
+        CppNodeType.OPTIONAL_PARAMETER_DECLARATION,
+        CppNodeType.VARIADIC_PARAMETER_DECLARATION,
+    }
+)
+# The nodes a free function is declared by: a definition or a prototype.
+CPP_FREE_FUNCTION_DECLARATION_TYPES = frozenset(
+    {CppNodeType.FUNCTION_DEFINITION, CppNodeType.DECLARATION}
+)
+# `return {args};` -- a braced construction of the declared return type.
+TS_CPP_INITIALIZER_LIST = "initializer_list"
+# Stream-insertion operator; a `binary_expression` using it whose left-spine base
+# is std::cout / std::cerr writes STDOUT.
+CPP_OP_LEFT_SHIFT = "<<"
+# Stream-extraction operator; on a bound fstream handle (`in >> word`) it is a
+# READ of that handle's resource (issue #714).
+CPP_OP_RIGHT_SHIFT = ">>"
+TS_CPP_FOR_RANGE_LOOP = "for_range_loop"
+# Switch family: cases may fall through; a default arm is a
+# case_statement without a `value` field.
+TS_CPP_SWITCH_STATEMENT = "switch_statement"
+TS_CPP_CASE_STATEMENT = "case_statement"
+# field_expression = `obj.field` (argument/field); subscript_expression =
+# `arr[i]` (argument/indices). Inert for C++ I/O, wired for shape correctness.
+CPP_FIELD_ARGUMENT = "argument"
+CPP_FIELD_FIELD = "field"
+CPP_FIELD_INDICES = "indices"
+
+# Derived node type tuples for class ingestion
+CPP_CLASS_TYPES = (CppNodeType.CLASS_SPECIFIER, TS_STRUCT_SPECIFIER)
+CPP_COMPOUND_TYPES = (*CPP_CLASS_TYPES, TS_UNION_SPECIFIER, TS_ENUM_SPECIFIER)
+# Node types that open their own variable scope; local-variable inference must
+# not descend, or a name in a lambda / nested function / local class body gets
+# attributed to the enclosing function's scope.
+CPP_NESTED_SCOPE_NODE_TYPES = frozenset(
+    (
+        TS_CPP_FUNCTION_DEFINITION,
+        TS_CPP_LAMBDA_EXPRESSION,
+        *CPP_COMPOUND_TYPES,
+    )
+)
+
+# Preprocessor conditional directive heads, matched at line start (C allows
+# whitespace around '#'). Drives the whole-file-ERROR parse recovery: a
+# conditional branch whose brace count does not balance (nlohmann's
+# `#ifdef __cpp_lib_byteswap ... else { #endif`) breaks tree-sitter, which
+# keeps every branch's tokens.
+CPP_PREPROC_CONDITIONAL_PATTERN = (
+    rb"^\s*#\s*(if|ifdef|ifndef|elif|elifdef|elifndef|else|endif)\b"
+)
+CPP_PREPROC_OPEN_DIRECTIVES = frozenset({b"if", b"ifdef", b"ifndef"})
+CPP_PREPROC_SPLIT_DIRECTIVES = frozenset({b"elif", b"elifdef", b"elifndef", b"else"})
+
+# Annotation macros written after a declarator (`bool Check() const
+# LOCKS_REQUIRED(mu) {`, `int count_ GUARDED_BY(mu);`, issue #2552). Only a
+# macro can stand there in valid C++, but tree-sitter cannot see the
+# #define and splits the declaration around it. The recovery pass blanks an
+# ALL_CAPS word, with its balanced argument list if it has one, when it
+# sits between a declarator and the token that ends the declaration. The
+# case rule keeps `int ATTR(x) name(void)` (a macro BEFORE the name) from
+# losing its real name.
+CPP_IDENTIFIER_PATTERN = rb"[A-Za-z_][A-Za-z0-9_]*"
+CPP_ANNOTATION_MACRO_PATTERN = rb"_*[A-Z][A-Z0-9_]*"
+# Whitespace and comments between the declarator and the macro (gmock puts
+# the annotation on its own line, sometimes after a `//` note).
+CPP_TRIVIA_PATTERN = rb"(?:\s+|//[^\n]*|/\*.*?\*/)*"
+# A string or character literal: a paren inside one does not count when
+# matching an argument list's closing paren.
+CPP_LITERAL_PATTERN = rb"\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'"
+CPP_ARGUMENT_TOKEN_PATTERN = CPP_LITERAL_PATTERN + rb"|[()]"
+# Two words in a row (`int a`, `const T& x`) declare a parameter; a macro's
+# arguments are expressions.
+CPP_DECLARED_NAME_PATTERN = rb"\b[A-Za-z_]\w*\s+[A-Za-z_]\w*\b"
+CPP_OPEN_PAREN = b"("
+CPP_CLOSE_PAREN = b")"
+CPP_BLANK_BYTE = ord(" ")
+# The class specifiers a `class MACRO Name {...}` misreading starts from
+# (issue #2840), and the tokens that open a class after its name: its body
+# or its base clause.
+CAPTURE_CPP_MACRO_CLASS = "specifier"
+CPP_MACRO_CLASS_QUERY = (
+    "[(class_specifier) (struct_specifier) (union_specifier)]"
+    f" @{CAPTURE_CPP_MACRO_CLASS}"
+)
+CPP_CLASS_OPENERS = (b"{", b":")
+CPP_LINE_BREAK_BYTES = frozenset(b"\r\n")
+# Declarator suffixes the grammar knows; an annotation may sit on either side
+# of them (`f() LOCKS_REQUIRED(mu) override`), so the scan steps over them
+# without blanking them.
+CPP_DECLARATOR_SUFFIX_KEYWORDS = frozenset(
+    {
+        b"const",
+        b"volatile",
+        b"override",
+        b"final",
+        b"noexcept",
+        b"throw",
+        b"__attribute__",
+        b"__attribute",
+    }
+)
+# What may follow the last annotation: a body, the end of the declaration,
+# `= 0`/`= default`/an initializer, the next declarator, a ctor-initializer.
+CPP_DECLARATOR_END_BYTES = frozenset(b"{;=,:")
+CPP_DECLARATOR_END_KEYWORDS = frozenset({b"try", b"requires"})
+# An annotation's argument list is short; an unbalanced `(` must not send
+# the scan across the rest of the file.
+CPP_ANNOTATION_MAX_ARGUMENT_BYTES = 1024
+
+# Reserved keywords that error recovery can leave in declarator position
+# (nlohmann: a macro access-label followed by `const decltype(MACRO_)`
+# members parses as a function declaration NAMED decltype). None can ever
+# name a real C/C++ function or method, so extraction rejects them.
+CPP_RESERVED_DEF_NAMES = frozenset(
+    {
+        "decltype",
+        "sizeof",
+        "alignof",
+        "alignas",
+        "typeid",
+        "static_assert",
+        "noexcept",
+        "typename",
+        "template",
+        "requires",
+        "if",
+        "for",
+        "while",
+        "switch",
+        "return",
+        "catch",
+    }
+)
+
+# Lambda capture list: `[a]` holds identifiers, `[=]`/`[&]` a default
+# capture pulling every enclosing local into scope.
+TS_CPP_LAMBDA_CAPTURE_SPECIFIER = "lambda_capture_specifier"
+TS_CPP_LAMBDA_DEFAULT_CAPTURE = "lambda_default_capture"
+# `[name = expr]` init-capture: binds its leading identifier in the lambda.
+TS_CPP_LAMBDA_CAPTURE_INITIALIZER = "lambda_capture_initializer"
+# A C or C++ enum body and its enumerators (issue #1807).
+TS_ENUMERATOR_LIST = "enumerator_list"
+TS_ENUMERATOR = "enumerator"
+
+# Where C names a function as a VALUE rather than calling it (issue #2529): an
+# initializer-list entry (positional, or `.field = f` in an initializer_pair),
+# a declarator's initial value, an assignment's right side, a call argument.
+TS_CPP_INITIALIZER_PAIR = "initializer_pair"
+TS_CPP_ASSIGNMENT_EXPRESSION = "assignment_expression"
+TS_CPP_ARGUMENT_LIST = "argument_list"
+# Wrappers a function designator keeps its identity through: `&f`, `(f)`,
+# `(handler_t)f` and either branch of `c ? f : g`.
+TS_CPP_POINTER_EXPRESSION = "pointer_expression"
+TS_CPP_CAST_EXPRESSION = "cast_expression"
+TS_CPP_CONDITIONAL_EXPRESSION = "conditional_expression"
+CPP_OP_ADDRESS_OF = "&"
+# Preprocessor conditionals: they wrap declarations without opening a scope,
+# so what they hold belongs to the scope around them (PR #2952).
+CPP_PREPROC_CONDITIONAL_TYPES = frozenset(
+    {"preproc_if", "preproc_ifdef", "preproc_else", "preproc_elif", "preproc_elifdef"}
+)
+# The head of an `#if` chain; its `#elif` / `#else` branches hang off it as
+# the `alternative` field, and only an `#else` makes some branch certain.
+CPP_PREPROC_IF_TYPES = frozenset({"preproc_if", "preproc_ifdef"})
+TS_CPP_PREPROC_ELSE = "preproc_else"
+TS_CPP_PREPROC_DEFINED = "preproc_defined"
+# `#ifndef X` and `#elifndef X` hold when `X` is not defined.
+CPP_PREPROC_NEGATED_DIRECTIVES = frozenset({"#ifndef", "#elifndef"})
+CPP_OP_NOT = "!"
+# Up to this many distinct conditions before a member, in the classes and
+# `#if` blocks around it, every build is tried, so two blocks testing the
+# same flag agree; past it each branch is taken or not on its own, which can
+# only make a member look public.
+CPP_MAX_CORRELATED_CONDITIONS = 6
+# `#define X` and `#define X(a)` give `X` a definition, `#undef X` (a
+# generic `preproc_call`) takes it away; either may change a flag between
+# two blocks that test it.
+CPP_PREPROC_DEFINE_TYPES = frozenset({"preproc_def", "preproc_function_def"})
+TS_CPP_PREPROC_CALL = "preproc_call"
+CPP_FIELD_DIRECTIVE = "directive"
+CPP_PREPROC_UNDEF = "#undef"
+# What can stand for a qualifier besides a namespace or class definition:
+# `namespace A = N;`, `using namespace Q;` (a `using_declaration` holding
+# the `namespace` keyword), `using N::Box;`, and the type aliases `using T =
+# Box;` and `typedef Box T;` (PR #2952).
+TS_CPP_NAMESPACE_ALIAS_DEFINITION = "namespace_alias_definition"
+TS_CPP_USING_DECLARATION = "using_declaration"
+CPP_KEYWORD_NAMESPACE = "namespace"
+# `namespace a::b` and `namespace A = ::N`: a namespace name with parts.
+TS_CPP_NESTED_NAMESPACE_SPECIFIER = "nested_namespace_specifier"
+# `inline namespace v1 {}`: its members are found as members of the
+# namespace around it too.
+CPP_KEYWORD_INLINE = "inline"
+# The path part an unnamed namespace adds: each namespace has one, and what
+# has it in its path is file-private (PR #2952).
+CPP_UNNAMED_NAMESPACE = ""
+CPP_TYPE_ALIAS_TYPES = frozenset({"alias_declaration", "type_definition"})
+# Aliases of aliases are followed this far, so a cycle in broken code ends.
+CPP_MAX_ALIAS_HOPS = 8
+# Nodes that hold file-scope declarations without opening a scope of their
+# own: preprocessor conditionals and an `extern "C" { ... }` block.
+C_FILE_SCOPE_CONTAINER_TYPES = frozenset(
+    {
+        "translation_unit",
+        "preproc_if",
+        "preproc_ifdef",
+        "preproc_else",
+        "preproc_elif",
+        "preproc_elifdef",
+        "linkage_specification",
+        "declaration_list",
+    }
+)
+
+# A conditional directive inside a comma-separated list (a constructor's
+# member-initialiser list, snappy's `#if !defined(NDEBUG) begin_(iov),
+# #endif`, issue #2614) sits where the grammar allows none. tree-sitter
+# opens a preproc conditional that never closes and the enclosing class
+# swallows the rest of the file. A directive is in list context when the
+# code line before it leaves a list open (`,`, `(`, or the `:` that starts a
+# member-initialiser list) or the code line after it continues one
+# (a leading `,` or `:`). A `\` at the end of a preprocessor line continues
+# it onto the next.
+CPP_PREPROC_LINE_PATTERN = rb"^\s*#"
+CPP_PREPROC_CONTINUATION = b"\\"
+CPP_BLOCK_COMMENT_PATTERN = rb"/\*.*?\*/"
+CPP_LIST_OPEN_SUFFIXES = (b",", b"(")
+CPP_CTOR_INIT_COLON_PATTERN = rb"(?:^|\)|\bnoexcept)\s*:$"
+CPP_LIST_ITEM_PREFIXES = (b",", b":")
+CPP_SCOPE_RESOLUTION_PREFIX = b"::"

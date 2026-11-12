@@ -1,0 +1,4434 @@
+# A scoped MCP query must return nothing from other projects (issue #1494).
+#
+# The graph layer is already multi-project -- `list_projects` enumerates,
+# `_get_project_node_ids` scopes by name, and several handlers derive a
+# project. The RETRIEVAL handlers did not: `query_code_graph` ran whatever
+# Cypher the model generated, unfiltered.
+#
+# That is why the reported bleed was INTERMITTENT. A code-level filter is
+# always-or-never; an instruction the model may or may not follow produces
+# exactly "sometimes", which is what was described.
+#
+# So enforcement is post-execution and keyed on `qualified_name`, which
+# begins with the project name for every node the indexer writes. Whatever
+# the generated query does or omits, a row from another project cannot
+# survive the filter.
+from __future__ import annotations
+
+import contextlib
+from pathlib import Path
+
+import pytest
+
+from codebase_rag import constants as cs
+
+# Two projects whose symbols COLLIDE by name. A fixture with distinct names
+# passes whether or not scoping works, so it would prove nothing.
+ALPHA = "alpha__aaaa1111"
+BETA = "beta__bbbb2222"
+GAMMA = "gamma__cccc3333"
+
+_ROWS = [
+    {"qualified_name": f"{ALPHA}.service.handler", "name": "handler"},
+    {"qualified_name": f"{BETA}.service.handler", "name": "handler"},
+    {"qualified_name": f"{ALPHA}.models.User", "name": "User"},
+    {"qualified_name": f"{BETA}.models.User", "name": "User"},
+]
+
+
+class TestTheFilter:
+    """The enforcement primitive, in isolation."""
+
+    def test_rows_from_other_projects_are_dropped(self) -> None:
+        from codebase_rag.tools.codebase_query import scope_rows_to_project
+
+        kept = scope_rows_to_project(_ROWS, ALPHA)
+
+        assert [row["qualified_name"] for row in kept] == [
+            f"{ALPHA}.service.handler",
+            f"{ALPHA}.models.User",
+        ]
+
+    def test_the_colliding_name_alone_does_not_decide_it(self) -> None:
+        """Both projects declare `handler`; only one row may survive.
+
+        This is the assertion a distinct-names fixture could not make.
+        """
+        kept = _scoped(ALPHA)
+        handlers = [r for r in kept if r["name"] == "handler"]
+
+        assert len(handlers) == 1
+        assert handlers[0]["qualified_name"].startswith(f"{ALPHA}.")
+
+    def test_a_prefix_that_is_not_a_component_boundary_does_not_match(self) -> None:
+        """One project name must not swallow a sibling that extends it.
+
+        A bare `startswith(project)` would match a DIFFERENT project whose
+        name begins with this one, so the separator is required.
+
+        The fixture uses names `derive_project_name` can actually produce.
+        An earlier version used `alpha__aaaa1111_extra`, which that
+        function CANNOT emit -- it always ends `__<8 hex digits>` -- so the
+        test was asserting behaviour on a string no project could have.
+        A directory named `alpha_extra` really does yield the name below.
+        """
+        from pathlib import Path
+
+        from codebase_rag.tools.codebase_query import scope_rows_to_project
+        from codebase_rag.utils.path_utils import derive_project_name
+
+        base = derive_project_name(Path("/tmp/alpha"))
+        sibling = derive_project_name(Path("/tmp/alpha_extra"))
+        assert sibling.startswith("alpha_"), sibling
+
+        rows = [
+            {"qualified_name": f"{base}.real.Thing"},
+            {"qualified_name": f"{sibling}.other.Thing"},
+        ]
+
+        kept = scope_rows_to_project(rows, base)
+
+        assert [r["qualified_name"] for r in kept] == [f"{base}.real.Thing"]
+
+    def test_a_project_named_after_another_projects_name_is_still_excluded(
+        self, tmp_path: Path
+    ) -> None:
+        """The pair above cannot fail if the separator is dropped.
+
+        `alpha` and `alpha_extra` derive to `alpha__<digest>` and
+        `alpha_extra__<digest>`, which diverge before the digest -- so a bare
+        `startswith` excludes the sibling anyway and the fixture proves
+        nothing about the separator. Deleting it leaves the whole suite
+        green.
+
+        A directory named after an EXISTING project's derived name does
+        produce a strict prefix, because the digest is appended to a base
+        that may itself already end in one:
+
+            alpha                    -> alpha__11912daa
+            alpha__11912daa_extra    -> alpha__11912daa_extra__f71503af
+
+        Both match the generator's own `<base>__<8 hex digits>` shape, and
+        the second starts with the first. Without the separator, that row
+        would be served to a caller scoped to the first project.
+        """
+        from codebase_rag.tools.codebase_query import scope_rows_to_project
+        from codebase_rag.utils.path_utils import derive_project_name
+
+        base_dir = tmp_path / "alpha"
+        base_dir.mkdir()
+        base = derive_project_name(base_dir)
+
+        nested_dir = tmp_path / f"{base}_extra"
+        nested_dir.mkdir()
+        nested = derive_project_name(nested_dir)
+
+        # The premise: without this the test could pass for the same
+        # non-reason the fixture above does.
+        assert nested.startswith(base), (base, nested)
+
+        rows = [
+            {"qualified_name": f"{base}.real.Thing"},
+            {"qualified_name": f"{nested}.other.Thing"},
+        ]
+
+        kept = scope_rows_to_project(rows, base)
+
+        assert [r["qualified_name"] for r in kept] == [f"{base}.real.Thing"]
+
+    def test_a_row_keyed_on_something_other_than_qualified_name_is_scoped(
+        self,
+    ) -> None:
+        """`RETURN a.qualified_name AS from_qn` must not evade the filter.
+
+        The repo's own relationship queries return `from_qn`/`to_qn`, and a
+        model may name a column anything. Keying on the literal
+        `qualified_name` key made the filter FAIL OPEN for exactly those
+        shapes: the row looked like an aggregate and was kept.
+        """
+        from codebase_rag.tools.codebase_query import scope_rows_to_project
+
+        rows = [
+            {"from_qn": f"{ALPHA}.a.f", "to_qn": f"{ALPHA}.b.g"},
+            {"from_qn": f"{BETA}.a.f", "to_qn": f"{BETA}.b.g"},
+        ]
+
+        kept = scope_rows_to_project(rows, ALPHA)
+
+        assert [r["from_qn"] for r in kept] == [f"{ALPHA}.a.f"]
+
+    def test_a_row_naming_another_project_anywhere_is_dropped(self) -> None:
+        """Any value identifying a foreign project disqualifies the row.
+
+        An edge spanning two projects is not a row a scoped caller asked
+        for, and keeping it would leak the other project's names.
+        """
+        from codebase_rag.tools.codebase_query import scope_rows_to_project
+
+        rows = [{"from_qn": f"{ALPHA}.a.f", "to_qn": f"{BETA}.b.g"}]
+
+        assert scope_rows_to_project(rows, ALPHA) == []
+
+    def test_a_genuine_aggregate_still_survives(self) -> None:
+        """The control that keeps the default-deny rule honest.
+
+        Tightening this filter must not start discarding `RETURN count(n)`.
+        A row carrying no project-identifying value at all is kept.
+        """
+        from codebase_rag.tools.codebase_query import scope_rows_to_project
+
+        rows = [{"total": 42, "label": "Function"}]
+
+        assert scope_rows_to_project(rows, ALPHA) == rows
+
+    def test_free_text_containing_a_dot_is_not_mistaken_for_a_qn(self) -> None:
+        """A docstring or path must not be read as a qualified name.
+
+        Over-eager matching would drop legitimate rows whose text happens
+        to contain dots -- the too-aggressive failure direction.
+        """
+        from codebase_rag.tools.codebase_query import scope_rows_to_project
+
+        rows = [
+            {
+                "qualified_name": f"{ALPHA}.mod.f",
+                "docstring": "Reads config.yaml and writes out.json",
+                "path": "src/alpha/mod.py",
+            }
+        ]
+
+        assert scope_rows_to_project(rows, ALPHA) == rows
+
+    def test_a_row_carrying_no_project_evidence_cannot_be_scoped(self) -> None:
+        """The limit of a result-level filter, asserted rather than assumed.
+
+        `RETURN n.name, n.path` produces rows with nothing identifying the
+        project, so this filter CANNOT tell them apart -- and it keeps them,
+        because it cannot prove they are foreign either.
+
+        Documenting it as a test because the gap is invisible otherwise: the
+        filter looks like it scopes everything. The guarantee is completed
+        by `requires_project_evidence` below, which refuses such a query up
+        front rather than answering it with unscoped rows.
+        """
+        from codebase_rag.tools.codebase_query import scope_rows_to_project
+
+        rows = [
+            {"name": "handler", "path": "alpha/service.py"},
+            {"name": "handler", "path": "beta/service.py"},
+        ]
+
+        assert scope_rows_to_project(rows, ALPHA) == rows
+
+
+class TestTheCliPathAppliesTheEvidenceGuardToo:
+    """The guard must not live only in the MCP handler.
+
+    A scoped CLI session whose query returns `n.name` and `n.path` gets
+    rows that cannot be attributed to a project. Filtering keeps them, so
+    without the guard here the CLI silently ignores its own scope -- the
+    same gap I closed for MCP, left open one layer down.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_scoped_tool_refuses_an_unattributable_query(self) -> None:
+        from unittest.mock import MagicMock
+
+        from codebase_rag.tools.codebase_query import create_query_tool
+
+        cypher_gen = MagicMock()
+
+        async def _generate(_query: str) -> str:
+            return "MATCH (n:Function) RETURN n.name AS name, n.path AS path"
+
+        cypher_gen.generate = _generate
+        ingestor = MagicMock()
+        ingestor.fetch_read_only = MagicMock(
+            return_value=[
+                {"name": "handler", "path": "a.py"},
+                {"name": "handler", "path": "b.py"},
+            ]
+        )
+
+        tool = create_query_tool(ingestor, cypher_gen, project_name=ALPHA)
+        result = await tool.function("names only")
+
+        assert result.results == []
+        assert "scope" in result.summary.lower() or "project" in result.summary.lower()
+
+    @pytest.mark.asyncio
+    async def test_the_same_query_is_fine_unscoped(self) -> None:
+        """The control: the refusal follows from scoping, not from the query."""
+        from unittest.mock import MagicMock
+
+        from codebase_rag.tools.codebase_query import create_query_tool
+
+        cypher_gen = MagicMock()
+
+        async def _generate(_query: str) -> str:
+            return "MATCH (n:Function) RETURN n.name AS name, n.path AS path"
+
+        cypher_gen.generate = _generate
+        ingestor = MagicMock()
+        ingestor.fetch_read_only = MagicMock(
+            return_value=[
+                {"name": "handler", "path": "a.py"},
+                {"name": "handler", "path": "b.py"},
+            ]
+        )
+
+        tool = create_query_tool(ingestor, cypher_gen)
+        result = await tool.function("names only")
+
+        assert len(result.results) == 2
+
+
+class TestTheMarkerDoesNotCatchOrdinaryNames:
+    """`__init__` is not a project name.
+
+    The digest marker `__` is what separates a qualified name from free
+    text -- but Python's most common method name contains it, and so does
+    every dunder. Treating `__init__` as a foreign qualified name DROPS a
+    valid row, which is the too-aggressive direction.
+    """
+
+    @pytest.mark.parametrize(
+        "value", ["__init__", "__main__", "__repr__", "_private", "__"]
+    )
+    def test_a_dunder_name_does_not_disqualify_a_row(self, value: str) -> None:
+        from codebase_rag.tools.codebase_query import scope_rows_to_project
+
+        rows = [{"qualified_name": f"{ALPHA}.mod.C", "name": value}]
+
+        assert scope_rows_to_project(rows, ALPHA) == rows
+
+    def test_a_real_foreign_qualified_name_is_still_dropped(self) -> None:
+        """The control: narrowing the marker must not reopen the leak."""
+        from codebase_rag.tools.codebase_query import scope_rows_to_project
+
+        rows = [{"qualified_name": f"{ALPHA}.ok"}, {"qualified_name": f"{BETA}.leak"}]
+
+        kept = scope_rows_to_project(rows, ALPHA)
+
+        assert [r["qualified_name"] for r in kept] == [f"{ALPHA}.ok"]
+
+
+class TestNestedValuesAreScoped:
+    """A foreign name inside a list or dict must not ride through.
+
+    Only top-level string values were inspected, so `collect(...)` results
+    and map projections carried other projects' qualified names untouched.
+    """
+
+    def test_a_foreign_name_in_a_list_disqualifies_the_row(self) -> None:
+        from codebase_rag.tools.codebase_query import scope_rows_to_project
+
+        rows = [{"qualified_name": f"{ALPHA}.ok", "callees": [f"{BETA}.secret.fn"]}]
+
+        assert scope_rows_to_project(rows, ALPHA) == []
+
+    def test_a_foreign_name_in_a_dict_disqualifies_the_row(self) -> None:
+        from codebase_rag.tools.codebase_query import scope_rows_to_project
+
+        rows = [{"qualified_name": f"{ALPHA}.ok", "meta": {"ref": f"{BETA}.other"}}]
+
+        assert scope_rows_to_project(rows, ALPHA) == []
+
+    def test_a_foreign_name_in_a_dict_KEY_disqualifies_the_row(self) -> None:
+        """A map keyed BY qualified name leaks through its keys.
+
+        `_names_another_project` recursed into `dict.values()` and never
+        `dict.keys()`, so a map projection keyed by qualified name carried
+        foreign names in a position nothing inspected.
+
+        Found by auditing my own docstring: it claimed "every string VALUE
+        in the row is inspected, at any depth", and I wrote that describing
+        the recursion rather than enumerating what Cypher can return. Keys
+        are values too.
+        """
+        from codebase_rag.tools.codebase_query import scope_rows_to_project
+
+        rows = [{"qualified_name": f"{ALPHA}.ok", "by_qn": {f"{BETA}.secret": 3}}]
+
+        assert scope_rows_to_project(rows, ALPHA) == []
+
+    def test_an_own_project_key_is_kept(self) -> None:
+        """The control: keys naming the caller's own project must survive."""
+        from codebase_rag.tools.codebase_query import scope_rows_to_project
+
+        rows = [{"qualified_name": f"{ALPHA}.ok", "by_qn": {f"{ALPHA}.mine": 3}}]
+
+        assert scope_rows_to_project(rows, ALPHA) == rows
+
+    def test_an_own_project_name_nested_is_kept(self) -> None:
+        """The control: nesting must not become a blanket rejection."""
+        from codebase_rag.tools.codebase_query import scope_rows_to_project
+
+        rows = [{"qualified_name": f"{ALPHA}.ok", "callees": [f"{ALPHA}.other.fn"]}]
+
+        assert scope_rows_to_project(rows, ALPHA) == rows
+
+
+class TestEvidenceMustBeInTheReturnClause:
+    """`qualified_name` in a WHERE clause is not evidence.
+
+    The check was a substring match over the whole query, so filtering on a
+    qualified name while RETURNING only `n.name` satisfied it -- and those
+    rows are exactly the unattributable ones the guard exists to refuse.
+    """
+
+    def test_a_where_only_mention_is_not_evidence(self) -> None:
+        from codebase_rag.tools.codebase_query import requires_project_evidence
+
+        assert not requires_project_evidence(
+            'MATCH (n) WHERE n.qualified_name STARTS WITH "x" RETURN n.name AS name',
+            ALPHA,
+        )
+
+    def test_an_order_by_only_mention_is_not_evidence(self) -> None:
+        from codebase_rag.tools.codebase_query import requires_project_evidence
+
+        assert not requires_project_evidence(
+            "MATCH (n) RETURN n.name AS name ORDER BY n.qualified_name",
+            ALPHA,
+        )
+
+    def test_a_returned_qualified_name_is_evidence(self) -> None:
+        """The control, including the WHERE-plus-RETURN case that is fine."""
+        from codebase_rag.tools.codebase_query import requires_project_evidence
+
+        assert requires_project_evidence(
+            'MATCH (n) WHERE n.name = "x" RETURN n.qualified_name AS qualified_name',
+            ALPHA,
+        )
+
+    def test_an_aggregate_mixed_with_unqualified_fields_is_not_evidence(self) -> None:
+        """`RETURN n.name, count(n)` still exposes names.
+
+        The aggregate exemption was meant for `RETURN count(n)` alone, which
+        names nobody. Mixing it with a bare field leaks exactly what the
+        exemption assumed could not leak.
+        """
+        from codebase_rag.tools.codebase_query import requires_project_evidence
+
+        assert not requires_project_evidence(
+            "MATCH (n:Function) RETURN n.name AS name, count(n) AS total",
+            ALPHA,
+        )
+
+    def test_an_aggregate_must_itself_be_restricted(self) -> None:
+        """A pure aggregate is evidence ONLY if the query narrows the rows.
+
+        This assertion previously read the other way -- that
+        `RETURN count(n)` alone was evidence, on the reasoning that an
+        aggregate names nobody. It encoded a real leak: the count spans
+        every indexed project, so a scoped caller learns the SIZE of
+        projects they never asked about. Names were not the only thing
+        that leaks.
+
+        Counting stays usable when scoped, via the restricted form below.
+        """
+        from codebase_rag.tools.codebase_query import requires_project_evidence
+
+        assert not requires_project_evidence(
+            "MATCH (n:Function) RETURN count(n) AS total",
+            ALPHA,
+        )
+        assert requires_project_evidence(
+            f'MATCH (n:Function) WHERE n.qualified_name STARTS WITH "{ALPHA}." '
+            "RETURN count(n) AS total",
+            ALPHA,
+        )
+
+
+class TestEvidenceIsAProjectedPropertyNotASubstring:
+    """An ALIAS containing "qualified_name" is not evidence.
+
+    The check matched the token anywhere in the RETURN clause, so
+    `RETURN n.name AS qualified_name_of_thing` satisfied it while
+    returning no qualified name at all -- unattributable rows, kept.
+    """
+
+    @pytest.mark.parametrize(
+        "cypher",
+        [
+            "MATCH (n) RETURN n.name AS qualified_name_of_thing",
+            'MATCH (n) RETURN "qualified_name" AS lit',
+            "MATCH (n) RETURN n.path AS my_qualified_name_col",
+            # A DIFFERENT property whose name merely starts with the token.
+            # This is the case the trailing boundary exists for: the three
+            # above are already rejected by the required `<ident>.` prefix,
+            # so without this one a mutation dropping the boundary survives.
+            "MATCH (n) RETURN n.qualified_name_extra AS x",
+        ],
+    )
+    def test_a_mere_mention_is_not_evidence(self, cypher: str) -> None:
+        from codebase_rag.tools.codebase_query import requires_project_evidence
+
+        assert not requires_project_evidence(cypher, ALPHA)
+
+    @pytest.mark.parametrize(
+        "cypher",
+        [
+            "MATCH (n) RETURN n.qualified_name",
+            "MATCH (n) RETURN n.qualified_name AS anything",
+            "MATCH (a)-[r]->(b) RETURN a.qualified_name AS from_qn, b.qualified_name",
+        ],
+    )
+    def test_a_projected_property_is_evidence(self, cypher: str) -> None:
+        """The control: reading the PROPERTY must still count."""
+        from codebase_rag.tools.codebase_query import requires_project_evidence
+
+        assert requires_project_evidence(cypher, ALPHA)
+
+
+class TestAnAggregateLeaksMagnitude:
+    """`RETURN count(n)` exposes no NAMES but still exposes a NUMBER.
+
+    The exemption reasoned about name leakage and missed that a scoped
+    caller receiving a count over every indexed project learns the size
+    of projects they did not ask about. An unfiltered aggregate is not
+    safe merely because it is anonymous.
+    """
+
+    def test_an_unfiltered_aggregate_is_refused_when_scoped(self) -> None:
+        """`ALPHA` is passed so the refusal comes from the aggregate rule.
+
+        Without a project name, `_restricts_to_project` returns False at its
+        `if not project_name` guard, so the assertion held whatever the
+        aggregate logic did -- a test named for the SCOPED path that never
+        reached it (reported on #1494).
+        """
+        from codebase_rag.tools.codebase_query import requires_project_evidence
+
+        assert not requires_project_evidence(
+            "MATCH (n:Function) RETURN count(n)", ALPHA
+        )
+
+    def test_an_aggregate_over_a_scoped_match_is_accepted(self) -> None:
+        """A count the query itself restricts is attributable and fine.
+
+        This is what keeps counting usable when scoped: the caller asks
+        for a project-filtered count and gets one.
+        """
+        from codebase_rag.tools.codebase_query import requires_project_evidence
+
+        assert requires_project_evidence(
+            f'MATCH (n:Function) WHERE n.qualified_name STARTS WITH "{ALPHA}." '
+            "RETURN count(n)",
+            ALPHA,
+        )
+
+
+class TestEveryProjectedEntityMustCarryItsQualifiedName:
+    """One entity's qualified name does not vouch for another's properties.
+
+    `MATCH (a)-[x]->(b) RETURN a.qualified_name, b.name, b.path` returns a
+    row that is PARTLY in-project: `a` proves membership, while `b.name`
+    and `b.path` belong to an entity whose qualified name was never
+    projected. The row filter keeps the row -- one value proves membership
+    -- and beta's function name and file path reach an alpha-scoped
+    caller.
+
+    The row filter cannot fix this. Dropping the row loses legitimate data
+    and keeping it leaks, so the query is refused instead, exactly as for
+    a row with no evidence at all.
+    """
+
+    def test_a_second_entity_without_its_qualified_name_is_refused(self) -> None:
+        from codebase_rag.tools.codebase_query import requires_project_evidence
+
+        cypher = (
+            "MATCH (a)-[x]->(b) RETURN a.qualified_name AS qualified_name, "
+            "b.name AS name, b.path AS path"
+        )
+
+        assert not requires_project_evidence(cypher, ALPHA)
+
+    def test_both_entities_projecting_a_qualified_name_is_accepted(self) -> None:
+        """The control: the legitimate relationship query must survive.
+
+        Every entity whose properties are returned carries its own
+        qualified name, so every row is attributable and the row filter
+        can judge it.
+        """
+        from codebase_rag.tools.codebase_query import requires_project_evidence
+
+        cypher = (
+            "MATCH (a)-[x]->(b) RETURN a.qualified_name AS from_qn, "
+            "b.qualified_name AS to_qn, b.name AS name"
+        )
+
+        assert requires_project_evidence(cypher, ALPHA)
+
+    def test_one_entity_projecting_several_properties_is_accepted(self) -> None:
+        """The other control: this must not forbid ordinary single-entity queries.
+
+        `n.qualified_name, n.name, n.path` is one entity with three
+        properties, not two entities. Requiring a qualified name per
+        ALIAS rather than per ENTITY would refuse it.
+        """
+        from codebase_rag.tools.codebase_query import requires_project_evidence
+
+        cypher = (
+            "MATCH (n:Function) RETURN n.qualified_name AS qualified_name, "
+            "n.name AS name, n.path AS path"
+        )
+
+        assert requires_project_evidence(cypher, ALPHA)
+
+
+class TestOnlyARestrictivePredicateAuthorisesAnAggregate:
+    """Mentioning a qualified name is not constraining by one.
+
+    `WHERE n.qualified_name IS NOT NULL` matches every indexed node in
+    every project, so a count over it spans them all -- yet it satisfied a
+    check that only looked for the property appearing before RETURN. The
+    predicate has to actually narrow to a prefix.
+    """
+
+    @pytest.mark.parametrize(
+        "predicate",
+        [
+            "n.qualified_name IS NOT NULL",
+            "n.qualified_name <> ''",
+            "exists(n.qualified_name)",
+        ],
+    )
+    def test_a_nonrestrictive_predicate_is_refused(self, predicate: str) -> None:
+        from codebase_rag.tools.codebase_query import requires_project_evidence
+
+        cypher = f"MATCH (n) WHERE {predicate} RETURN count(n) AS total"
+
+        assert not requires_project_evidence(cypher, ALPHA)
+
+    def test_a_prefix_predicate_is_accepted(self) -> None:
+        """The control: the restrictive form must still authorise a count."""
+        from codebase_rag.tools.codebase_query import requires_project_evidence
+
+        cypher = (
+            f'MATCH (n) WHERE n.qualified_name STARTS WITH "{ALPHA}." '
+            "RETURN count(n) AS total"
+        )
+
+        assert requires_project_evidence(cypher, ALPHA)
+
+
+class TestQuotedTextIsNotEvidence:
+    """A qualified name inside a string literal returns no qualified name.
+
+    `RETURN "n.qualified_name" AS lit, n.name AS name` projects a constant
+    and an unattributable property, but textual matching saw the property
+    read inside the quotes.
+    """
+
+    def test_a_quoted_property_read_is_not_evidence(self) -> None:
+        from codebase_rag.tools.codebase_query import requires_project_evidence
+
+        cypher = 'MATCH (n) RETURN "n.qualified_name" AS lit, n.name AS name'
+
+        assert not requires_project_evidence(cypher, ALPHA)
+
+    def test_a_single_quoted_property_read_is_not_evidence(self) -> None:
+        from codebase_rag.tools.codebase_query import requires_project_evidence
+
+        cypher = "MATCH (n) RETURN 'n.qualified_name' AS lit, n.name AS name"
+
+        assert not requires_project_evidence(cypher, ALPHA)
+
+    @pytest.mark.parametrize(
+        "cypher",
+        [
+            "MATCH (n) RETURN n.name AS name // n.qualified_name",
+            "MATCH (n) RETURN n.name AS name /* n.qualified_name */",
+            "MATCH (n) // n.qualified_name\n RETURN n.name AS name",
+        ],
+    )
+    def test_a_commented_property_read_is_not_evidence(self, cypher: str) -> None:
+        """A qualified name in a COMMENT returns nothing either.
+
+        I tested only the before-RETURN form first and called the class
+        handled. The after-RETURN forms leaked, because the projection is
+        taken from the text following the last RETURN and a trailing
+        comment sits inside it. Same unenumerated-axis mistake as the
+        dunder case: the right property, the wrong positions.
+        """
+        from codebase_rag.tools.codebase_query import requires_project_evidence
+
+        assert not requires_project_evidence(cypher, ALPHA)
+
+    def test_a_real_read_beside_a_comment_is_still_evidence(self) -> None:
+        """The control: stripping comments must not blind the real check."""
+        from codebase_rag.tools.codebase_query import requires_project_evidence
+
+        cypher = (
+            "MATCH (n) RETURN n.qualified_name AS qualified_name "
+            "// the project-qualified name"
+        )
+
+        assert requires_project_evidence(cypher, ALPHA)
+
+    def test_a_real_read_beside_a_quoted_one_is_still_evidence(self) -> None:
+        """The control: stripping literals must not blind the real check.
+
+        A query can legitimately return a string constant alongside real
+        properties, and that must still be judged on the real ones.
+        """
+        from codebase_rag.tools.codebase_query import requires_project_evidence
+
+        cypher = (
+            "MATCH (n) RETURN 'a label' AS kind, "
+            "n.qualified_name AS qualified_name, n.name AS name"
+        )
+
+        assert requires_project_evidence(cypher, ALPHA)
+
+
+class TestOnlyTheSimpleShapeIsScopeable:
+    """Default-deny on STRUCTURE, not a list of known bypasses.
+
+    Four review rounds found four ways to satisfy a textual evidence check
+    while returning unattributable data: an alias containing the token, a
+    string literal, a comment, and a transformed projection. Two more used
+    UNION so that only the final branch was inspected. Enumerating them is
+    endless -- every Cypher construct not yet considered is a candidate.
+
+    So a SCOPED query must have the shape the prompt already mandates:
+    "MATCH, WHERE, RETURN, LIMIT" with plain aliased property reads. Any
+    other structure is refused rather than analysed. The model is told to
+    emit exactly this, so refusing the rest costs nothing it should be
+    producing, and it converts an open-ended class into a closed one.
+    """
+
+    @pytest.mark.parametrize(
+        "cypher",
+        [
+            # UNION: only the last branch was inspected, so an earlier one
+            # could return anything.
+            "MATCH (n) RETURN n.name AS name "
+            "UNION MATCH (m) RETURN m.qualified_name AS name",
+            # A transformed qualified name does not attribute its entity.
+            "MATCH (a),(b) RETURN a.qualified_name AS q, "
+            "left(b.qualified_name, 3) AS t, b.name AS n",
+            # A CALL SUBQUERY assembles its projection elsewhere.
+            "CALL { MATCH (n) RETURN n.name AS name } RETURN name",
+            "MATCH (n) WITH n.name AS name RETURN name",
+        ],
+    )
+    def test_an_unrecognised_structure_is_refused_when_scoped(
+        self, cypher: str
+    ) -> None:
+        from codebase_rag.tools.codebase_query import requires_project_evidence
+
+        assert not requires_project_evidence(cypher, ALPHA)
+
+    @pytest.mark.parametrize(
+        "cypher",
+        [
+            "MATCH (n:Function) RETURN n.qualified_name AS qualified_name",
+            "MATCH (n:Function) RETURN n.qualified_name AS qualified_name, "
+            "n.name AS name, n.path AS path LIMIT 50",
+            "MATCH (a)-[r]->(b) RETURN a.qualified_name AS from_qn, "
+            "b.qualified_name AS to_qn",
+            # prompts.py line 64 RECOMMENDS `ENDS WITH` for matching a
+            # class or function by its short name, so refusing it would
+            # break the form the prompt teaches.
+            'MATCH (c) WHERE c.qualified_name ENDS WITH ".VatManager" '
+            "RETURN c.qualified_name AS qualified_name",
+        ],
+    )
+    def test_the_shape_the_prompt_asks_for_is_accepted(self, cypher: str) -> None:
+        """The control, and the reason this is not simply a ban.
+
+        These are the forms the system prompt instructs the model to emit
+        -- MATCH/WHERE/RETURN/LIMIT with aliased property reads. If the
+        default-deny rule refused them it would break every scoped query,
+        which a leak-only test suite would not notice.
+        """
+        from codebase_rag.tools.codebase_query import requires_project_evidence
+
+        assert requires_project_evidence(cypher, ALPHA)
+
+    @pytest.mark.asyncio
+    async def test_an_unrecognised_structure_is_fine_unscoped(self) -> None:
+        """The other control: this restricts SCOPED requests only.
+
+        An unscoped caller asked for everything, so a UNION or a subquery
+        is none of this guard's business. Asserted through the HANDLER,
+        because that is where the scope decision lives -- asserting on
+        `requires_project_evidence` directly would say nothing, since the
+        handler never calls it when no project is given.
+        """
+        cypher = "MATCH (n) RETURN n.name AS name UNION MATCH (m) RETURN m.name AS name"
+        handler = _handler_returning([{"name": "x"}], query_used=cypher)
+
+        result = await handler.query_code_graph("everything")
+
+        assert not result.get("error"), result
+        assert result["results"] == [{"name": "x"}]
+
+
+class TestAnAggregatedEntityMustAlsoBeAttributable:
+    """`count(b)` exposes b's magnitude even when `a` vouches for the row.
+
+    `MATCH (a)-[:CALLS]->(b) RETURN a.qualified_name, count(b)` was
+    accepted: `a` is attributable, so the row passed, while the count
+    reported how many `b` there are across every project.
+
+    The per-entity check SKIPPED aggregate terms entirely, on the reasoning
+    that an aggregate names nobody. It names nobody but it still measures
+    someone, which is the magnitude leak in a mixed projection.
+    """
+
+    def test_an_aggregate_over_an_unattributed_entity_is_refused(self) -> None:
+        from codebase_rag.tools.codebase_query import requires_project_evidence
+
+        cypher = (
+            "MATCH (a)-[:CALLS]->(b) RETURN a.qualified_name AS q, count(b) AS total"
+        )
+
+        assert not requires_project_evidence(cypher, ALPHA)
+
+    def test_an_aggregate_over_the_same_attributed_entity_is_accepted(self) -> None:
+        """The control: counting the entity you already attributed is fine.
+
+        `RETURN a.qualified_name, count(a)` measures only rows the filter
+        can judge, so refusing it would break a legitimate shape.
+        """
+        from codebase_rag.tools.codebase_query import requires_project_evidence
+
+        cypher = "MATCH (a) RETURN a.qualified_name AS q, count(a) AS total"
+
+        assert requires_project_evidence(cypher, ALPHA)
+
+    def test_an_aggregate_over_an_attributed_second_entity_is_accepted(self) -> None:
+        """The other control: attribute b too and the count is fine.
+
+        This is what the caller should write, and it must stay available --
+        a rule that refused every mixed aggregate would pass the leak test
+        while making relationship counting impossible when scoped.
+        """
+        from codebase_rag.tools.codebase_query import requires_project_evidence
+
+        cypher = (
+            "MATCH (a)-[:CALLS]->(b) RETURN a.qualified_name AS q, "
+            "b.qualified_name AS bq, count(b) AS total"
+        )
+
+        assert requires_project_evidence(cypher, ALPHA)
+
+
+class TestTheRestrictionMustConstrainTheAggregatedAlias:
+    """Restricting alias `a` says nothing about a count over alias `b`.
+
+    `MATCH (a),(b) WHERE a.qualified_name STARTS WITH "alpha." RETURN
+    count(b)` was accepted: a literal naming the requested project is
+    present, so the restriction check passed -- while the count ranged
+    over `b`, which nothing constrained.
+
+    The check asked "is there a restriction to my project", not "is the
+    thing being COUNTED restricted". Those differ whenever the query
+    matches more than one entity.
+    """
+
+    def test_restricting_one_alias_does_not_authorise_counting_another(
+        self,
+    ) -> None:
+        from codebase_rag.tools.codebase_query import requires_project_evidence
+
+        cypher = (
+            f'MATCH (a),(b) WHERE a.qualified_name STARTS WITH "{ALPHA}." '
+            "RETURN count(b) AS total"
+        )
+
+        assert not requires_project_evidence(cypher, ALPHA)
+
+    def test_restricting_the_counted_alias_is_accepted(self) -> None:
+        """The control: constrain what you count and the count is sound."""
+        from codebase_rag.tools.codebase_query import requires_project_evidence
+
+        cypher = (
+            f'MATCH (b) WHERE b.qualified_name STARTS WITH "{ALPHA}." '
+            "RETURN count(b) AS total"
+        )
+
+        assert requires_project_evidence(cypher, ALPHA)
+
+    def test_restricting_both_aliases_is_accepted(self) -> None:
+        """The other control: a relationship count with both ends bound.
+
+        This is the legitimate form of the leaking query, and it must stay
+        available -- refusing every multi-alias aggregate would pass the
+        leak test while breaking scoped relationship counting.
+        """
+        from codebase_rag.tools.codebase_query import requires_project_evidence
+
+        cypher = (
+            f'MATCH (a)-[:CALLS]->(b) WHERE a.qualified_name STARTS WITH "{ALPHA}." '
+            f'AND b.qualified_name STARTS WITH "{ALPHA}." '
+            "RETURN count(b) AS total"
+        )
+
+        assert requires_project_evidence(cypher, ALPHA)
+
+
+class TestAnAggregateMustBeBoundToTheRequestedProject:
+    """Restricting by *a* qualified name is not restricting to *yours*.
+
+    The aggregate exemption checked only that the query filtered on some
+    qualified name, so a query narrowing to a DIFFERENT project passed and
+    returned that project's count to the scoped caller. The same magnitude
+    leak the exemption was tightened to prevent, one level deeper.
+    """
+
+    def test_a_restriction_naming_another_project_is_refused(self) -> None:
+        from codebase_rag.tools.codebase_query import requires_project_evidence
+
+        cypher = (
+            f'MATCH (n) WHERE n.qualified_name STARTS WITH "{BETA}." '
+            "RETURN count(n) AS total"
+        )
+
+        assert not requires_project_evidence(cypher, ALPHA)
+
+    def test_a_restriction_naming_the_requested_project_is_accepted(self) -> None:
+        """The control: the useful case must survive the tightening."""
+        from codebase_rag.tools.codebase_query import requires_project_evidence
+
+        cypher = (
+            f'MATCH (n) WHERE n.qualified_name STARTS WITH "{ALPHA}." '
+            "RETURN count(n) AS total"
+        )
+
+        assert requires_project_evidence(cypher, ALPHA)
+
+    @pytest.mark.parametrize(
+        "predicate",
+        [
+            # A parameter this code cannot see the value of. Accepting it
+            # means accepting a restriction to ANY project.
+            "n.qualified_name STARTS WITH $anything",
+            "n.qualified_name =~ $re",
+            # Restricts n to m, which says nothing about the caller.
+            "n.qualified_name = m.qualified_name",
+        ],
+    )
+    def test_a_literal_free_restriction_is_refused(self, predicate: str) -> None:
+        """ "No literal" was read as "safely parameterised". It is not.
+
+        The exemption accepted any literal-free query carrying a prefix
+        operator, on the reasoning that a parameter must be the project.
+        But this code cannot see a parameter's VALUE, so it was accepting
+        a restriction to any project at all -- or, in the last case, to
+        another matched entity.
+
+        The only form it can actually verify is the literal one, and the
+        caller knows their own project name, so that is what is required.
+        """
+        from codebase_rag.tools.codebase_query import requires_project_evidence
+
+        cypher = f"MATCH (n),(m) WHERE {predicate} RETURN count(n) AS total"
+
+        assert not requires_project_evidence(cypher, ALPHA)
+
+    def test_a_literal_restriction_to_the_caller_is_accepted(self) -> None:
+        """The control: the verifiable form must stay usable.
+
+        This is the one shape that proves the count belongs to the caller,
+        and the prompt already instructs the model to emit it.
+        """
+        from codebase_rag.tools.codebase_query import requires_project_evidence
+
+        cypher = (
+            f'MATCH (n) WHERE n.qualified_name STARTS WITH "{ALPHA}." '
+            "RETURN count(n) AS total"
+        )
+
+        assert requires_project_evidence(cypher, ALPHA)
+
+    def test_a_projected_qualified_name_needs_no_binding(self) -> None:
+        """The control that keeps the non-aggregate path unchanged.
+
+        A query RETURNING qualified names is attributable row by row, so
+        `scope_rows_to_project` filters it and the binding check does not
+        apply. Requiring binding there would refuse valid queries.
+        """
+        from codebase_rag.tools.codebase_query import requires_project_evidence
+
+        assert requires_project_evidence(
+            "MATCH (n) RETURN n.qualified_name AS qualified_name", ALPHA
+        )
+
+
+class TestScopedQueriesMustProjectAQualifiedName:
+    """Close the gap the result filter cannot.
+
+    A scoped request whose query returns no qualified name is refused, so
+    the caller learns the scope could not be honoured instead of silently
+    receiving every project's rows.
+    """
+
+    def test_a_query_without_a_qualified_name_is_refused(self) -> None:
+        from codebase_rag.tools.codebase_query import requires_project_evidence
+
+        assert not requires_project_evidence(
+            "MATCH (n:Function) RETURN n.name AS name, n.path AS path",
+            ALPHA,
+        )
+
+    @pytest.mark.parametrize(
+        "cypher",
+        [
+            "MATCH (n:Function) RETURN n.qualified_name AS qualified_name",
+            "MATCH (a)-[r]->(b) RETURN a.qualified_name AS from_qn",
+            "MATCH (n) RETURN n.qualified_name",
+        ],
+    )
+    def test_a_query_projecting_a_qualified_name_is_accepted(self, cypher: str) -> None:
+        """Any projection of a qualified name suffices, whatever it is aliased to.
+
+        The alias is the model's choice, so requiring a specific column name
+        would refuse valid queries.
+        """
+        from codebase_rag.tools.codebase_query import requires_project_evidence
+
+        assert requires_project_evidence(cypher, ALPHA)
+
+    def test_a_restricted_aggregate_is_accepted(self) -> None:
+        """Counting stays usable when scoped, provided the query narrows.
+
+        This previously asserted that a BARE `RETURN count(n)` was
+        accepted, reasoning that it leaks no names. It leaks a magnitude
+        instead -- see TestAnAggregateLeaksMagnitude. The restricted form
+        preserves the useful case without the leak.
+        """
+        from codebase_rag.tools.codebase_query import requires_project_evidence
+
+        assert requires_project_evidence(
+            f'MATCH (n:Function) WHERE n.qualified_name STARTS WITH "{ALPHA}." '
+            "RETURN count(n) AS total",
+            ALPHA,
+        )
+
+
+class TestUnscopedIsUnchanged:
+    """Every existing caller passes no project."""
+
+    def test_no_scope_returns_everything(self) -> None:
+        """Omitting the scope must preserve current behaviour.
+
+        Every existing caller passes no project, so a filter that defaulted
+        to dropping rows would silently empty the CLI.
+        """
+        from codebase_rag.tools.codebase_query import scope_rows_to_project
+
+        assert scope_rows_to_project(_ROWS, None) == _ROWS
+
+    def test_rows_without_a_qualified_name_survive_a_scoped_query(self) -> None:
+        """Aggregates carry no qualified_name and must not be discarded.
+
+        `RETURN count(n)` produces a row with no such key. Dropping it would
+        turn scoping into silent data loss for every aggregate query --
+        a filter that is too aggressive fails as badly as one too lax.
+        """
+        from codebase_rag.tools.codebase_query import scope_rows_to_project
+
+        rows = [{"total": 42}]
+
+        assert scope_rows_to_project(rows, ALPHA) == rows
+
+
+def _scoped(project: str) -> list[dict]:
+    from codebase_rag.tools.codebase_query import scope_rows_to_project
+
+    return scope_rows_to_project(_ROWS, project)
+
+
+class TestPerRequestScope:
+    """One server process must serve many projects.
+
+    A workspace fixed at startup would force one process per project, which
+    is the case the issue rules out. So the scope travels with the REQUEST,
+    and the handler applies it -- the pre-built `_query_tool` has its
+    project bound at construction and cannot vary per call.
+    """
+
+    @pytest.mark.asyncio
+    async def test_two_requests_can_name_different_projects(self) -> None:
+        """The requirement, stated as a test.
+
+        Both calls hit the same handler on the same server object; only the
+        argument differs. If the scope were per-process this could not pass.
+        Runs through the REAL query tool, because the scope is now bound
+        into a per-request tool rather than filtered in the handler.
+        """
+        handler = _registry_over_graph(_ROWS, cypher=_QN_CYPHER)
+
+        alpha = await handler.query_code_graph("everything", project=ALPHA)
+        beta = await handler.query_code_graph("everything", project=BETA)
+
+        assert _prefixes(alpha) == {ALPHA}
+        assert _prefixes(beta) == {BETA}
+
+    @pytest.mark.asyncio
+    async def test_omitting_the_project_returns_every_project(self) -> None:
+        """The control, and the backwards-compatibility guarantee.
+
+        Existing clients pass no project. Without this, a handler that
+        always scoped to something would satisfy the test above while
+        silently narrowing every current caller's results.
+        """
+        handler = _handler_returning(_ROWS)
+
+        both = await handler.query_code_graph("everything")
+
+        assert _prefixes(both) == {ALPHA, BETA}
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_project_is_refused_rather_than_silently_empty(
+        self,
+    ) -> None:
+        """A typo must not look like "this project has no matches".
+
+        Returning zero rows for a misspelled name is indistinguishable from
+        a genuine empty result, and the caller cannot tell which happened.
+        """
+        handler = _handler_returning(_ROWS)
+
+        result = await handler.query_code_graph("everything", project="no-such")
+
+        assert result.get("error")
+        assert "no-such" in str(result["error"])
+
+
+class TestTheHandlerRefusesAnUnjudgeableScopedQuery:
+    """The gap the result filter cannot close, closed at the handler.
+
+    `RETURN n.name, n.path` yields rows carrying no project evidence, so
+    the filter keeps them -- it cannot prove them foreign. Answering a
+    SCOPED request with those rows would silently ignore the scope, which
+    is the original bug wearing a different hat.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_scoped_query_returning_no_qualified_name_is_refused(
+        self,
+    ) -> None:
+        handler = _registry_over_graph(
+            [{"name": "handler", "path": "a.py"}],
+            cypher="MATCH (n:Function) RETURN n.name AS name, n.path AS path",
+        )
+
+        result = await handler.query_code_graph("names only", project=ALPHA)
+
+        assert result.get("error"), result
+        assert result["results"] == []
+
+    @pytest.mark.asyncio
+    async def test_the_same_query_is_fine_unscoped(self) -> None:
+        """The control: the refusal is a consequence of scoping, not a ban.
+
+        Without this, refusing that query outright would pass the test
+        above while breaking every existing unscoped caller.
+        """
+        handler = _handler_returning(
+            [{"name": "handler", "path": "a.py"}],
+            query_used="MATCH (n:Function) RETURN n.name AS name, n.path AS path",
+        )
+
+        result = await handler.query_code_graph("names only")
+
+        assert not result.get("error")
+        assert len(result["results"]) == 1
+
+
+class TestTheCliScopeIsChosenNotAssumed:
+    """The CLI shares the weakness, but only when one project is active.
+
+    A session with several projects activated has asked for all of them, so
+    scoping to one would silently narrow deliberate multi-project work. The
+    rule is therefore "exactly one active project", not "the first one".
+    """
+
+    def test_one_active_project_is_the_scope(self) -> None:
+        from codebase_rag.main import _cli_query_scope
+
+        assert _cli_query_scope([ALPHA]) == ALPHA
+
+    def test_several_active_projects_means_no_scope(self) -> None:
+        """The control that stops this narrowing deliberate multi-project use."""
+        from codebase_rag.main import _cli_query_scope
+
+        assert _cli_query_scope([ALPHA, BETA]) is None
+
+    def test_no_active_projects_means_no_scope(self) -> None:
+        """The default path: nothing activated, so nothing is excluded."""
+        from codebase_rag.main import _cli_query_scope
+
+        assert _cli_query_scope(None) is None
+        assert _cli_query_scope([]) is None
+
+
+class TestTheHandlerBindsTheAggregateToItsOwnProject:
+    """The MCP call site must pass the project, not just possess one.
+
+    `create_query_tool` takes `project_name` as a DEFAULTED parameter, so a
+    handler that builds a per-request tool but forgets to bind the project
+    still type-checks, still runs, and still returns a well-formed answer --
+    the tool just never scopes anything. An aggregate is where that shows:
+    the row filter cannot judge `{"total": 99}`, so only a bound tool's
+    evidence guard stands between the caller and another project's count.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_cross_project_aggregate_is_refused_through_the_handler(
+        self,
+    ) -> None:
+        cypher = (
+            f'MATCH (n) WHERE n.qualified_name STARTS WITH "{BETA}." '
+            "RETURN count(n) AS total"
+        )
+        handler = _registry_over_graph([{"total": 99}], cypher=cypher)
+
+        result = await handler.query_code_graph("how many", project=ALPHA)
+
+        assert result.get("error"), result
+        assert result["results"] == []
+
+    @pytest.mark.asyncio
+    async def test_an_own_project_aggregate_is_allowed_through_the_handler(
+        self,
+    ) -> None:
+        """The control: binding must not refuse the caller's own count."""
+        cypher = (
+            f'MATCH (n) WHERE n.qualified_name STARTS WITH "{ALPHA}." '
+            "RETURN count(n) AS total"
+        )
+        handler = _registry_over_graph([{"total": 99}], cypher=cypher)
+
+        result = await handler.query_code_graph("how many", project=ALPHA)
+
+        assert not result.get("error"), result
+        assert result["results"] == [{"total": 99}]
+
+
+class TestTheDeclaredSchemaMatchesTheHandler:
+    """A parameter absent from the schema is unreachable over the protocol.
+
+    The handlers accept `project`, but an MCP client reads the declared
+    input schema to learn what it may send. Omitting it there makes the
+    whole feature undiscoverable and, for a strict client, unsendable --
+    the code works and nothing can call it.
+
+    This is the same silent-disconnection shape as an unwired parameter:
+    every other test drives the handler DIRECTLY, bypassing the schema, so
+    they all pass regardless.
+    """
+
+    @pytest.mark.parametrize(
+        "tool_name",
+        [cs.MCPToolName.QUERY_CODE_GRAPH, cs.MCPToolName.SEMANTIC_SEARCH],
+    )
+    def test_project_is_declared_for_a_scopeable_tool(
+        self, tool_name: str, tmp_path: Path
+    ) -> None:
+        schema = _declared_schema(tmp_path, tool_name)
+
+        assert cs.MCPParamName.PROJECT in schema["properties"], (
+            f"{tool_name} accepts a project but does not declare it, so no "
+            "client can send one"
+        )
+
+    @pytest.mark.parametrize(
+        "tool_name",
+        [cs.MCPToolName.QUERY_CODE_GRAPH, cs.MCPToolName.SEMANTIC_SEARCH],
+    )
+    def test_project_is_optional(self, tool_name: str, tmp_path: Path) -> None:
+        """The control: declaring it must not make it mandatory.
+
+        Every existing client sends no project and must keep working.
+        """
+        schema = _declared_schema(tmp_path, tool_name)
+
+        assert cs.MCPParamName.PROJECT not in (schema.get("required") or [])
+
+
+def _declared_schema(tmp_path: Path, tool_name: str):
+    """The input schema the registry publishes for `tool_name`.
+
+    Built through the real constructor, since `_tools` is assembled in
+    `__init__` -- reading it off a hand-made object would test a dict this
+    code never publishes.
+
+    `semantic_search` is registered only when the vector backend is
+    installed, so on a BASE install the tool legitimately does not exist and
+    a `KeyError` here is the environment, not a regression. Skipping on the
+    bare absence would fail OPEN -- a tool wrongly dropped on a full install
+    would skip rather than fail -- so the skip is conditioned on
+    `has_semantic_dependencies()`, the same predicate the registry itself
+    gates on. Absent while the dependencies ARE present still fails.
+    """
+    from unittest.mock import MagicMock
+
+    from codebase_rag.mcp.tools import MCPToolsRegistry
+    from codebase_rag.utils.dependencies import has_semantic_dependencies
+
+    registry = MCPToolsRegistry(
+        project_root=str(tmp_path),
+        ingestor=MagicMock(),
+        cypher_gen=MagicMock(),
+    )
+    if tool_name not in registry._tools and not has_semantic_dependencies():
+        pytest.skip(f"{tool_name} needs the vector backend, absent on a base install")
+    return registry._tools[tool_name].input_schema
+
+
+class TestSemanticSearchScope:
+    """The other retrieval handler named in the issue.
+
+    Its underlying tool ALREADY accepted `project` and passes it to
+    `search_embeddings`, which filters in the vector store. Only the MCP
+    handler failed to forward it, so this is a plumbing gap rather than a
+    missing filter -- and the fix is correspondingly smaller.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_project_reaches_the_underlying_tool(self) -> None:
+        from unittest.mock import AsyncMock, MagicMock
+
+        from codebase_rag.mcp.tools import MCPToolsRegistry
+
+        handler = MCPToolsRegistry.__new__(MCPToolsRegistry)
+        handler._ingestor_lock = _NullLock()
+        # A complete graph: `query_code_graph` and the `_graph_query`
+        # tools refuse when these say otherwise, so a fixture that
+        # omits them raises AttributeError instead of testing anything.
+        handler._graph_incomplete = False
+        handler._persisted_incomplete = lambda _project: False
+        handler.project_root = "/repo"
+        handler._semantic_search_tool = MagicMock()
+        handler._semantic_search_tool.function = AsyncMock(return_value="ok")
+        handler.ingestor = MagicMock()
+        handler.ingestor.list_projects = MagicMock(return_value=[ALPHA, BETA])
+
+        await handler.semantic_search("intent", project=ALPHA)
+
+        kwargs = handler._semantic_search_tool.function.call_args.kwargs
+        assert kwargs["project"] == ALPHA
+
+    @pytest.mark.asyncio
+    async def test_no_project_is_forwarded_as_none(self) -> None:
+        """The control: the default must stay unscoped.
+
+        Asserting the VALUE rather than merely that the key is present --
+        forwarding a wrong-but-present project would pass a presence check
+        while silently narrowing every unscoped caller.
+        """
+        from unittest.mock import AsyncMock, MagicMock
+
+        from codebase_rag.mcp.tools import MCPToolsRegistry
+
+        handler = MCPToolsRegistry.__new__(MCPToolsRegistry)
+        handler._ingestor_lock = _NullLock()
+        # A complete graph: `query_code_graph` and the `_graph_query`
+        # tools refuse when these say otherwise, so a fixture that
+        # omits them raises AttributeError instead of testing anything.
+        handler._graph_incomplete = False
+        handler._persisted_incomplete = lambda _project: False
+        handler.project_root = "/repo"
+        handler._semantic_search_tool = MagicMock()
+        handler._semantic_search_tool.function = AsyncMock(return_value="ok")
+        handler.ingestor = MagicMock()
+        handler.ingestor.list_projects = MagicMock(return_value=[ALPHA, BETA])
+
+        await handler.semantic_search("intent")
+
+        kwargs = handler._semantic_search_tool.function.call_args.kwargs
+        assert kwargs["project"] is None
+
+
+def _prefixes(result: dict) -> set[str]:
+    return {row["qualified_name"].split(".")[0] for row in result["results"]}
+
+
+def _handler_returning(
+    rows: list[dict],
+    query_used: str = "MATCH (n) RETURN n.qualified_name AS qualified_name",
+    summary: str = "ok",
+):
+    """An MCPToolsRegistry bound to a stub graph, with the real handler logic.
+
+    The default `query_used` PROJECTS a qualified name, because that is what
+    a scoped request needs in order to be judgeable. Tests that want the
+    unjudgeable case pass their own.
+
+    `summary` is a parameter so a test can assert the tool's own message
+    SURVIVES rather than merely that some other message is absent. With it
+    hardcoded, a translation-failure test could only check that the
+    unscopeable text was missing -- which any replacement message satisfies,
+    including a wrong one (reported on #1494).
+    """
+    from unittest.mock import AsyncMock, MagicMock
+
+    from codebase_rag.mcp.tools import MCPToolsRegistry
+    from codebase_rag.schemas import QueryGraphData
+
+    handler = MCPToolsRegistry.__new__(MCPToolsRegistry)
+    handler._ingestor_lock = _NullLock()
+    # A complete graph: `query_code_graph` and the `_graph_query`
+    # tools refuse when these say otherwise, so a fixture that
+    # omits them raises AttributeError instead of testing anything.
+    handler._graph_incomplete = False
+    handler._persisted_incomplete = lambda _project: False
+    handler.project_root = "/repo"
+    handler._query_tool = MagicMock()
+    handler._query_tool.function = AsyncMock(
+        return_value=QueryGraphData(
+            query_used=query_used,
+            results=list(rows),
+            summary=summary,
+        )
+    )
+    handler.ingestor = MagicMock()
+    handler.ingestor.list_projects = MagicMock(return_value=[ALPHA, BETA])
+    # What a scoped request builds its per-request tool from. Left as bare
+    # mocks: a test that lets a scoped request reach a REAL tool should use
+    # `_registry_over_graph`, which stubs the graph, not the tool.
+    handler.cypher_gen = MagicMock()
+    handler._stderr_console = MagicMock()
+    return handler
+
+
+class _NullLock:
+    async def __aenter__(self) -> None:
+        return None
+
+    async def __aexit__(self, *_: object) -> None:
+        return None
+
+
+def _registry_over_graph(rows: list[dict], cypher: str):
+    """An MCPToolsRegistry whose scoped requests exercise the REAL query tool.
+
+    `_handler_returning` stubs `_query_tool`, which is right for tests about
+    the handler's own logic but blind to everything the tool does: the
+    evidence guard, the row filter, the row cap, the token truncation and the
+    summary. Issue #1508 is precisely about the ordering of those, so these
+    tests stub only the graph (`fetch_all`) and the translation (`generate`)
+    and let the real tool run.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+
+    from codebase_rag.mcp.tools import MCPToolsRegistry
+    from codebase_rag.tools.codebase_query import create_query_tool
+
+    handler = MCPToolsRegistry.__new__(MCPToolsRegistry)
+    handler._ingestor_lock = _NullLock()
+    # A complete graph: `query_code_graph` and the `_graph_query`
+    # tools refuse when these say otherwise, so a fixture that
+    # omits them raises AttributeError instead of testing anything.
+    handler._graph_incomplete = False
+    handler._persisted_incomplete = lambda _project: False
+    handler.project_root = "/repo"
+    handler.ingestor = MagicMock()
+    handler.ingestor.fetch_all = MagicMock(return_value=list(rows))
+    handler.ingestor.fetch_read_only = handler.ingestor.fetch_all
+    handler.ingestor.list_projects = MagicMock(return_value=[ALPHA, BETA])
+    handler.cypher_gen = MagicMock()
+    handler.cypher_gen.generate = AsyncMock(return_value=cypher)
+    handler._stderr_console = MagicMock()
+    handler._query_tool = create_query_tool(
+        ingestor=handler.ingestor,
+        cypher_gen=handler.cypher_gen,
+        console=handler._stderr_console,
+    )
+    return handler
+
+
+# Projects a qualified name, so the evidence guard accepts it for any scope
+# and the row filter does the narrowing (the shape line 901 relies on).
+_QN_CYPHER = "MATCH (n) RETURN n.qualified_name AS qualified_name"
+
+
+class TestScopedBudgetIsSpentOnInProjectRows:
+    """The row cap and token budget must apply AFTER the scope (issue #1508).
+
+    The pre-built `_query_tool` capped and truncated the unfiltered result,
+    and the handler filtered afterwards -- so with foreign rows sorting
+    first, a scoped caller could receive none of its own rows while its rows
+    existed beyond the cap, and the `summary` described the unfiltered set.
+    """
+
+    @pytest.mark.asyncio
+    async def test_in_project_rows_survive_foreign_rows_sorting_first(
+        self,
+    ) -> None:
+        """With a cap of 2 and both own rows beyond it, both must arrive."""
+        from unittest.mock import patch
+
+        foreign = [{"qualified_name": f"{BETA}.mod.f{i}"} for i in range(4)]
+        own = [{"qualified_name": f"{ALPHA}.mod.f{i}"} for i in range(2)]
+        handler = _registry_over_graph(foreign + own, cypher=_QN_CYPHER)
+
+        with patch("codebase_rag.tools.codebase_query.settings") as s:
+            s.QUERY_RESULT_ROW_CAP = 2
+            s.QUERY_RESULT_MAX_TOKENS = 16000
+            s.QUERY_TIMEOUT_S = 60.0
+            result = await handler.query_code_graph("functions", project=ALPHA)
+
+        assert not result.get("error"), result
+        assert _prefixes(result) == {ALPHA}
+        assert len(result["results"]) == 2
+
+    @pytest.mark.asyncio
+    async def test_the_summary_counts_the_rows_actually_returned(self) -> None:
+        """The summary must describe the delivered rows, not the raw set.
+
+        Two own rows among six matches is a complete answer for the scoped
+        caller, so the summary is the success message for 2 -- not a
+        truncation report about rows the caller never receives.
+        """
+        from unittest.mock import patch
+
+        foreign = [{"qualified_name": f"{BETA}.mod.f{i}"} for i in range(4)]
+        own = [{"qualified_name": f"{ALPHA}.mod.f{i}"} for i in range(2)]
+        handler = _registry_over_graph(foreign + own, cypher=_QN_CYPHER)
+
+        with patch("codebase_rag.tools.codebase_query.settings") as s:
+            s.QUERY_RESULT_ROW_CAP = 2
+            s.QUERY_RESULT_MAX_TOKENS = 16000
+            s.QUERY_TIMEOUT_S = 60.0
+            result = await handler.query_code_graph("functions", project=ALPHA)
+
+        assert result["summary"] == cs.QUERY_SUMMARY_SUCCESS.format(count=2)
+
+    @pytest.mark.asyncio
+    async def test_the_project_reaches_the_query_tool(self) -> None:
+        """A scoped request must be served by a tool BOUND to its project.
+
+        Asserting on the constructed tool's `project_name` rather than on
+        filtered output: post-hoc filtering in the handler would satisfy any
+        output assertion while still spending the cap on foreign rows.
+        """
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from codebase_rag.schemas import QueryGraphData
+
+        handler = _handler_returning(_ROWS)
+        scoped_tool = MagicMock()
+        scoped_tool.function = AsyncMock(
+            return_value=QueryGraphData(
+                query_used=_QN_CYPHER,
+                results=[_ROWS[0]],
+                summary="ok",
+            )
+        )
+        with patch(
+            "codebase_rag.mcp.tools.create_query_tool", return_value=scoped_tool
+        ) as factory:
+            result = await handler.query_code_graph("everything", project=ALPHA)
+
+        assert factory.call_args.kwargs["project_name"] == ALPHA
+        scoped_tool.function.assert_awaited_once()
+        assert result["results"] == [_ROWS[0]]
+
+    @pytest.mark.asyncio
+    async def test_an_unscoped_request_uses_the_prebuilt_tool(self) -> None:
+        """The control: no scope, no per-request construction.
+
+        Building a tool per unscoped request would be silent waste; using
+        the pre-built one for a SCOPED request is the bug itself. This pins
+        the boundary between the two.
+        """
+        from unittest.mock import patch
+
+        handler = _handler_returning(_ROWS)
+        with patch("codebase_rag.mcp.tools.create_query_tool") as factory:
+            result = await handler.query_code_graph("everything")
+
+        factory.assert_not_called()
+        handler._query_tool.function.assert_awaited_once()
+        assert len(result["results"]) == len(_ROWS)
+
+    @pytest.mark.asyncio
+    async def test_a_successful_response_carries_no_error_key_at_all(self) -> None:
+        """Absent, not present-and-null. A client tests `"error" in result`.
+
+        `QueryGraphData.error` defaults to None and `model_dump()` emits
+        every field, so a successful scoped response would ship
+        `{"error": None}` and read as a failure to any client checking for
+        the key. Found by mutation: deleting the handler's pop left all 190
+        tests in this file and its neighbour green.
+        """
+        handler = _registry_over_graph(_ROWS, cypher=_QN_CYPHER)
+
+        result = await handler.query_code_graph("everything", project=ALPHA)
+
+        assert cs.MCP_KEY_ERROR not in result, result
+
+    @pytest.mark.asyncio
+    async def test_an_unscoped_success_carries_no_error_key_either(self) -> None:
+        """The control: the unscoped path shares the same serialisation."""
+        handler = _registry_over_graph(_ROWS, cypher=_QN_CYPHER)
+
+        result = await handler.query_code_graph("everything")
+
+        assert cs.MCP_KEY_ERROR not in result, result
+
+    @pytest.mark.asyncio
+    async def test_a_scoped_refusal_still_reports_an_error(self) -> None:
+        """Delegating to the tool must not demote the refusal to a summary.
+
+        MCP callers distinguish "refused" from "matched nothing" by the
+        `error` key; the tool historically reported its refusal only in
+        `summary`. The contract survives the move.
+        """
+        handler = _registry_over_graph(
+            [{"name": "handler"}],
+            cypher="MATCH (n:Function) RETURN n.name AS name",
+        )
+
+        result = await handler.query_code_graph("names only", project=ALPHA)
+
+        assert result.get("error"), result
+        assert result["results"] == []
+
+
+class TestEnforcementSurvivesAnUnfilteredQuery:
+    """The case a prompt cannot prevent.
+
+    The model generates the Cypher. If it omits the project filter -- which
+    is exactly what produced the reported bleed -- the guarantee has to come
+    from somewhere else.
+    """
+
+    @pytest.mark.asyncio
+    async def test_an_unfiltered_generated_query_still_returns_one_project(
+        self,
+    ) -> None:
+        from unittest.mock import MagicMock
+
+        from codebase_rag.tools.codebase_query import create_query_tool
+
+        # Deliberately NO project filter in the generated Cypher.
+        cypher_gen = MagicMock()
+
+        async def _generate(_query: str) -> str:
+            return "MATCH (n:Function) RETURN n.qualified_name, n.name"
+
+        cypher_gen.generate = _generate
+
+        ingestor = MagicMock()
+        ingestor.fetch_read_only = MagicMock(return_value=list(_ROWS))
+
+        tool = create_query_tool(ingestor, cypher_gen, project_name=ALPHA)
+        result = await tool.function("every function")
+
+        names = [row["qualified_name"] for row in result.results]
+
+        assert names, "scoping emptied the result entirely"
+        assert all(n.startswith(f"{ALPHA}.") for n in names), names
+
+    @pytest.mark.asyncio
+    async def test_without_a_project_the_same_query_returns_both(self) -> None:
+        """The control.
+
+        Without it, a `create_query_tool` that returned nothing at all would
+        satisfy the test above -- "no rows from other projects" is trivially
+        true of an empty result.
+        """
+        from unittest.mock import MagicMock
+
+        from codebase_rag.tools.codebase_query import create_query_tool
+
+        cypher_gen = MagicMock()
+
+        async def _generate(_query: str) -> str:
+            return "MATCH (n:Function) RETURN n.qualified_name, n.name"
+
+        cypher_gen.generate = _generate
+
+        ingestor = MagicMock()
+        ingestor.fetch_read_only = MagicMock(return_value=list(_ROWS))
+
+        tool = create_query_tool(ingestor, cypher_gen)
+        result = await tool.function("every function")
+
+        prefixes = {row["qualified_name"].split(".")[0] for row in result.results}
+
+        assert prefixes == {ALPHA, BETA}
+
+
+class TestTheRestrictionMustBindTheAliasToThisProject:
+    """A prefix operator on the alias is not a restriction TO the project.
+
+    `_alias_is_restricted` checked only that `<alias>.qualified_name` was
+    followed by a prefix operator, and `_restricts_to_project` accepted the
+    project literal ANYWHERE in the body. So a vacuous predicate plus a
+    tautology carrying the project name satisfied both, and the aggregate
+    ran across every project (reported on #1494, reproduced by execution).
+    """
+
+    def _refused(self, query: str) -> bool:
+        from codebase_rag.tools.codebase_query import requires_project_evidence
+
+        return not requires_project_evidence(query, ALPHA)
+
+    def test_a_vacuous_prefix_with_a_tautology_is_refused(self) -> None:
+        assert self._refused(
+            "MATCH (n:Function) WHERE n.qualified_name STARTS WITH '' "
+            f"AND '{ALPHA}' = '{ALPHA}' RETURN count(n) AS total"
+        )
+
+    def test_a_prefix_naming_another_project_is_refused(self) -> None:
+        """The operand must be THIS project, not merely project-shaped."""
+        assert self._refused(
+            f'MATCH (n:Function) WHERE n.qualified_name STARTS WITH "{BETA}." '
+            f"AND '{ALPHA}' = '{ALPHA}' RETURN count(n) AS total"
+        )
+
+    def test_a_genuine_binding_is_still_allowed(self) -> None:
+        """THE CONTROL. The ordinary scoped count must keep working."""
+        assert not self._refused(
+            f'MATCH (n:Function) WHERE n.qualified_name STARTS WITH "{ALPHA}." '
+            "RETURN count(n) AS total"
+        )
+
+
+class TestTrailingClausesAreCutOnAnyWhitespace:
+    """`ORDER BY` on the next line must not stay inside the projection.
+
+    `CYPHER_POST_RETURN_KEYWORDS` were matched as literal single-spaced
+    strings, so a NEWLINE before `ORDER BY` defeated the cut and the sort
+    key stayed in the parsed projection. `RETURN n.name AS a` then looked
+    like it projected a qualified name -- because `n.qualified_name` was
+    sitting in the ORDER BY -- while the rows actually returned carry only
+    `n.name`, which the row filter cannot attribute (reported on #1494).
+
+    The aliased form is the one that leaks: `_every_term_is_plain` splits
+    the term at ` AS `, so the trailing clause falls outside the part it
+    checks and the term passes as a bare property read.
+    """
+
+    def _refused(self, query: str) -> bool:
+        from codebase_rag.tools.codebase_query import requires_project_evidence
+
+        return not requires_project_evidence(query, ALPHA)
+
+    def test_a_newline_before_order_by_is_still_cut(self) -> None:
+        assert self._refused("MATCH (n) RETURN n.name AS a\nORDER BY n.qualified_name")
+
+    def test_a_newline_inside_order_by_is_still_cut(self) -> None:
+        assert self._refused("MATCH (n) RETURN n.name AS a\nORDER\nBY n.qualified_name")
+
+    def test_a_newline_before_skip_is_still_cut(self) -> None:
+        assert self._refused(
+            "MATCH (n) RETURN n.name AS a\nSKIP 1\nORDER BY n.qualified_name"
+        )
+
+    def test_a_newline_before_limit_is_still_cut(self) -> None:
+        assert self._refused(
+            "MATCH (n) RETURN n.name AS a\nLIMIT 5\nORDER BY n.qualified_name"
+        )
+
+    def test_a_real_projection_with_a_newline_order_by_is_allowed(self) -> None:
+        """THE CONTROL. Cutting the clause must not lose genuine evidence."""
+        assert not self._refused(
+            "MATCH (n) RETURN n.qualified_name AS q\nORDER BY n.name"
+        )
+
+    def test_a_property_containing_a_keyword_is_not_a_trailing_clause(self) -> None:
+        """The upper-bound guard: `n.reunion` contains the letters UNION.
+
+        `" UNION"` carries no trailing space, so the leading whitespace is
+        its only boundary. Without it the projection is truncated mid-word
+        at `RE|UNION`, the qualified name that follows is lost, and a
+        legitimate query is refused. Found by mutating the boundary away and
+        seeing every test still pass.
+        """
+        assert not self._refused("MATCH (n) RETURN n.reunion, n.qualified_name")
+
+
+class TestAForeignProjectLiteralAnywhereIsRefused:
+    """Deliberately conservative, and pinned because nothing else pins it.
+
+    `_restricts_to_project` requires EVERY project-shaped literal in the
+    body to name the requested project. Since `_alias_is_restricted` began
+    checking the operand, that is belt-and-braces: a query restricting the
+    counted alias to another project is already refused there.
+
+    What survives is a genuine over-restriction -- a query whose counted
+    alias IS correctly bound to this project but which mentions another
+    project's name in a non-restricting position. That is refused, which is
+    the SAFE direction, but it was an unguarded decision: mutating the
+    quantifier from `all` to `any` killed no test at all. Found by sweeping
+    every quantifier in the module after one of them turned out to be wrong.
+    """
+
+    def _refused(self, query: str) -> bool:
+        from codebase_rag.tools.codebase_query import requires_project_evidence
+
+        return not requires_project_evidence(query, ALPHA)
+
+    def test_a_foreign_literal_in_a_non_restricting_position_is_refused(self) -> None:
+        assert self._refused(
+            f"MATCH (n) WHERE n.qualified_name STARTS WITH '{ALPHA}.' "
+            f"AND n.path CONTAINS '{BETA}.' RETURN count(n) AS total"
+        )
+
+    def test_a_counted_alias_bound_to_another_project_is_refused(self) -> None:
+        """The case the literal rule was originally written for."""
+        assert self._refused(
+            f"MATCH (n) WHERE n.qualified_name STARTS WITH '{BETA}.' "
+            f"AND n.path CONTAINS '{ALPHA}.' RETURN count(n) AS total"
+        )
+
+
+class TestAnAggregateDoesNotExcuseTheRestOfItsTerm:
+    """`count(a.qn) + left(b.qn, 3)` returned a foreign fragment.
+
+    `_every_term_is_plain` skipped any term CONTAINING an aggregate, on the
+    reasoning that an aggregate names nobody. True of the aggregate; not
+    true of whatever else shares the term. A transformed read of a second
+    alias rides along, and `scope_rows_to_project` cannot recognise a
+    truncated qualified name, so the fragment survives the filter (#1494).
+
+    The reported example -- with no WHERE -- does NOT reproduce: it is
+    refused because the aggregated alias is unrestricted, by a different
+    check. These are the cases where that path does not fire, found by
+    sweeping the class rather than testing the example.
+    """
+
+    def _refused(self, query: str) -> bool:
+        from codebase_rag.tools.codebase_query import requires_project_evidence
+
+        return not requires_project_evidence(query, ALPHA)
+
+    def test_a_transform_beside_a_restricted_aggregate_is_refused(self) -> None:
+        assert self._refused(
+            f"MATCH (a),(b) WHERE a.qualified_name STARTS WITH '{ALPHA}.' "
+            "RETURN count(a.qualified_name) + left(b.qualified_name, 3) AS leak"
+        )
+
+    def test_a_transform_beside_an_aggregate_in_a_mixed_projection_is_refused(
+        self,
+    ) -> None:
+        assert self._refused(
+            "MATCH (a),(b) RETURN a.qualified_name AS q, "
+            "count(a) + left(b.qualified_name, 3) AS leak"
+        )
+
+    def test_a_bare_aggregate_term_is_still_allowed(self) -> None:
+        """THE CONTROL. An aggregate alone, aliased, keeps working."""
+        assert not self._refused(
+            f"MATCH (n) WHERE n.qualified_name STARTS WITH '{ALPHA}.' "
+            "RETURN count(n) AS total"
+        )
+
+    def test_an_aggregate_beside_a_plain_qualified_name_is_still_allowed(self) -> None:
+        assert not self._refused(
+            "MATCH (n) RETURN n.qualified_name AS q, count(n.name) AS total"
+        )
+
+
+class TestARegexRestrictionCannotBeShownPrefixLimited:
+    """`=~ "alpha__aaaa1111|.*"` starts with the project name and matches all.
+
+    `_alias_is_restricted` requires the operand to begin with the active
+    project, which is sound for `STARTS WITH` and `=` on a literal. A REGEX
+    is not a literal: an alternation after the prefix matches every foreign
+    qualified name while satisfying the same textual check, and the scoped
+    aggregate returns a scalar the row filter cannot attribute (#1494).
+
+    Deciding whether an arbitrary pattern is prefix-limited is a language
+    question this module has no business answering, so a regex predicate no
+    longer authorises a scoped aggregate at all.
+    """
+
+    def _refused(self, query: str) -> bool:
+        from codebase_rag.tools.codebase_query import requires_project_evidence
+
+        return not requires_project_evidence(query, ALPHA)
+
+    def test_a_regex_with_an_alternation_is_refused(self) -> None:
+        assert self._refused(
+            f'MATCH (n) WHERE n.qualified_name =~ "{ALPHA}|.*" RETURN count(n) AS total'
+        )
+
+    def test_even_a_faithful_regex_is_refused(self) -> None:
+        """Refused as a CLASS, not by inspecting the pattern.
+
+        This one really is limited to the project, and is still refused: the
+        rule is that a regex cannot be shown limited, not that this pattern
+        is bad. Pinned so the refusal reads as deliberate rather than as an
+        accident of the alternation case above.
+        """
+        assert self._refused(
+            f'MATCH (n) WHERE n.qualified_name =~ "^{ALPHA}\\\\." '
+            "RETURN count(n) AS total"
+        )
+
+    def test_starts_with_is_still_allowed(self) -> None:
+        """THE CONTROL. The shape the prompt mandates keeps working."""
+        assert not self._refused(
+            f"MATCH (n) WHERE n.qualified_name STARTS WITH '{ALPHA}.' "
+            "RETURN count(n) AS total"
+        )
+
+
+class TestTheRestrictionMustBeAPlainConjunction:
+    """A token blacklist tests spellings; the contract is a PROPERTY.
+
+    Refusing `OR`/`NOT`/`XOR` enumerated the operators known to widen or
+    invert a predicate. Cypher's boolean surface is larger than three
+    keywords, and the Cypher here is LLM-GENERATED rather than emitted by a
+    constrained builder, so the input language is not small enough for a
+    blacklist to be sound. `CASE WHEN <pred> THEN true ELSE true END` and
+    `coalesce(<pred>, true)` both contain none of the three tokens, both
+    evaluate true for every row, and both were accepted (#1494).
+
+    So the WHERE clause must now BE a conjunction of plain comparisons,
+    rather than merely not contain known-bad ones. Anything else is refused
+    unanalysed -- the same default-deny this module already applies to query
+    structure, applied to the predicate.
+    """
+
+    def _refused(self, query: str) -> bool:
+        from codebase_rag.tools.codebase_query import requires_project_evidence
+
+        return not requires_project_evidence(query, ALPHA)
+
+    def test_a_case_expression_returning_true_is_refused(self) -> None:
+        assert self._refused(
+            "MATCH (n) WHERE CASE WHEN n.qualified_name STARTS WITH "
+            f"'{ALPHA}.' THEN true ELSE true END RETURN count(n) AS total"
+        )
+
+    def test_a_coalesce_defaulting_to_true_is_refused(self) -> None:
+        assert self._refused(
+            "MATCH (n) WHERE coalesce(n.qualified_name STARTS WITH "
+            f"'{ALPHA}.', true) RETURN count(n) AS total"
+        )
+
+    def test_every_conjunct_must_be_plain_not_just_one(self) -> None:
+        """Precedence makes `A OR B AND C` mean `A OR (B AND C)`.
+
+        Splitting on AND yields `TRUE OR n.name = 'x'` and a real-looking
+        restriction, so accepting the clause because SOME conjunct is plain
+        admits a query that evaluates true for every row. Found by mutating
+        `all` to `any` and seeing the whole suite stay green -- nothing else
+        here distinguished the two.
+        """
+        assert self._refused(
+            "MATCH (n) WHERE TRUE OR n.name = 'x' "
+            f"AND n.qualified_name STARTS WITH '{ALPHA}.' "
+            "RETURN count(n) AS total"
+        )
+
+    def test_a_plain_conjunction_is_still_allowed(self) -> None:
+        """THE CONTROL. The shape the prompt actually mandates."""
+        assert not self._refused(
+            f"MATCH (n) WHERE n.qualified_name STARTS WITH '{ALPHA}.' "
+            "AND n.name = 'handler' RETURN count(n) AS total"
+        )
+
+    def test_a_single_predicate_is_still_allowed(self) -> None:
+        assert not self._refused(
+            f"MATCH (n) WHERE n.qualified_name STARTS WITH '{ALPHA}.' "
+            "RETURN count(n) AS total"
+        )
+
+
+class TestAnAggregateWithNoBindableEntityIsRefused:
+    """`count(*)` measures rows, and no alias means nothing to restrict.
+
+    The restriction check ran `all(...)` over the set of counted aliases.
+    `count(*)` captures no alias, so that set was EMPTY and `all()` over it
+    is vacuously true -- the query passed while counting every node in every
+    indexed project (reported on #1494).
+
+    `RETURN n.qualified_name, count(*)` is a different shape and stays
+    allowed: the count is grouped by a column the row filter can judge, so a
+    foreign group is dropped whole.
+    """
+
+    def _refused(self, query: str) -> bool:
+        from codebase_rag.tools.codebase_query import requires_project_evidence
+
+        return not requires_project_evidence(query, ALPHA)
+
+    def test_count_star_is_refused(self) -> None:
+        assert self._refused(
+            f"MATCH (n) WHERE n.qualified_name STARTS WITH '{ALPHA}.' "
+            "RETURN count(*) AS total"
+        )
+
+    def test_count_distinct_star_is_refused(self) -> None:
+        """Found by sweeping the shape, not named in the report."""
+        assert self._refused(
+            f"MATCH (n) WHERE n.qualified_name STARTS WITH '{ALPHA}.' "
+            "RETURN count(DISTINCT *) AS total"
+        )
+
+    def test_a_bound_aggregate_is_still_allowed(self) -> None:
+        """THE CONTROL. `count(n)` names an alias that IS restricted."""
+        assert not self._refused(
+            f"MATCH (n) WHERE n.qualified_name STARTS WITH '{ALPHA}.' "
+            "RETURN count(n) AS total"
+        )
+
+    def test_a_grouped_count_star_is_also_refused(self) -> None:
+        """This was a control asserting the OPPOSITE, and it was wrong.
+
+        I argued a grouped `count(*)` was safe because the row filter can
+        judge the grouping key. It cannot judge the COUNT. Grouping bounds
+        which rows survive; `count(*)` counts MATCHES, and a match can
+        involve an alias nothing restricts:
+
+            MATCH (a)-[:CALLS]->(b) WHERE a.qualified_name STARTS WITH 'alpha.'
+            RETURN a.qualified_name, count(*)
+
+        returns an alpha-labelled row whose total includes beta callees --
+        demonstrated by execution at total 2 against a both-endpoints-
+        restricted control's total 1. The label passes the filter and carries
+        a foreign magnitude past it (#1494).
+
+        `count(*)` binds no alias, so its contributors cannot be enumerated
+        and cannot be shown restricted. Refused wherever it appears in a
+        scoped projection, not only in an all-aggregate one.
+        """
+        assert self._refused(
+            "MATCH (n) RETURN n.qualified_name AS q, count(*) AS total"
+        )
+
+    def test_a_constant_string_operand_is_refused(self) -> None:
+        """`count('x')` binds no alias, so its contributors are unchecked.
+
+        The reported example was `count(true)`, which does NOT reproduce --
+        `TRUE` uppercases into something the alias pattern matches, so it is
+        collected as an alias, found unrestricted, and refused already. The
+        CLASS is real even though that member is not: a QUOTED constant
+        matches no identifier pattern, contributes nothing to the alias set,
+        and left the contributor check with nothing to verify (#1494).
+
+        So the rule is now what an operand must BE -- an alias this analysis
+        can bind -- rather than a list of constant spellings to exclude.
+        """
+        assert self._refused(
+            "MATCH (a)-[:CALLS]->(b) RETURN a.qualified_name AS q, count('x') AS total"
+        )
+
+    def test_a_boolean_operand_is_refused(self) -> None:
+        """Pinned even though it already passed, so it stays deliberate."""
+        assert self._refused(
+            "MATCH (a)-[:CALLS]->(b) RETURN a.qualified_name AS q, count(true) AS total"
+        )
+
+    def test_a_property_operand_is_still_allowed(self) -> None:
+        """THE CONTROL. `count(n.qualified_name)` binds `n` and is checkable."""
+        assert not self._refused(
+            "MATCH (n) RETURN n.qualified_name AS q, count(n.name) AS total"
+        )
+
+    def test_a_grouped_count_over_a_restricted_alias_is_allowed(self) -> None:
+        """THE CONTROL that replaces it: a NAMED alias can be checked."""
+        assert not self._refused(
+            "MATCH (n) RETURN n.qualified_name AS q, count(n) AS total"
+        )
+
+
+class TestADisjunctionCannotMakeTheRestrictionOptional:
+    """`... STARTS WITH 'alpha.' OR TRUE` restricts nothing.
+
+    `_alias_is_restricted` searches for the predicate as a SUBSTRING, so it
+    is satisfied by a predicate that appears in the query without being
+    required on every Boolean path. The aggregate then spans every project
+    and its scalar result carries no qualified name for the row filter to
+    reject (reported on #1494, reproduced end to end: `{'total': 2}` on a
+    two-project graph while scoped to one).
+
+    Refused rather than analysed. Deciding whether a project predicate is
+    mandatory across arbitrary Boolean structure is a satisfiability
+    question, and this module's stated rule is that an unanalysable shape is
+    refused -- the same default-deny that governs `_UNANALYSABLE_RE`.
+    """
+
+    def _refused(self, query: str) -> bool:
+        from codebase_rag.tools.codebase_query import requires_project_evidence
+
+        return not requires_project_evidence(query, ALPHA)
+
+    def test_or_true_is_refused(self) -> None:
+        assert self._refused(
+            f"MATCH (n:Function) WHERE n.qualified_name STARTS WITH '{ALPHA}.' "
+            "OR TRUE RETURN count(n) AS total"
+        )
+
+    def test_or_a_tautology_is_refused(self) -> None:
+        assert self._refused(
+            f"MATCH (n:Function) WHERE n.qualified_name STARTS WITH '{ALPHA}.' "
+            "OR 1=1 RETURN count(n) AS total"
+        )
+
+    def test_a_newline_separated_or_is_refused(self) -> None:
+        """Cypher treats a newline as whitespace; a literal `" OR "` did not.
+
+        The first version of this guard matched the spaced string, so the
+        same disjunction written across two lines walked straight past it --
+        the identical literal-whitespace defect that let a newline `ORDER BY`
+        stay in the projection, reintroduced one function away (#1494).
+        """
+        assert self._refused(
+            f"MATCH (n:Function) WHERE n.qualified_name STARTS WITH '{ALPHA}.'\n"
+            "OR TRUE RETURN count(n) AS total"
+        )
+
+    def test_a_tab_separated_or_is_refused(self) -> None:
+        assert self._refused(
+            f"MATCH (n:Function) WHERE n.qualified_name STARTS WITH '{ALPHA}.'\t"
+            "OR\tTRUE RETURN count(n) AS total"
+        )
+
+    def test_a_conjunction_is_still_allowed(self) -> None:
+        """THE CONTROL. `AND` keeps the restriction mandatory, so it stays."""
+        assert not self._refused(
+            f"MATCH (n:Function) WHERE n.qualified_name STARTS WITH '{ALPHA}.' "
+            "AND n.name = 'x' RETURN count(n) AS total"
+        )
+
+    def test_the_plain_restriction_is_still_allowed(self) -> None:
+        assert not self._refused(
+            f"MATCH (n:Function) WHERE n.qualified_name STARTS WITH '{ALPHA}.' "
+            "RETURN count(n) AS total"
+        )
+
+    def test_a_negated_predicate_is_refused(self) -> None:
+        """`NOT (... STARTS WITH 'alpha.')` selects everything EXCEPT alpha.
+
+        The predicate matches the textual check while its SENSE is inverted,
+        so the restriction the guard found was the opposite of a restriction
+        (reported on #1494).
+        """
+        assert self._refused(
+            f"MATCH (n) WHERE NOT (n.qualified_name STARTS WITH '{ALPHA}.') "
+            "RETURN count(n) AS total"
+        )
+
+    def test_a_negated_predicate_without_parentheses_is_refused(self) -> None:
+        assert self._refused(
+            f"MATCH (n) WHERE NOT n.qualified_name STARTS WITH '{ALPHA}.' "
+            "RETURN count(n) AS total"
+        )
+
+    def test_an_xor_is_refused(self) -> None:
+        """Found by sweeping the shape: XOR makes the predicate optional too."""
+        assert self._refused(
+            f"MATCH (n) WHERE n.qualified_name STARTS WITH '{ALPHA}.' "
+            "XOR TRUE RETURN count(n) AS total"
+        )
+
+    def test_an_identifier_containing_or_is_not_a_disjunction(self) -> None:
+        """The upper-bound guard: `n.coordinator` contains the letters OR.
+
+        The body is uppercased before matching, so an unspaced `"OR" in body`
+        refuses any query mentioning a property whose name happens to contain
+        the substring. Found by mutating the spaced constant to an unspaced
+        one and seeing every test still pass -- nothing here distinguished
+        the operator from the letters until this case existed.
+        """
+        assert not self._refused(
+            "MATCH (n:Function) WHERE n.coordinator = 'x' "
+            f"AND n.qualified_name STARTS WITH '{ALPHA}.' "
+            "RETURN count(n) AS total"
+        )
+
+
+class TestAPlainPropertyIsNotAttributionUnlessItIsTheQualifiedName:
+    """Grouping by `n.name` does not let the row filter judge the row.
+
+    `_entities_only_ever_aggregated` treated ANY plain property read as
+    making an entity filterable, on the reasoning that it supplies a
+    grouping column. Only a plain `qualified_name` does: `RETURN n.name,
+    count(n.qualified_name)` returns a name and a number, neither of which
+    the row filter can attribute, while the count spans every project.
+
+    That was my own rule and this is the case it got wrong (#1494).
+    """
+
+    def _refused(self, query: str) -> bool:
+        from codebase_rag.tools.codebase_query import requires_project_evidence
+
+        return not requires_project_evidence(query, ALPHA)
+
+    def test_a_non_identifying_plain_property_does_not_excuse_the_aggregate(
+        self,
+    ) -> None:
+        assert self._refused(
+            "MATCH (n:Function) RETURN n.name, count(n.qualified_name) AS total"
+        )
+
+    def test_a_plain_qualified_name_still_excuses_the_aggregate(self) -> None:
+        """THE CONTROL. A real grouping key keeps mixed aggregates usable."""
+        assert not self._refused(
+            "MATCH (n:Function) RETURN n.qualified_name AS q, count(n) AS total"
+        )
+
+
+class TestAnOpaqueValueCannotSmuggleAForeignProject:
+    """A value the inspector cannot read must not be assumed harmless.
+
+    `_names_another_project` understands strings and built-in containers.
+    A graph driver's Node, Relationship or Path is none of those, so it fell
+    through to `return False` and the row was KEPT -- then rendered with
+    `str()`, printing another project's properties under an active scope
+    (reported on #1494).
+
+    Fails closed instead: unreadable means unattributable, which is the same
+    rule the rest of this module already applies to queries. Plain scalars
+    stay readable, so a genuine aggregate row is unaffected.
+    """
+
+    def test_an_opaque_object_carrying_a_foreign_name_is_dropped(self) -> None:
+        from codebase_rag.tools.codebase_query import scope_rows_to_project
+
+        class _DriverNode:
+            """Stands in for a driver entity: not a str, not a container."""
+
+            def __init__(self, qn: str) -> None:
+                self._properties = {"qualified_name": qn}
+
+            def __str__(self) -> str:
+                return str(self._properties)
+
+        rows = [
+            {"qualified_name": f"{ALPHA}.a.f", "node": _DriverNode(f"{BETA}.x.y")},
+        ]
+
+        assert scope_rows_to_project(rows, ALPHA) == []
+
+    def test_a_genuine_aggregate_row_still_survives(self) -> None:
+        """THE CONTROL. Scalars are readable and must not be failed closed."""
+        from codebase_rag.tools.codebase_query import scope_rows_to_project
+
+        rows = [{"total": 42, "ratio": 0.5, "ok": True, "missing": None}]
+
+        assert scope_rows_to_project(rows, ALPHA) == rows
+
+
+class TestACommentedPredicateDoesNotRestrictAnything:
+    """A project predicate inside a comment is not executed by the database.
+
+    The projection is analysed with comments and quoted strings blanked, but
+    the RESTRICTION check received the original Cypher, so text the database
+    never runs satisfied the scope guard. The aggregate then executed with no
+    project predicate at all and returned a cross-project total (reported on
+    #1494, reproduced by execution).
+
+    Quoted strings must survive this stripping: the project literal
+    legitimately lives inside quotes, so blanking them would refuse every
+    correctly-scoped query instead.
+    """
+
+    def _refused(self, query: str) -> bool:
+        from codebase_rag.tools.codebase_query import requires_project_evidence
+
+        return not requires_project_evidence(query, ALPHA)
+
+    def test_a_block_comment_predicate_is_refused(self) -> None:
+        assert self._refused(
+            f'MATCH (b) /* b.qualified_name STARTS WITH "{ALPHA}." */ '
+            "RETURN count(b) AS total"
+        )
+
+    def test_a_line_comment_predicate_is_refused(self) -> None:
+        assert self._refused(
+            f'MATCH (b) // b.qualified_name STARTS WITH "{ALPHA}."\n'
+            "RETURN count(b) AS total"
+        )
+
+    def test_a_genuine_predicate_is_still_allowed(self) -> None:
+        """THE CONTROL. Stripping must not refuse a real restriction."""
+        assert not self._refused(
+            f'MATCH (b) WHERE b.qualified_name STARTS WITH "{ALPHA}." '
+            "RETURN count(b) AS total"
+        )
+
+    def test_a_double_slash_inside_a_string_is_not_a_comment(self) -> None:
+        """`"http://..."` must not be mistaken for a line comment.
+
+        Blanking from the `//` would swallow the rest of the line including
+        the genuine predicate, refusing a correct query.
+        """
+        assert not self._refused(
+            f'MATCH (b) WHERE b.path STARTS WITH "http://x" '
+            f'AND b.qualified_name STARTS WITH "{ALPHA}." '
+            "RETURN count(b) AS total"
+        )
+
+
+class TestATranslationFailureIsNotReportedAsUnscopeable:
+    """A query that was never generated cannot be judged unscopeable.
+
+    The #1494 shape of this bug lived in the handler, which read the tool's
+    OUTPUT: `QUERY_NOT_AVAILABLE` has no RETURN clause, so it failed the
+    evidence check and the real translation error was replaced with "this
+    query cannot be scoped". The guard now runs inside the per-request tool,
+    where generation either returns a validated query or RAISES -- so the
+    guard only ever judges a query that exists, and an empty or unavailable
+    query cannot reach it at all. What remains to pin is that the raised
+    error survives to the scoped caller unrelabelled.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_underlying_error_survives(self) -> None:
+        """Asserts the real message is PRESENT, not that another is absent.
+
+        An absence assertion is satisfied by every other outcome, including
+        a regression that replaces the translation failure with some third
+        error. So the failure carries a representative message and the test
+        requires it to arrive intact.
+        """
+        from unittest.mock import AsyncMock
+
+        from codebase_rag import exceptions as ex
+
+        translation_error = "Cypher generation failed: unparseable request"
+        handler = _registry_over_graph([], cypher=_QN_CYPHER)
+        handler.cypher_gen.generate = AsyncMock(
+            side_effect=ex.LLMGenerationError(translation_error)
+        )
+
+        result = await handler.query_code_graph("something unparseable", project=ALPHA)
+
+        assert result.get("summary") == cs.QUERY_SUMMARY_TRANSLATION_FAILED.format(
+            error=translation_error
+        )
+        assert result.get("query_used") == cs.QUERY_NOT_AVAILABLE
+        assert not result.get("error")
+
+
+class TestPropertyAggregatesAreAttributed:
+    """An aggregate over a PROPERTY measures its entity, exactly as a bare one does.
+
+    `_every_projected_entity_is_attributable` registers an aggregated entity
+    only when it appears as a BARE identifier -- `count(b)`. The property form
+    `count(b.qualified_name)` reaches the same function as an ordinary property
+    read, satisfies "this entity projects its own qualified name", and returns
+    early, so the restriction check below is never reached for it.
+
+    The two checks answer different questions, and only one of them is the
+    right question for an aggregate. Attributability asks "does this row say
+    who it is about"; restriction asks "is this entity confined to my
+    project". For a projection of NAMES those coincide. An aggregate returns
+    no names at all, so attributability is satisfied trivially while the
+    MAGNITUDE still spans every indexed project.
+    """
+
+    def _refused(self, query: str) -> bool:
+        from codebase_rag.tools.codebase_query import requires_project_evidence
+
+        return not requires_project_evidence(query, ALPHA)
+
+    def test_a_property_aggregate_over_an_unrestricted_alias_is_refused(self) -> None:
+        assert self._refused(
+            f'MATCH (a),(b) WHERE a.qualified_name STARTS WITH "{ALPHA}." '
+            "RETURN count(b.qualified_name) AS total"
+        )
+
+    def test_a_distinct_property_aggregate_is_refused_too(self) -> None:
+        """DISTINCT sits INSIDE the aggregate, so it must not change the answer."""
+        assert self._refused(
+            f'MATCH (a),(b) WHERE a.qualified_name STARTS WITH "{ALPHA}." '
+            "RETURN count(DISTINCT b.qualified_name) AS total"
+        )
+
+    def test_a_collect_over_a_property_is_refused(self) -> None:
+        """`collect` returns the VALUES, not merely a magnitude.
+
+        The worst of the three: it hands back other projects' qualified names
+        outright rather than a count of them.
+        """
+        assert self._refused(
+            f'MATCH (a),(b) WHERE a.qualified_name STARTS WITH "{ALPHA}." '
+            "RETURN collect(b.qualified_name) AS names"
+        )
+
+    def test_a_mixed_projection_is_refused_when_any_alias_is_unrestricted(self) -> None:
+        """The too-LITTLE twin of the control below.
+
+        A fix that inspects only the first projection term, or that stops at
+        the first restricted alias it finds, refuses all three leaks above and
+        still permits this one. Nothing else here would notice.
+        """
+        assert self._refused(
+            f'MATCH (a),(b) WHERE a.qualified_name STARTS WITH "{ALPHA}." '
+            "RETURN count(a.qualified_name), count(b.qualified_name)"
+        )
+
+    def test_a_property_aggregate_over_the_restricted_alias_is_allowed(self) -> None:
+        """THE CONTROL, and the too-MUCH guard.
+
+        Identical in shape to the refusals above except that the counted alias
+        IS the one the WHERE restricts. A fix that simply refuses every
+        property aggregate passes all four leak tests while breaking
+        legitimate scoped counting, and would look correct.
+        """
+        assert not self._refused(
+            f'MATCH (a) WHERE a.qualified_name STARTS WITH "{ALPHA}." '
+            "RETURN count(a.qualified_name) AS total"
+        )
+
+    def test_the_bare_aggregate_case_still_behaves(self) -> None:
+        """Regression pin: the original bare-`count(b)` finding stays fixed."""
+        assert self._refused(
+            f'MATCH (a),(b) WHERE a.qualified_name STARTS WITH "{ALPHA}." '
+            "RETURN count(b) AS total"
+        )
+
+
+class TestAnUnscopeableQueryNeverReachesTheGraph:
+    """Refusing after execution still ran the query against every project.
+
+    The guard inspects only the generated Cypher, so nothing required it to
+    wait for results -- yet it sat after `fetch_all`. A scoped request with
+    an unscopable query therefore executed a cross-project read, and only
+    then returned an error. The rows never reached the caller, but the
+    database served them, which is the part a caller cannot see and cannot
+    undo.
+
+    Asserted on the CALL, not the result: an empty result is what the old
+    order produced too, so `results == []` cannot tell the two apart.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_ingestor_is_never_called(self) -> None:
+        from unittest.mock import MagicMock
+
+        from codebase_rag.tools.codebase_query import create_query_tool
+
+        cypher_gen = MagicMock()
+
+        async def _generate(_q: str) -> str:
+            return "MATCH (n:Function) RETURN n.name AS name, n.path AS path"
+
+        cypher_gen.generate = _generate
+        ingestor = MagicMock()
+        ingestor.fetch_read_only = MagicMock(return_value=[{"name": "x", "path": "p"}])
+
+        tool = create_query_tool(ingestor, cypher_gen, project_name=ALPHA)
+        result = await tool.function("names only")
+
+        assert result.results == []
+        ingestor.fetch_read_only.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_scopeable_query_still_reaches_the_graph(self) -> None:
+        """The control: refusing early must not refuse everything.
+
+        Without this, moving the guard before execution could short-circuit
+        every scoped query and the leak test above would still pass.
+        """
+        from unittest.mock import MagicMock
+
+        from codebase_rag.tools.codebase_query import create_query_tool
+
+        cypher_gen = MagicMock()
+
+        async def _generate(_q: str) -> str:
+            return "MATCH (n:Function) RETURN n.qualified_name AS qualified_name"
+
+        cypher_gen.generate = _generate
+        ingestor = MagicMock()
+        ingestor.fetch_read_only = MagicMock(
+            return_value=[{"qualified_name": f"{ALPHA}.mod.f"}]
+        )
+
+        tool = create_query_tool(ingestor, cypher_gen, project_name=ALPHA)
+        result = await tool.function("functions")
+
+        ingestor.fetch_read_only.assert_called_once()
+        assert result.results == [{"qualified_name": f"{ALPHA}.mod.f"}]
+
+
+class TestARestrictedAggregateOnlyAliasIsNotRefusedTwice:
+    """A proven-confined aggregated alias need not also project its name.
+
+    `RETURN f.qualified_name, count(c)` -- "how many callers does each of my
+    functions have" -- was refused even when the query restricted BOTH `c`
+    and `f` to the requested project. `_restricts_to_project` returned True
+    for `{'C'}`; `_every_projected_entity_is_attributable` then refused
+    anyway, because `c` contributes no property read of its own.
+
+    The two checks answer different questions. Attributability asks "does
+    this row say who it is about", and guards the row filter. The leak an
+    aggregate poses is a MAGNITUDE spanning projects the caller never asked
+    for -- and restriction has already established that magnitude is
+    bounded. Refusing a second time costs a common shape and prevents no
+    leak (issue #1843).
+
+    The exemption covers ONLY aliases `_restricts_to_project` vouched for.
+    What actually enforces that is the caller: `aggregated_only` is the set
+    the restriction gate above has just passed, and it is the same set
+    handed to the exemption, so an unvouched alias cannot reach here at all.
+    The `restricted` parameter is therefore a narrowing the caller cannot
+    currently violate -- defence in depth against a future caller passing a
+    wider set, not the thing keeping today's unrestricted queries out.
+
+    Said plainly because mutation testing shows it: widening the exemption
+    to every aggregated alias leaves the whole file green, since each query
+    it would wrongly admit is already refused upstream.
+
+    So only three of the eight tests below reach the changed line, and each
+    of the other five says which earlier gate decides it. The three that do:
+    the accepted grouped count, the property-read refusal, and the
+    collect-of-a-property refusal. Dropping the exemption reddens the first;
+    dropping the `not reads[entity]` guard reddens the other two. The bare
+    `collect` test reddens on its own mutation -- putting COLLECT back into
+    the magnitude pattern -- and the guard/filter agreement test guards the
+    consistency the bare-collect bug broke. The remaining five are
+    boundary tests of the accepted shape -- worth keeping, but not evidence
+    for this change.
+    """
+
+    def test_a_grouped_count_over_a_restricted_alias_is_accepted(self) -> None:
+        from codebase_rag.tools.codebase_query import requires_project_evidence
+
+        cypher = (
+            "MATCH (c:Function)-[:CALLS]->(f:Function) "
+            f"WHERE c.qualified_name STARTS WITH '{ALPHA}.' "
+            f"AND f.qualified_name STARTS WITH '{ALPHA}.' "
+            "RETURN f.qualified_name AS name, count(c) AS callers "
+            "ORDER BY callers DESC LIMIT 10"
+        )
+
+        assert requires_project_evidence(cypher, ALPHA)
+
+    def test_an_unrestricted_aggregated_alias_is_still_refused(self) -> None:
+        """The alias must be restricted, not merely aggregated.
+
+        Only `f` is bounded here, so the count ranges over every project's
+        callers while the row wears an in-project label.
+
+        This one is guarded by `_restricts_to_project` UPSTREAM of the
+        exemption, not by the exemption itself: widening the exemption to
+        every aggregated alias leaves it green, because the query is already
+        refused before attributability runs. Kept as a boundary test of the
+        accepted shape, not as evidence for the `restricted` filter -- see
+        the class docstring for what actually covers that.
+        """
+        from codebase_rag.tools.codebase_query import requires_project_evidence
+
+        cypher = (
+            "MATCH (c:Function)-[:CALLS]->(f:Function) "
+            f"WHERE f.qualified_name STARTS WITH '{ALPHA}.' "
+            "RETURN f.qualified_name AS name, count(c) AS callers"
+        )
+
+        assert not requires_project_evidence(cypher, ALPHA)
+
+    def test_a_foreign_project_restriction_is_still_refused(self) -> None:
+        """Restricted to *a* project is not restricted to *yours*.
+
+        Decided upstream of the exemption, by `_restricts_to_project` --
+        see the class docstring.
+        """
+        from codebase_rag.tools.codebase_query import requires_project_evidence
+
+        cypher = (
+            "MATCH (c:Function)-[:CALLS]->(f:Function) "
+            f"WHERE c.qualified_name STARTS WITH '{BETA}.' "
+            f"AND f.qualified_name STARTS WITH '{ALPHA}.' "
+            "RETURN f.qualified_name AS name, count(c) AS callers"
+        )
+
+        assert not requires_project_evidence(cypher, ALPHA)
+
+    def test_an_alias_that_also_reads_a_property_is_still_refused(self) -> None:
+        """The exemption is for aliases exposing NO name of their own.
+
+        `c.name` puts an entity's name in the row, so that entity must carry
+        its own qualified name however well restricted it is -- otherwise
+        the row filter judges it on `f`'s label.
+        """
+        from codebase_rag.tools.codebase_query import requires_project_evidence
+
+        cypher = (
+            "MATCH (c:Function)-[:CALLS]->(f:Function) "
+            f"WHERE c.qualified_name STARTS WITH '{ALPHA}.' "
+            f"AND f.qualified_name STARTS WITH '{ALPHA}.' "
+            "RETURN f.qualified_name AS name, c.name AS caller, count(c) AS n"
+        )
+
+        assert not requires_project_evidence(cypher, ALPHA)
+
+    def test_a_wildcard_aggregate_is_still_refused(self) -> None:
+        """`count(*)` binds no alias, so nothing can be shown restricted.
+
+        Decided upstream of the exemption, by
+        `_every_aggregate_operand_is_bindable` -- see the class docstring.
+        """
+        from codebase_rag.tools.codebase_query import requires_project_evidence
+
+        cypher = (
+            "MATCH (c:Function)-[:CALLS]->(f:Function) "
+            f"WHERE c.qualified_name STARTS WITH '{ALPHA}.' "
+            f"AND f.qualified_name STARTS WITH '{ALPHA}.' "
+            "RETURN f.qualified_name AS name, count(*) AS n"
+        )
+
+        assert not requires_project_evidence(cypher, ALPHA)
+
+    def test_a_relationship_alias_is_still_refused(self) -> None:
+        """A relationship has no qualified name, so it cannot be vouched for.
+
+        Its confinement would have to be inferred from its endpoints, which
+        this module does not do. Recorded here so the gap is deliberate
+        rather than accidental (issue #1843).
+
+        Decided upstream of the exemption, by `_restricts_to_project` --
+        see the class docstring.
+        """
+        from codebase_rag.tools.codebase_query import requires_project_evidence
+
+        cypher = (
+            "MATCH (c:Function)-[r:CALLS]->(f:Function) "
+            f"WHERE c.qualified_name STARTS WITH '{ALPHA}.' "
+            f"AND f.qualified_name STARTS WITH '{ALPHA}.' "
+            "RETURN f.qualified_name AS name, count(r) AS callers"
+        )
+
+        assert not requires_project_evidence(cypher, ALPHA)
+
+    def test_a_regex_restriction_does_not_vouch_for_an_alias(self) -> None:
+        """A pattern can start with the project and still match everything.
+
+        Decided upstream of the exemption, by `_restricts_to_project` --
+        see the class docstring.
+        """
+        from codebase_rag.tools.codebase_query import requires_project_evidence
+
+        cypher = (
+            "MATCH (c:Function)-[:CALLS]->(f:Function) "
+            f"WHERE c.qualified_name =~ '{ALPHA}.*|.*' "
+            f"AND f.qualified_name STARTS WITH '{ALPHA}.' "
+            "RETURN f.qualified_name AS name, count(c) AS callers"
+        )
+
+        assert not requires_project_evidence(cypher, ALPHA)
+
+    def test_bare_collect_over_a_restricted_alias_is_refused(self) -> None:
+        """`collect(c)` returns the ENTITIES, so restriction does not vouch.
+
+        Caught on review after the first version of this change admitted it.
+        The guard accepted the query and `scope_rows_to_project` then dropped
+        the whole row -- `_names_another_project` fails closed on a driver
+        `Node`, which is neither scalar nor a supported container -- so the
+        caller got an empty result instead of either their data or a refusal.
+        Accepted-then-silently-emptied is worse than refused, because nothing
+        in the response says the scope guard was involved.
+
+        Restriction bounds a MAGNITUDE; it does not make the entities
+        themselves attributable. So the exemption covers `count`/`sum`/`avg`/
+        `min`/`max` only, and `collect` is excluded by construction rather
+        than by a separate check that could drift (issue #1843).
+        """
+        from codebase_rag.tools.codebase_query import requires_project_evidence
+
+        cypher = (
+            "MATCH (c:Function)-[:CALLS]->(f:Function) "
+            f"WHERE c.qualified_name STARTS WITH '{ALPHA}.' "
+            f"AND f.qualified_name STARTS WITH '{ALPHA}.' "
+            "RETURN f.qualified_name AS name, collect(c) AS callers"
+        )
+
+        assert not requires_project_evidence(cypher, ALPHA)
+
+    def test_an_accepted_aggregate_survives_the_row_filter(self) -> None:
+        """The guard and the filter must agree, not merely each be safe.
+
+        The `collect` bug was a DISAGREEMENT: admitted by one, emptied by the
+        other. This asserts the pair is consistent for the shape the change
+        exists to allow -- a row whose aggregate is a number survives scoping
+        with its value intact.
+        """
+        from codebase_rag.tools.codebase_query import (
+            requires_project_evidence,
+            scope_rows_to_project,
+        )
+
+        cypher = (
+            "MATCH (c:Function)-[:CALLS]->(f:Function) "
+            f"WHERE c.qualified_name STARTS WITH '{ALPHA}.' "
+            f"AND f.qualified_name STARTS WITH '{ALPHA}.' "
+            "RETURN f.qualified_name AS name, count(c) AS callers"
+        )
+        assert requires_project_evidence(cypher, ALPHA)
+
+        rows = [{"name": f"{ALPHA}.mod.f", "callers": 3}]
+
+        assert scope_rows_to_project(rows, ALPHA) == rows
+
+    def test_collect_of_a_property_over_a_restricted_alias_is_refused(
+        self,
+    ) -> None:
+        """`collect` returns the names themselves, not only a magnitude."""
+        from codebase_rag.tools.codebase_query import requires_project_evidence
+
+        cypher = (
+            "MATCH (c:Function)-[:CALLS]->(f:Function) "
+            f"WHERE c.qualified_name STARTS WITH '{ALPHA}.' "
+            f"AND f.qualified_name STARTS WITH '{ALPHA}.' "
+            "RETURN f.qualified_name AS name, collect(c.name) AS callers"
+        )
+
+        assert not requires_project_evidence(cypher, ALPHA)
+
+
+class TestTheCachedUpdatersProject:
+    """A cached updater belongs to one project and must not answer for another.
+
+    `_live_updater` is built by `_update_repository_sync` for the DERIVED
+    project name. A caller naming a different project (the rename tool takes
+    an explicit `project`) would otherwise be handed that updater: the delta
+    is then measured under the selected prefix while the re-ingest writes
+    under the derived one, so a correct rename reads as not applied, is
+    rolled back, and the graph ends up split across two project names.
+    """
+
+    def _registry(self, tmp_path: Path, cached_project: str | None):
+        from unittest.mock import MagicMock
+
+        from codebase_rag.mcp.tools import MCPToolsRegistry
+
+        registry = MCPToolsRegistry(
+            project_root=str(tmp_path),
+            ingestor=MagicMock(),
+            cypher_gen=MagicMock(),
+        )
+        if cached_project is not None:
+            cached = MagicMock()
+            cached.project_name = cached_project
+            registry._live_updater = cached
+        return registry
+
+    def test_a_cached_updater_for_another_project_is_not_reused(
+        self, tmp_path: Path
+    ) -> None:
+        registry = self._registry(tmp_path, cached_project=ALPHA)
+        # Asking for BETA must not hand back ALPHA's updater. There is no
+        # graph here, so rebuilding refuses -- which is the point: the
+        # refusal proves the cached one was rejected rather than returned.
+        registry.ingestor.list_projects.return_value = []
+        with pytest.raises(ValueError):
+            registry._hydrate_reingest_updater(BETA)
+
+    def test_the_cached_updater_is_reused_for_its_own_project(
+        self, tmp_path: Path
+    ) -> None:
+        """The known-positive for the test above.
+
+        Without it, that test would pass just as well against a path that
+        never reuses a cached updater at all.
+
+        Asserted through `_guarded_rename_reingest`, which is where the reuse
+        lives now: `_updater_for_reingest` was deleted under #1783 because its
+        guard read `_graph_incomplete` alone, and a flag-only hydration helper
+        sitting beside the marker-reading one is how that defect returned once
+        already. A retained same-project updater is still reused here -- it is
+        warm, and the guarded callback does its own marking.
+        """
+        registry = self._registry(tmp_path, cached_project=ALPHA)
+        callback = registry._guarded_rename_reingest(ALPHA)
+        assert callback is not None, "fixture guard: expected a callback"
+        assert callback.__closure__ is not None
+        reused = [
+            cell.cell_contents
+            for cell in callback.__closure__
+            if cell.cell_contents is registry._live_updater
+        ]
+        assert reused, (
+            "the guarded callback rebuilt an updater instead of reusing the "
+            "warm one retained for this same project"
+        )
+
+
+# A graph known to be partial must not be READ as if it were whole.
+#
+# `_reingest` has always refused on `_graph_incomplete`, but every read tool
+# dispatched regardless, so after a failed run -- or a rename whose rollback
+# re-ingest failed -- `definition`, `callers`, `resolve` and
+# `query_code_graph` answered from the partial graph. A missing definition
+# is indistinguishable from one that never existed, so the caller cannot
+# tell a restored graph from a complete one (Greptile, PR #1547).
+def _registry_with_incomplete_flag(*, in_process: bool, persisted: bool):
+    from unittest.mock import MagicMock
+
+    from codebase_rag.mcp.tools import MCPToolsRegistry
+
+    handler = MCPToolsRegistry.__new__(MCPToolsRegistry)
+    handler._ingestor_lock = _NullLock()
+    handler.ingestor = MagicMock()
+    handler.ingestor.list_projects = MagicMock(return_value=[ALPHA])
+    handler.project_root = "/repo"
+    handler._graph_incomplete = in_process
+    handler._persisted_incomplete = MagicMock(return_value=persisted)
+    return handler
+
+
+@pytest.mark.asyncio
+async def test_a_read_refuses_while_this_process_knows_the_graph_is_partial() -> None:
+    handler = _registry_with_incomplete_flag(in_process=True, persisted=False)
+    ran = []
+
+    result = await handler._graph_query(cs.MCPToolName.DEFINITION, ALPHA, ran.append)
+
+    assert ran == [], "the query ran against a graph known to be incomplete"
+    assert cs.DICT_KEY_ERROR in result
+    assert ALPHA in result[cs.DICT_KEY_ERROR]
+
+
+@pytest.mark.asyncio
+async def test_a_read_refuses_on_a_marker_left_by_an_EARLIER_process() -> None:
+    # The in-process flag is lost on restart; the durable marker is not.
+    handler = _registry_with_incomplete_flag(in_process=False, persisted=True)
+    ran = []
+
+    result = await handler._graph_query(cs.MCPToolName.CALLERS, ALPHA, ran.append)
+
+    assert ran == []
+    assert cs.DICT_KEY_ERROR in result
+
+
+@pytest.mark.asyncio
+async def test_a_read_runs_normally_when_the_graph_is_whole() -> None:
+    # The control: without it, a guard that refused EVERYTHING would pass
+    # both tests above.
+    handler = _registry_with_incomplete_flag(in_process=False, persisted=False)
+    ran = []
+
+    result = await handler._graph_query(
+        cs.MCPToolName.DEFINITION, ALPHA, lambda name: ran.append(name) or {"ok": True}
+    )
+
+    assert ran == [ALPHA]
+    assert result == {"ok": True}
+
+
+@pytest.mark.asyncio
+async def test_the_incomplete_guard_does_not_intercept_a_WRITE() -> None:
+    # `rename` shares `_graph_query` for the ingestor lock but is a write:
+    # guarding it too replaced its own refusal payload (carrying `ambiguous`
+    # and `unlocatable`) with a generic error, breaking three rename tests.
+    # The guard is keyed on an explicit read-tool set for exactly this reason.
+    handler = _registry_with_incomplete_flag(in_process=True, persisted=True)
+    ran = []
+
+    result = await handler._graph_query(
+        cs.MCPToolName.RENAME, ALPHA, lambda name: ran.append(name) or {"applied": True}
+    )
+
+    assert ran == [ALPHA], "the write was refused by the read guard"
+    assert result == {"applied": True}
+
+
+@pytest.mark.asyncio
+async def test_query_code_graph_refuses_on_an_incomplete_graph() -> None:
+    # It does NOT route through `_graph_query` -- it binds a per-request
+    # query tool -- so it needs the check of its own. Without it the guard
+    # covered eight tools while the commit claimed nine (greptile-local,
+    # PR #1547): the freeform query still returned rows from a partial graph.
+    from unittest.mock import AsyncMock, MagicMock
+
+    from codebase_rag.mcp.tools import MCPToolsRegistry
+
+    handler = MCPToolsRegistry.__new__(MCPToolsRegistry)
+    handler._ingestor_lock = _NullLock()
+    handler.ingestor = MagicMock()
+    handler.ingestor.list_projects = MagicMock(return_value=[ALPHA])
+    handler.project_root = "/repo"
+    handler._graph_incomplete = True
+    handler._persisted_incomplete = MagicMock(return_value=True)
+    handler._query_tool = MagicMock()
+    handler._query_tool.function = AsyncMock()
+    # The guard now runs INSIDE the read's lock, i.e. after the per-request
+    # tool is built, so the fixture needs what that construction touches.
+    handler.cypher_gen = MagicMock()
+    handler._stderr_console = MagicMock()
+
+    result = await handler.query_code_graph("anything", project=ALPHA)
+
+    # The tool is never reached: `query_code_graph` swallows exceptions into
+    # an error payload, so a raising double would look like a pass. Assert
+    # the call did not happen instead.
+    handler._query_tool.function.assert_not_awaited()
+    assert result[cs.DICT_KEY_RESULTS] == []
+    assert ALPHA in result[cs.MCP_KEY_ERROR]
+
+
+@pytest.mark.asyncio
+async def test_query_code_graph_runs_when_the_graph_is_whole() -> None:
+    # The control: without it a guard that refused unconditionally would
+    # pass the test above.
+    from unittest.mock import AsyncMock, MagicMock
+
+    from codebase_rag.mcp.tools import MCPToolsRegistry
+
+    handler = MCPToolsRegistry.__new__(MCPToolsRegistry)
+    handler._ingestor_lock = _NullLock()
+    handler.ingestor = MagicMock()
+    handler.ingestor.list_projects = MagicMock(return_value=[ALPHA])
+    handler.project_root = "/repo"
+    handler._graph_incomplete = False
+    handler._persisted_incomplete = MagicMock(return_value=False)
+    handler._query_tool = MagicMock()
+    handler._query_tool.function = AsyncMock(
+        return_value=_GraphData(error=None, results=[{"qualified_name": "m.f"}])
+    )
+
+    result = await handler.query_code_graph("anything")
+
+    handler._query_tool.function.assert_awaited_once_with("anything")
+    assert result[cs.DICT_KEY_RESULTS] == [{"qualified_name": "m.f"}]
+
+
+class _GraphData:
+    """The minimal shape `query_code_graph` consumes: `.model_dump()` + `.error`."""
+
+    def __init__(self, error: str | None, results: list[dict]) -> None:
+        self.error = error
+        self._results = results
+
+    def model_dump(self) -> dict:
+        return {
+            "error": self.error,
+            "query_used": "MATCH (n) RETURN n",
+            "results": self._results,
+            "summary": "",
+        }
+
+
+def test_a_failed_rollback_reingest_is_marked_DURABLY() -> None:
+    # The in-process flag dies with the process; the half-restored graph does
+    # not. Without a durable marker a fresh registry sees a project that looks
+    # whole and serves reads from it (Greptile, PR #1547).
+    from unittest.mock import MagicMock, patch
+
+    from codebase_rag.mcp.tools import MCPToolsRegistry
+
+    handler = MCPToolsRegistry.__new__(MCPToolsRegistry)
+    handler.ingestor = MagicMock()
+    # Not indexed here, so `_run_rename` passes reingest=None and does not
+    # build an updater: this test is about what happens AFTER the report
+    # comes back saying the rollback's re-ingest failed.
+    handler.ingestor.list_projects = MagicMock(return_value=[])
+    handler.project_root = "/repo"
+    handler._live_updater = None
+    handler._graph_incomplete = False
+    handler._persist_incomplete = MagicMock(return_value=True)
+
+    report = MagicMock()
+    report.graph_incomplete = True
+    report.verdict = None
+    report.sites = []
+    report.ambiguous = []
+    report._asdict = MagicMock(return_value={"applied": True})
+
+    with (
+        patch("codebase_rag.graph_query.source_root_for", return_value=Path("/repo")),
+        patch("codebase_rag.editing.rename.rename", return_value=report),
+        patch("codebase_rag.editing.rename.sites_for", return_value=[]),
+    ):
+        payload = handler._run_rename(ALPHA, "p.m.f", "g", False, False)
+
+    # Durable, not merely in-process: this is the whole point of the finding.
+    handler._persist_incomplete.assert_called_once()
+    assert handler._persist_incomplete.call_args.args[0] == ALPHA
+    assert handler._persist_incomplete.call_args.args[1] is True
+    assert handler._persist_incomplete.call_args.kwargs["writing"] is True
+    assert handler._graph_incomplete is True
+    assert isinstance(payload, dict)
+
+
+def test_a_marker_that_cannot_be_written_is_REPORTED() -> None:
+    # Graph partial AND unrecordable: the caller must be told, because a
+    # restarted process cannot infer it.
+    from unittest.mock import MagicMock, patch
+
+    from codebase_rag.mcp.tools import MCPToolsRegistry
+
+    handler = MCPToolsRegistry.__new__(MCPToolsRegistry)
+    handler.ingestor = MagicMock()
+    # Not indexed here, so `_run_rename` passes reingest=None and does not
+    # build an updater: this test is about what happens AFTER the report
+    # comes back saying the rollback's re-ingest failed.
+    handler.ingestor.list_projects = MagicMock(return_value=[])
+    handler.project_root = "/repo"
+    handler._live_updater = None
+    handler._graph_incomplete = False
+    handler._persist_incomplete = MagicMock(return_value=False)
+
+    report = MagicMock()
+    report.graph_incomplete = True
+    report.verdict = None
+    report.sites = []
+    report.ambiguous = []
+    report._asdict = MagicMock(return_value={"applied": True})
+
+    with (
+        patch("codebase_rag.graph_query.source_root_for", return_value=Path("/repo")),
+        patch("codebase_rag.editing.rename.rename", return_value=report),
+        patch("codebase_rag.editing.rename.sites_for", return_value=[]),
+    ):
+        payload = handler._run_rename(ALPHA, "p.m.f", "g", False, False)
+
+    assert cs.DICT_KEY_ERROR in payload
+    assert ALPHA in payload[cs.DICT_KEY_ERROR]
+
+
+def test_a_clean_rename_marks_NOTHING() -> None:
+    # The control: without it a fix that always marked would pass both above.
+    from unittest.mock import MagicMock, patch
+
+    from codebase_rag.mcp.tools import MCPToolsRegistry
+
+    handler = MCPToolsRegistry.__new__(MCPToolsRegistry)
+    handler.ingestor = MagicMock()
+    # Not indexed here, so `_run_rename` passes reingest=None and does not
+    # build an updater: this test is about what happens AFTER the report
+    # comes back saying the rollback's re-ingest failed.
+    handler.ingestor.list_projects = MagicMock(return_value=[])
+    handler.project_root = "/repo"
+    handler._live_updater = None
+    handler._graph_incomplete = False
+    handler._persist_incomplete = MagicMock(return_value=True)
+
+    report = MagicMock()
+    report.graph_incomplete = False
+    report.verdict = None
+    report.sites = []
+    report.ambiguous = []
+    report._asdict = MagicMock(return_value={"applied": True})
+
+    with (
+        patch("codebase_rag.graph_query.source_root_for", return_value=Path("/repo")),
+        patch("codebase_rag.editing.rename.rename", return_value=report),
+        patch("codebase_rag.editing.rename.sites_for", return_value=[]),
+    ):
+        payload = handler._run_rename(ALPHA, "p.m.f", "g", False, False)
+
+    handler._persist_incomplete.assert_not_called()
+    assert handler._graph_incomplete is False
+    assert cs.DICT_KEY_ERROR not in payload
+
+
+def test_every_graph_reader_is_guarded() -> None:
+    """A tool that reads the graph must refuse while the graph is partial.
+
+    The point is the FAILURE MODE, not today's list. An explicit inventory of
+    guarded readers fails open: seven readers went unguarded from the day the
+    refusal was written because nobody added them to it (PR #1547). Here a
+    new `MCPToolName` counts as a reader by default, so this test fails until
+    it is either routed through `_graph_query`, calls `_incomplete_refusal`
+    itself, or is named a non-reader deliberately.
+    """
+    import ast
+    import inspect
+
+    from codebase_rag.mcp import tools as mcp_tools
+
+    # AST, not a substring search. Every tool also names itself in its
+    # `_tools[...]` registration, so `"cs.MCPToolName.X" in source` is true
+    # for all of them and the check could never fail -- verified by removing
+    # a guard and watching it still pass.
+    tree = ast.parse(inspect.getsource(mcp_tools))
+    refused: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        name = func.attr if isinstance(func, ast.Attribute) else None
+        if name != "_incomplete_refusal":
+            # `asyncio.to_thread(self._incomplete_refusal, project, TOOL)`
+            # passes it as an argument rather than calling it directly.
+            passed = any(
+                isinstance(a, ast.Attribute) and a.attr == "_incomplete_refusal"
+                for a in node.args
+            )
+            if not passed:
+                continue
+        for arg in node.args:
+            if isinstance(arg, ast.Attribute) and isinstance(arg.value, ast.Attribute):
+                if arg.value.attr == "MCPToolName":
+                    refused.add(arg.attr)
+
+    unguarded = []
+    for tool in mcp_tools._GRAPH_READING_TOOLS:
+        if tool in mcp_tools._READS_THE_GRAPH:
+            continue  # guarded by the `_graph_query` dispatcher
+        if tool.name not in refused:
+            unguarded.append(tool.value)
+    assert not unguarded, (
+        f"these tools read the graph but never refuse on a partial one: "
+        f"{sorted(unguarded)}. Guard them, or add them to _NOT_GRAPH_READERS."
+    )
+
+
+def test_the_reader_inventory_covers_every_tool() -> None:
+    # Neither set may drift from the enum: a member in neither would be
+    # silently skipped by the test above.
+    from codebase_rag.mcp import tools as mcp_tools
+
+    covered = mcp_tools._GRAPH_READING_TOOLS | mcp_tools._NOT_GRAPH_READERS
+    assert covered == frozenset(cs.MCPToolName)
+    assert not (mcp_tools._GRAPH_READING_TOOLS & mcp_tools._NOT_GRAPH_READERS)
+
+
+# A store OUTAGE is not an incomplete graph.
+#
+# `_persisted_incomplete` answers True when it cannot reach the store, which
+# is right for a reingest (never start on an unknown state) and wrong for a
+# read: it reported every outage as "graph incomplete" and buried the real
+# error. Reads go through `_marker_says_incomplete`, which treats an
+# unreachable store as no verdict. `test_mcp_errors_are_reported_not_raised`
+# in test_graph_query.py pins this for the `_graph_query` dispatcher; these
+# seven bypass that dispatcher, so the covered path is not the broken one
+# (M1 CGR-3, PR #1547).
+def _registry_with_a_dead_store():
+    from unittest.mock import MagicMock
+
+    from codebase_rag.mcp.tools import MCPToolsRegistry
+
+    handler = MCPToolsRegistry.__new__(MCPToolsRegistry)
+    handler._ingestor_lock = _NullLock()
+    handler.ingestor = MagicMock()
+    handler.ingestor.fetch_all = MagicMock(side_effect=RuntimeError("store is down"))
+    handler.ingestor.list_projects = MagicMock(return_value=[ALPHA])
+    handler.project_root = "/repo"
+    handler._graph_incomplete = False
+    return handler
+
+
+def test_a_dead_store_is_not_reported_as_an_incomplete_graph() -> None:
+    handler = _registry_with_a_dead_store()
+
+    # The decision the seven share. False means "no verdict, carry on and let
+    # the read fail as itself" -- NOT "the graph is fine".
+    assert handler._marker_says_incomplete(ALPHA) is False
+    assert (
+        handler._incomplete_refusal(ALPHA, cs.MCPToolName.GET_FUNCTION_SOURCE) is None
+    )
+
+
+def test_the_reingest_default_still_refuses_on_a_dead_store() -> None:
+    # The asymmetry is the point: same store, opposite answer, because a
+    # write that starts on an unknown graph cannot be undone.
+    handler = _registry_with_a_dead_store()
+
+    assert handler._persisted_incomplete(ALPHA) is True
+
+
+# One project's damage must not make every other project unreadable, and a
+# healthy project's recovery must not clear the damaged one's warning
+# (Greptile, PR #1547).
+def _registry_incomplete_for(project: str | None):
+    from unittest.mock import MagicMock
+
+    from codebase_rag.mcp.tools import MCPToolsRegistry
+
+    handler = MCPToolsRegistry.__new__(MCPToolsRegistry)
+    handler._ingestor_lock = _NullLock()
+    handler.ingestor = MagicMock()
+    handler.ingestor.fetch_all = MagicMock(return_value=[])
+    handler.project_root = "/repo"
+    handler._graph_incomplete = True
+    handler._incomplete_project = project
+    handler._persisted_incomplete = MagicMock(return_value=False)
+    return handler
+
+
+def test_one_projects_damage_does_not_block_another() -> None:
+    handler = _registry_incomplete_for(ALPHA)
+
+    assert handler._incomplete_refusal(ALPHA, cs.MCPToolName.DEFINITION) is not None
+    assert handler._incomplete_refusal(BETA, cs.MCPToolName.DEFINITION) is None
+
+
+def test_unattributed_damage_still_blocks_everything() -> None:
+    # A wipe spans every project, and a failure before the name is known
+    # could have touched anything: None must refuse for all.
+    handler = _registry_incomplete_for(None)
+
+    assert handler._incomplete_refusal(ALPHA, cs.MCPToolName.DEFINITION) is not None
+    assert handler._incomplete_refusal(BETA, cs.MCPToolName.DEFINITION) is not None
+
+
+@pytest.mark.asyncio
+async def test_graph_query_refuses_only_the_DAMAGED_project() -> None:
+    # `_graph_query` read the bare registry flag while the direct readers
+    # used the project-scoped helper, so project A's failed recovery blocked
+    # a read explicitly scoped to healthy project B (Greptile, PR #1547).
+    from unittest.mock import MagicMock
+
+    from codebase_rag.mcp.tools import MCPToolsRegistry
+
+    handler = MCPToolsRegistry.__new__(MCPToolsRegistry)
+    handler._ingestor_lock = _NullLock()
+    handler.ingestor = MagicMock()
+    handler.ingestor.fetch_all = MagicMock(return_value=[])
+    handler.ingestor.list_projects = MagicMock(return_value=[ALPHA, BETA])
+    handler.project_root = "/repo"
+    handler._graph_incomplete = True
+    handler._incomplete_project = ALPHA
+    handler._persisted_incomplete = MagicMock(return_value=False)
+
+    ran: list[str] = []
+    damaged = await handler._graph_query(cs.MCPToolName.DEFINITION, ALPHA, ran.append)
+    healthy = await handler._graph_query(
+        cs.MCPToolName.DEFINITION, BETA, lambda n: ran.append(n) or {"ok": True}
+    )
+
+    assert cs.DICT_KEY_ERROR in damaged
+    assert healthy == {"ok": True}, "a healthy project was refused"
+    assert ran == [BETA]
+
+
+def test_every_guard_sits_inside_its_lock() -> None:
+    """A guard evaluated before the lock decides on a graph it has not pinned.
+
+    An index or update can acquire the lock, mark the graph incomplete and
+    release it between the check and the read, after which the approved read
+    runs against the partial graph. I fixed four readers this way and missed
+    three, and reported the race closed (Greptile, PR #1547) -- so this is
+    structural rather than a test per reader.
+    """
+    import ast
+    import inspect
+
+    from codebase_rag.mcp import tools as mcp_tools
+
+    tree = ast.parse(inspect.getsource(mcp_tools))
+    offenders: list[str] = []
+
+    def guard_lines(node: ast.AST) -> list[int]:
+        found = []
+        for n in ast.walk(node):
+            if isinstance(n, ast.Call):
+                names = [
+                    a.attr for a in [n.func, *n.args] if isinstance(a, ast.Attribute)
+                ]
+                if "_incomplete_refusal" in names:
+                    found.append(n.lineno)
+        return found
+
+    for fn in ast.walk(tree):
+        if not isinstance(fn, ast.AsyncFunctionDef):
+            continue
+        guards = guard_lines(fn)
+        if not guards:
+            continue
+        locks = [
+            n.lineno
+            for n in ast.walk(fn)
+            if isinstance(n, ast.AsyncWith) and "_ingestor_lock" in ast.dump(n)
+        ]
+        if not locks:
+            continue  # no lock in this handler at all
+        # Every guard must come after the lock statement that encloses it.
+        if min(guards) < min(locks):
+            offenders.append(
+                f"{fn.name} (guard line {min(guards)} < lock {min(locks)})"
+            )
+
+    assert not offenders, (
+        "these handlers decide before pinning the graph: "
+        + ", ".join(sorted(offenders))
+    )
+
+
+# A successful clear for ONE project must not speak for another, and a
+# project-scoped latch must not block an unrelated project's recovery
+# (Greptile, PR #1547).
+def _registry_for_marker_clear(cleared: bool):
+    from unittest.mock import MagicMock
+
+    from codebase_rag.mcp.tools import MCPToolsRegistry
+
+    handler = MCPToolsRegistry.__new__(MCPToolsRegistry)
+    handler._ingestor_lock = _NullLock()
+    handler.ingestor = MagicMock()
+    handler.ingestor.fetch_all = MagicMock(return_value=[])
+    handler.project_root = "/repo"
+    handler._graph_incomplete = False
+    handler._incomplete_project = None
+    handler._flag_from_failed_clear = None
+    handler._persist_incomplete = MagicMock(return_value=cleared)
+    # Healthy on disk: the in-process flag is the only thing in play.
+    handler._persisted_incomplete = MagicMock(return_value=False)
+    return handler
+
+
+def test_clearing_one_project_keeps_anothers_warning() -> None:
+    """ALPHA is partial in-process only; clearing healthy BETA must not heal it.
+
+    The damaging failure could not write ALPHA's durable marker, so the
+    in-process flag is the ONLY record that ALPHA is partial. A blanket
+    reset on BETA's success discards it and lets reads onto ALPHA's
+    partial graph.
+    """
+    handler = _registry_for_marker_clear(cleared=True)
+    handler._graph_incomplete = True
+    handler._incomplete_project = ALPHA
+
+    assert handler._require_marker_cleared(BETA) is None
+
+    assert handler._graph_incomplete is True, "BETA's clear healed ALPHA's flag"
+    assert handler._incomplete_project == ALPHA
+    assert handler._incomplete_refusal(ALPHA, cs.MCPToolName.DEFINITION) is not None
+
+
+def test_clearing_a_project_still_heals_its_own_warning() -> None:
+    """The control: a clear for the project the flag is ABOUT must heal it.
+
+    Without this, scoping the reset could be implemented as "never reset",
+    which passes the test above and breaks recovery entirely.
+    """
+    handler = _registry_for_marker_clear(cleared=True)
+    handler._graph_incomplete = True
+    handler._incomplete_project = ALPHA
+
+    assert handler._require_marker_cleared(ALPHA) is None
+
+    assert handler._graph_incomplete is False
+    assert handler._incomplete_project is None
+    assert handler._incomplete_refusal(ALPHA, cs.MCPToolName.DEFINITION) is None
+
+
+def test_clearing_a_project_still_heals_unattributed_damage() -> None:
+    """An unattributed flag is owned by nobody, so any clear may settle it.
+
+    This is the pre-existing behaviour for the common single-project case,
+    where the flag is set with no name and cleared by the run that earned it.
+    """
+    handler = _registry_for_marker_clear(cleared=True)
+    handler._graph_incomplete = True
+    handler._incomplete_project = None
+
+    assert handler._require_marker_cleared(ALPHA) is None
+
+    assert handler._graph_incomplete is False
+    assert handler._incomplete_project is None
+
+
+def test_two_damaged_projects_block_either_projects_clear() -> None:
+    """The two-named-projects route into the broad unattributed state.
+
+    `_invalidate_graph_for` widens the attribution to None when a SECOND,
+    different project is damaged. That None means "more than one project is
+    partial", and neither project's successful clear may retire it.
+
+    Distinct from the failed-wipe route asserted in
+    `test_a_successful_clear_cannot_settle_a_widened_flag`: both end at
+    `_incomplete_project is None`, and mutating this widening was invisible
+    to every other test in the suite. Both directions are checked below,
+    because a guard reading the flag for ALPHA and not for BETA would be
+    satisfied by testing only one.
+    """
+    for clearing in (ALPHA, BETA):
+        handler = _registry_for_marker_clear(cleared=True)
+        handler._invalidate_graph_for(ALPHA)
+        handler._invalidate_graph_for(BETA)
+
+        assert handler._incomplete_project is None, (
+            "fixture guard: two different damaged projects must widen the "
+            "attribution to None, or the clear takes the attributed branch "
+            "and this proves nothing"
+        )
+
+        assert handler._require_marker_cleared(clearing) is None
+
+        assert handler._graph_incomplete is True, (
+            f"{clearing} cleared its own marker and settled a flag that "
+            "records damage to two projects"
+        )
+
+
+def test_repairing_every_damaged_project_lifts_the_refusal() -> None:
+    """The mirror-image bug: a refusal with no way out.
+
+    The first version of this guard was a BOOLEAN saying "the damage spans
+    projects". Nothing could ever lower it -- no sequence of successful
+    repairs retires a flag that counts nothing -- so once two projects were
+    damaged, every project was refused for the life of the process, including
+    projects never damaged at all, with `wipe_database` the only escape.
+
+    That is worse than the leak it fixed: a leak lets a stale read through,
+    this makes the server useless until restarted. Recording WHICH projects
+    are outstanding is what makes the flag retirable.
+
+    Asserted through the refusal rather than the field, and on a project that
+    was never damaged as well as the two that were: an over-broad latch
+    refuses GAMMA too, and only a behavioural assertion notices.
+    """
+    handler = _registry_for_marker_clear(cleared=True)
+    handler._invalidate_graph_for(ALPHA)
+    handler._invalidate_graph_for(BETA)
+
+    def refused(project: str) -> bool:
+        return (
+            handler._incomplete_refusal(project, cs.MCPToolName.ASK_AGENT) is not None
+        )
+
+    # One assertion per project: a composite reports "some project did not
+    # refuse" and leaves the reader to find which, and WHICH is the whole
+    # diagnosis here -- a damaged project not refusing is a different bug
+    # from an undamaged one not refusing (SonarCloud S9073).
+    assert refused(ALPHA), (
+        "fixture guard: a damaged project must refuse before the repair below"
+    )
+    assert refused(BETA), "fixture guard: the second damaged project must refuse too"
+    assert refused("gamma"), (
+        "fixture guard: an unattributed flag must block a project it does not "
+        "name, or the widening is not in the broad state this test needs"
+    )
+
+    handler._require_marker_cleared(ALPHA)
+    assert refused(BETA), (
+        "repairing one of two damaged projects lifted the other's refusal"
+    )
+
+    handler._require_marker_cleared(BETA)
+
+    assert not refused(ALPHA), (
+        "the first damaged project was repaired and its reads are still "
+        "refused; nothing short of a full wipe can clear this"
+    )
+    assert not refused(BETA), (
+        "the last damaged project was repaired and its reads are still "
+        "refused, so the outstanding set never empties"
+    )
+    assert not refused("gamma"), (
+        "a project that was never damaged is still refused after every "
+        "damaged project was repaired"
+    )
+
+
+def test_a_third_damaged_project_is_recorded_like_the_first_two() -> None:
+    """The route into the broad state that recorded nothing.
+
+    `_invalidate_graph_for` notes BOTH names when the attribution widens, but
+    a THIRD project damaged afterwards takes the "already unattributed, keep
+    it" branch -- correct about the attribution, and silent about the fact
+    that another project is now outstanding.
+
+    So A, B and C damaged, then A and B repaired, and the set empties while C
+    is still partial: C's reads reopen onto a graph nothing ever finished
+    (Greptile, PR #1547). Two damaged projects was the case I tested and
+    three is the case that was broken, which is the whole lesson.
+    """
+    handler = _registry_for_marker_clear(cleared=True)
+    for project in (ALPHA, BETA, GAMMA):
+        handler._invalidate_graph_for(project)
+
+    def refused(project: str) -> bool:
+        return (
+            handler._incomplete_refusal(project, cs.MCPToolName.ASK_AGENT) is not None
+        )
+
+    assert refused(GAMMA), "fixture guard: three damaged projects must all refuse"
+
+    handler._require_marker_cleared(ALPHA)
+    handler._require_marker_cleared(BETA)
+
+    assert refused(GAMMA), (
+        "repairing two of three damaged projects settled the flag, so the "
+        "third project's reads reopened while it is still partial"
+    )
+
+    handler._require_marker_cleared(GAMMA)
+    assert not refused(GAMMA), (
+        "the last outstanding project was repaired and the flag still stands"
+    )
+
+
+def test_damage_under_an_unbounded_flag_stays_unbounded() -> None:
+    """The control on the guard the third-project fix needed.
+
+    A project damaged while a FAILED WIPE's flag is up must not create a
+    named outstanding set: that would make the wipe look settleable by
+    enumerating repairs, when it spans projects this process has never seen.
+    The fix for the third-project case is guarded on the set being non-empty
+    for exactly this reason.
+
+    Measured caveat: removing that guard leaves this test GREEN, because the
+    settle branch checks `_incomplete_unbounded` independently and refuses
+    first. So the guard is defence in depth rather than the load-bearing
+    protection, and this test pins the BEHAVIOUR (a wipe is never settled by
+    repairing one named project) rather than the guard. Do not read its
+    greenness as evidence that the guard is doing work -- the assertion holds
+    either way, and it is the settle branch that earns it.
+    """
+    handler = _registry_for_marker_clear(cleared=True)
+    handler._graph_incomplete = True
+    handler._incomplete_project = None
+    handler._incomplete_unbounded = True
+
+    handler._invalidate_graph_for(ALPHA)
+    handler._require_marker_cleared(ALPHA)
+
+    assert handler._graph_incomplete is True, (
+        "a project damaged under a failed wipe's flag turned it into a "
+        "settleable named set, so repairing that one project retired damage "
+        "spanning every project"
+    )
+
+
+def test_a_failed_wipe_is_not_settled_by_repairing_named_projects() -> None:
+    """The unbounded case, which a set cannot enumerate.
+
+    A half-done wipe damages every project at once, including ones this
+    process has never named, so there is no set of repairs that proves the
+    graph whole. Only a completed wipe retires it.
+
+    Without this the outstanding set is empty after a failed wipe, and the
+    first successful clear by any project would settle a flag that records
+    damage to all of them -- the original bug, reached from the one route
+    that cannot be counted.
+    """
+    handler = _registry_for_marker_clear(cleared=True)
+    handler._graph_incomplete = True
+    handler._incomplete_project = None
+    handler._incomplete_unbounded = True
+
+    handler._require_marker_cleared(ALPHA)
+
+    assert handler._graph_incomplete is True, (
+        "a named project's successful clear settled a failed wipe's flag, "
+        "which records damage to every project including unnamed ones"
+    )
+
+
+def test_a_completed_wipe_does_settle_damage_spanning_projects() -> None:
+    """The over-correction control for the whole spans-projects mechanism.
+
+    A wipe rebuilds every project, so it is the one operation entitled to
+    retire a flag covering all of them. Without this, "never settle a
+    spanning flag" latches the refusal for the life of the process and the
+    only escape hatch is gone -- the mirror-image bug, and the one that
+    survives a suite full of tests asserting refusals.
+    """
+    handler = _registry_for_marker_clear(cleared=True)
+    handler._invalidate_graph_for(ALPHA)
+    handler._invalidate_graph_for(BETA)
+    assert handler._incomplete_projects == {ALPHA, BETA}, (
+        "fixture guard: both damaged projects must be outstanding before the "
+        "wipe, or the wipe has nothing to retire and this proves nothing"
+    )
+
+    # Drive the REAL wipe. Resetting the three fields by hand here would
+    # assert nothing about the production reset: the test would pass with the
+    # reset line deleted, which is how this started out (measured).
+    import asyncio
+
+    asyncio.run(handler.wipe_database(confirm=True))
+
+    assert handler._graph_incomplete is False, (
+        "a completed wipe left the graph flagged incomplete, so no project "
+        "can ever read again"
+    )
+    assert not handler._incomplete_projects, (
+        "the wipe cleared the flag but left named projects outstanding, so "
+        "the next damaged project inherits a refusal no damage explains"
+    )
+    assert not handler._incomplete_unbounded, (
+        "the wipe cleared the flag but left the unbounded marker set, so no "
+        "sequence of repairs can ever settle the graph again"
+    )
+
+
+def test_a_recovered_marker_cannot_retire_a_flag_spanning_projects() -> None:
+    """`_hydrate_reingest_updater`, the third reader, on the same trap.
+
+    A stranded marker that this project later recovers lifts the flag its
+    own failed clear raised. But if a SECOND project was damaged in between,
+    the flag no longer describes only this project's stranded marker, and
+    recovering the marker is evidence about one project rather than two.
+
+    The route into the state matters: the flag must be spanning at the
+    moment of recovery, with `_flag_from_failed_clear` still naming this
+    project, or the guard is never reached and the test is vacuous.
+    """
+    handler = _registry_for_marker_clear(cleared=False)
+
+    # ALPHA's clear fails, stranding a marker it is licensed to recover.
+    assert handler._require_marker_cleared(ALPHA) is not None
+    assert handler._flag_from_failed_clear == ALPHA, (
+        "fixture guard: ALPHA must hold the recovery licence, or the guard "
+        "under test is never reached"
+    )
+
+    # BETA is damaged too, so the flag now spans both.
+    handler._invalidate_graph_for(BETA)
+    handler._flag_from_failed_clear = ALPHA
+    assert handler._incomplete_projects == {ALPHA, BETA}, (
+        "fixture guard: both projects must be outstanding before the recovery"
+    )
+
+    handler._live_updater = None
+    # The refusal is the wanted outcome, and it is stronger evidence than a
+    # state read: it can only be raised from the state under test, so it
+    # cannot be produced by a fixture that never reached the guard.
+    with pytest.raises(ValueError, match="incomplete"):
+        handler._hydrate_reingest_updater(ALPHA)
+
+    assert handler._graph_incomplete is True, (
+        "ALPHA recovering its own stranded marker retired a flag that also "
+        "records BETA's damage"
+    )
+
+
+def test_a_rollback_widening_is_recorded_like_any_other() -> None:
+    """`_abandon_before_writing` widens to None too, and must say so.
+
+    It reaches the broad unattributed state by the same reasoning as
+    `_invalidate_graph_for` -- an owner already in place naming a different
+    project cannot be replaced, so the pair becomes None. Recording it there
+    and not here would leave one route into the state indistinguishable from
+    a never-attributed flag, which is the original bug with a different
+    entry point.
+    """
+    handler = _registry_for_marker_clear(cleared=False)
+    handler._graph_incomplete = True
+    handler._incomplete_project = ALPHA
+    handler._flag_from_failed_clear = None
+
+    handler._abandon_before_writing(BETA)
+
+    assert handler._incomplete_project is None, (
+        "fixture guard: an abandon naming a different project, over a flag "
+        "already owned by ALPHA, must widen the attribution to None"
+    )
+    assert handler._incomplete_projects == {ALPHA, BETA}, (
+        "the rollback widened the attribution without recording WHICH "
+        "projects are outstanding, so the next successful clear settles it"
+    )
+
+
+def test_a_failed_clear_from_clean_attributes_the_flag_to_itself() -> None:
+    """A stuck marker on an otherwise clean registry is this project's to own.
+
+    Nothing else has claimed the flag, so the refusal and the
+    `_flag_from_failed_clear` recovery are both about the project whose
+    marker is actually stuck.
+    """
+    handler = _registry_for_marker_clear(cleared=False)
+
+    assert handler._require_marker_cleared(BETA) is not None
+
+    assert handler._graph_incomplete is True
+    assert handler._incomplete_project == BETA
+    assert handler._flag_from_failed_clear == BETA
+
+
+def test_a_failed_clear_does_not_steal_an_earlier_owners_flag() -> None:
+    """A flag already up records damage this run did not cause.
+
+    Claiming it would let BETA's recoverable marker lift the refusal ALPHA
+    earned: `_hydrate_reingest_updater` heals a flag whose
+    `_flag_from_failed_clear` names the project being re-ingested, so
+    attributing ALPHA's flag to BETA hands BETA the licence to clear it.
+    `_abandon_before_writing` already takes exactly this care.
+    """
+    handler = _registry_for_marker_clear(cleared=False)
+    handler._graph_incomplete = True
+    handler._incomplete_project = ALPHA
+    handler._flag_from_failed_clear = None
+
+    assert handler._require_marker_cleared(BETA) is not None
+
+    assert handler._graph_incomplete is True
+    assert handler._incomplete_project == ALPHA, "BETA stole ALPHA's attribution"
+    assert handler._flag_from_failed_clear is None, "BETA gained a licence to heal"
+
+
+def _registry_for_hydration(incomplete_project: str | None):
+    from unittest.mock import MagicMock
+
+    from codebase_rag.mcp.tools import MCPToolsRegistry
+
+    handler = MCPToolsRegistry.__new__(MCPToolsRegistry)
+    handler._ingestor_lock = _NullLock()
+    handler.ingestor = MagicMock()
+    handler.ingestor.list_projects = MagicMock(return_value=[ALPHA, BETA])
+    handler.project_root = "/repo"
+    handler._live_updater = None
+    handler._graph_incomplete = True
+    handler._incomplete_project = incomplete_project
+    handler._flag_from_failed_clear = None
+    # Healthy on disk for whichever project is asked: the in-process latch
+    # is the only thing that could refuse.
+    handler._persisted_incomplete = MagicMock(return_value=False)
+    return handler
+
+
+def test_one_projects_damage_does_not_block_anothers_reingest() -> None:
+    """ALPHA's latch must not stop BETA re-ingesting its own healthy graph.
+
+    Refusing here is not a safe default: a scoped re-ingest is how a
+    project recovers, so blocking BETA on ALPHA's damage removes BETA's
+    only route back to a complete graph.
+    """
+    handler = _registry_for_hydration(ALPHA)
+
+    with pytest.raises(ValueError) as damaged:
+        handler._hydrate_reingest_updater(ALPHA)
+    assert ALPHA in str(damaged.value)
+
+    # BETA must get past the incomplete-graph guard. It stops at the next
+    # one only because this fake has no parsers to build an updater with;
+    # what matters is WHICH refusal it earns.
+    try:
+        handler._hydrate_reingest_updater(BETA)
+    except ValueError as exc:
+        assert cs.MCP_REINGEST_AFTER_FAILED_RUN.format(project=BETA) != str(exc), (
+            "healthy BETA was refused for ALPHA's damage"
+        )
+    except Exception:
+        pass
+
+
+def test_unattributed_damage_still_blocks_every_reingest() -> None:
+    """The control: a wipe-shaped failure names no project and blocks all."""
+    handler = _registry_for_hydration(None)
+
+    for project in (ALPHA, BETA):
+        with pytest.raises(ValueError) as refused:
+            handler._hydrate_reingest_updater(project)
+        assert cs.MCP_REINGEST_AFTER_FAILED_RUN.format(project=project) == str(
+            refused.value
+        )
+
+
+def test_the_cached_path_also_scopes_the_latch() -> None:
+    """The hydration path carries the same latch scoping as the read guard."""
+    handler = _registry_for_hydration(ALPHA)
+
+    with pytest.raises(ValueError) as damaged:
+        handler._hydrate_reingest_updater(ALPHA)
+    assert cs.MCP_REINGEST_AFTER_FAILED_RUN.format(project=ALPHA) == str(damaged.value)
+
+    try:
+        handler._hydrate_reingest_updater(BETA)
+    except ValueError as exc:
+        assert cs.MCP_REINGEST_AFTER_FAILED_RUN.format(project=BETA) != str(exc), (
+            "healthy BETA was refused for ALPHA's damage"
+        )
+    except Exception:
+        pass
+
+
+# The attribution field holds ONE project, so it can only ever narrow to a
+# name when nothing broader already owns the flag (Greptile, PR #1547).
+def _registry_for_invalidation(flagged: bool, owner: str | None):
+    from unittest.mock import MagicMock
+
+    from codebase_rag.mcp.tools import MCPToolsRegistry
+
+    handler = MCPToolsRegistry.__new__(MCPToolsRegistry)
+    handler.ingestor = MagicMock()
+    handler._graph_incomplete = flagged
+    handler._incomplete_project = owner
+    handler._flag_from_failed_clear = None
+    return handler
+
+
+def test_a_named_failure_does_not_narrow_a_wipes_unattributed_flag() -> None:
+    """A wipe spans every project; naming one would declare the rest healthy.
+
+    This is what the reingest and read guards now key off, so overwriting
+    the `None` lets a scoped reingest run over the half-wiped graph the
+    wipe left behind.
+    """
+    handler = _registry_for_invalidation(flagged=True, owner=None)
+
+    handler._invalidate_graph_for(ALPHA)
+
+    assert handler._graph_incomplete is True
+    assert handler._incomplete_project is None, "a wipe's flag was narrowed"
+
+
+def test_a_second_damaged_project_widens_to_unattributed() -> None:
+    """Two damaged projects cannot both be named in a one-project field.
+
+    Keeping ALPHA would declare BETA healthy and replacing it would declare
+    ALPHA healthy, so the only safe answer is that neither is.
+    """
+    handler = _registry_for_invalidation(flagged=True, owner=ALPHA)
+
+    handler._invalidate_graph_for(BETA)
+
+    assert handler._graph_incomplete is True
+    assert handler._incomplete_project is None
+
+
+def test_a_first_failure_still_attributes_to_its_project() -> None:
+    """The control: with no flag up, the damage IS this project's.
+
+    Without this, the widening rule could be implemented as "never
+    attribute", which passes both tests above and makes every failure block
+    every project -- the bug the scoping was added to fix.
+    """
+    handler = _registry_for_invalidation(flagged=False, owner=None)
+
+    handler._invalidate_graph_for(ALPHA)
+
+    assert handler._graph_incomplete is True
+    assert handler._incomplete_project == ALPHA
+
+
+def test_re_flagging_the_same_project_keeps_its_name() -> None:
+    """The second control: repeated damage to ONE project must not widen.
+
+    A project that fails twice is still the only damaged project, and
+    widening would block every other project for no reason.
+    """
+    handler = _registry_for_invalidation(flagged=True, owner=ALPHA)
+
+    handler._invalidate_graph_for(ALPHA)
+
+    assert handler._graph_incomplete is True
+    assert handler._incomplete_project == ALPHA
+
+
+# Three writers that were harmless while the guards read the bare flag, and
+# became correctness bugs once the guards trusted the attribution
+# (greptile-local, PR #1547).
+@pytest.mark.asyncio
+async def test_a_failed_wipe_widens_an_existing_attribution() -> None:
+    """A wipe spans every project, so it cannot leave one project's name up.
+
+    The try-block raises the flag but never touches the attribution, so a
+    prior failure's name survives and records the wipe's damage under it --
+    telling the guards every other project is healthy.
+    """
+    from unittest.mock import MagicMock, patch
+
+    from codebase_rag.mcp.tools import MCPToolsRegistry
+
+    handler = MCPToolsRegistry.__new__(MCPToolsRegistry)
+    handler._ingestor_lock = _NullLock()
+    handler.ingestor = MagicMock()
+    handler.ingestor.fetch_all = MagicMock(return_value=[])
+    handler.ingestor.clean_database = MagicMock(side_effect=RuntimeError("wipe died"))
+    handler.project_root = "/repo"
+    handler._live_updater = None
+    handler._graph_incomplete = False
+    handler._incomplete_project = None
+    handler._flag_from_failed_clear = None
+    handler._persisted_incomplete = MagicMock(return_value=False)
+    handler._invalidate_graph_for(ALPHA)
+
+    with patch("codebase_rag.mcp.tools.clear_all_embeddings"):
+        await handler.wipe_database(confirm=True)
+
+    assert handler._graph_incomplete is True
+    assert handler._incomplete_project is None, (
+        "the wipe's damage was recorded under one project's name"
+    )
+    assert handler._incomplete_refusal(BETA, cs.MCPToolName.DEFINITION) is not None
+
+
+@pytest.mark.asyncio
+async def test_a_successful_wipe_still_clears_everything() -> None:
+    """The control: a completed wipe leaves an empty graph, so nothing is partial."""
+    from unittest.mock import MagicMock, patch
+
+    from codebase_rag.mcp.tools import MCPToolsRegistry
+
+    handler = MCPToolsRegistry.__new__(MCPToolsRegistry)
+    handler._ingestor_lock = _NullLock()
+    handler.ingestor = MagicMock()
+    handler.ingestor.fetch_all = MagicMock(return_value=[])
+    handler.project_root = "/repo"
+    handler._live_updater = None
+    handler._graph_incomplete = False
+    handler._incomplete_project = None
+    handler._flag_from_failed_clear = None
+    handler._persisted_incomplete = MagicMock(return_value=False)
+    handler._invalidate_graph_for(ALPHA)
+
+    with patch("codebase_rag.mcp.tools.clear_all_embeddings"):
+        await handler.wipe_database(confirm=True)
+
+    assert handler._graph_incomplete is False
+    assert handler._incomplete_project is None
+    assert handler._incomplete_refusal(ALPHA, cs.MCPToolName.DEFINITION) is None
+
+
+def test_a_delta_failure_does_not_overwrite_another_projects_attribution() -> None:
+    """A delta failure names its own root, which must not erase a prior owner.
+
+    Its comment already argues that leaving an earlier attribution in place
+    matters -- but it reasoned only about the healing licence, and assigned
+    the owner unconditionally. Driven through the real handler, not through
+    the helper: the helper already narrows correctly, so a test calling it
+    passes whether or not this site was ever fixed.
+    """
+    from unittest.mock import MagicMock, patch
+
+    from codebase_rag.mcp.tools import MCPToolsRegistry
+
+    handler = MCPToolsRegistry.__new__(MCPToolsRegistry)
+    handler._ingestor_lock = _NullLock()
+    handler.ingestor = MagicMock()
+    handler.ingestor.fetch_all = MagicMock(return_value=[])
+    handler.project_root = "/repo"
+    handler._live_updater = MagicMock()
+    handler._live_updater.reingest = MagicMock(side_effect=RuntimeError("delta died"))
+    handler._graph_incomplete = False
+    handler._incomplete_project = None
+    handler._flag_from_failed_clear = None
+    handler._persisted_incomplete = MagicMock(return_value=False)
+    handler._require_marker = MagicMock(return_value=None)
+    # ALPHA's marker-less damage is the only record that ALPHA is partial.
+    handler._invalidate_graph_for(ALPHA)
+
+    with patch("codebase_rag.mcp.tools.derive_project_name", return_value=BETA):
+        handler._delta_after_write([Path("/repo/f.py")])
+
+    assert handler._graph_incomplete is True
+    assert handler._incomplete_project is None, (
+        "a delta failure for BETA erased ALPHA's attribution"
+    )
+    assert handler._incomplete_refusal(ALPHA, cs.MCPToolName.DEFINITION) is not None
+
+
+def test_widening_the_owner_drops_a_stale_healing_licence() -> None:
+    """A licence naming a project the flag is no longer about must not survive.
+
+    `recoverable_here` keys off the licence alone, so a surviving one lets
+    that project's reingest clear a flag that now covers everything. This
+    asserts the INVARIANT over the state the rollback site produces, which
+    is where the divergent inline copy lives.
+    """
+    from unittest.mock import MagicMock
+
+    from codebase_rag.mcp.tools import MCPToolsRegistry
+
+    handler = MCPToolsRegistry.__new__(MCPToolsRegistry)
+    handler.ingestor = MagicMock()
+    handler.ingestor.list_projects = MagicMock(return_value=[ALPHA, BETA])
+    handler.project_root = "/repo"
+    handler._live_updater = None
+    handler._graph_incomplete = True
+    handler._incomplete_project = BETA
+    handler._flag_from_failed_clear = BETA
+    handler._persisted_incomplete = MagicMock(return_value=False)
+
+    # The rollback site's inline narrowing, for a DIFFERENT project.
+    handler._invalidate_graph_for(ALPHA)
+
+    assert handler._incomplete_project is None
+    assert handler._flag_from_failed_clear is None, (
+        "a licence for BETA survived a widening BETA no longer owns"
+    )
+    # The consequence the licence would have had.
+    with pytest.raises(ValueError):
+        handler._hydrate_reingest_updater(BETA)
+
+
+# `ask_agent` hands the agent the RAW tool objects, so its graph reads bypass
+# every guarded wrapper: the refusal has to be made before the run starts
+# (Greptile, PR #1547).
+def _registry_for_ask_agent(incomplete: bool):
+    from unittest.mock import AsyncMock, MagicMock
+
+    from codebase_rag.mcp.tools import MCPToolsRegistry
+
+    handler = MCPToolsRegistry.__new__(MCPToolsRegistry)
+    handler._ingestor_lock = _NullLock()
+    handler.ingestor = MagicMock()
+    handler.ingestor.fetch_all = MagicMock(return_value=[])
+    handler.project_root = "/repo"
+    handler._graph_incomplete = incomplete
+    handler._incomplete_project = None
+    handler._flag_from_failed_clear = None
+    handler._persisted_incomplete = MagicMock(return_value=False)
+    response = MagicMock()
+    response.output = "an authoritative-looking answer"
+    handler.rag_agent = MagicMock()
+    handler.rag_agent.run = AsyncMock(return_value=response)
+    return handler
+
+
+@pytest.mark.asyncio
+async def test_ask_agent_refuses_on_an_incomplete_graph() -> None:
+    """The agent must not answer from a graph known to be partial.
+
+    Its answer is composed across several raw tool calls and comes back
+    with no indication that the definitions behind it were missing, which
+    is worse than a single unguarded read: the caller cannot tell.
+    """
+    handler = _registry_for_ask_agent(incomplete=True)
+
+    result = await handler.ask_agent("what calls helper?")
+
+    assert cs.DICT_KEY_ERROR in result
+    handler.rag_agent.run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ask_agent_runs_when_the_graph_is_whole() -> None:
+    """The control: the guard must not refuse a healthy graph.
+
+    Without this, "refuse always" passes the test above and removes the
+    tool entirely.
+    """
+    handler = _registry_for_ask_agent(incomplete=False)
+
+    result = await handler.ask_agent("what calls helper?")
+
+    assert result == {"output": "an authoritative-looking answer"}
+    handler.rag_agent.run.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_ask_agent_refuses_on_a_durable_marker_alone() -> None:
+    """A marker from an EARLIER process must refuse too.
+
+    `_graph_incomplete` is False in a fresh registry after a crash, so the
+    in-process latch alone would let the agent answer from the partial
+    graph that crash left behind.
+    """
+    from unittest.mock import MagicMock
+
+    handler = _registry_for_ask_agent(incomplete=False)
+    handler._persisted_incomplete = MagicMock(return_value=True)
+
+    result = await handler.ask_agent("what calls helper?")
+
+    assert cs.DICT_KEY_ERROR in result
+    handler.rag_agent.run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_the_cached_path_honours_a_marker_from_an_earlier_process() -> None:
+    """`_graph_incomplete` is False in a fresh registry after a crash.
+
+    `_hydrate_reingest_updater` checks the durable marker for exactly this
+    reason (#1679); the cached path did not, so the rename and delta
+    callers would build an updater over the graph a previous process left
+    partial (Greptile, PR #1547).
+    """
+    from unittest.mock import MagicMock
+
+    from codebase_rag.mcp.tools import MCPToolsRegistry
+
+    handler = MCPToolsRegistry.__new__(MCPToolsRegistry)
+    handler.ingestor = MagicMock()
+    handler.ingestor.list_projects = MagicMock(return_value=[ALPHA])
+    handler.project_root = "/repo"
+    handler._live_updater = None
+    # Nothing in THIS process failed: the crash was in an earlier one.
+    handler._graph_incomplete = False
+    handler._incomplete_project = None
+    handler._flag_from_failed_clear = None
+    handler._persisted_incomplete = MagicMock(return_value=True)
+
+    with pytest.raises(ValueError) as refused:
+        handler._hydrate_reingest_updater(ALPHA)
+
+    assert cs.MCP_REINGEST_AFTER_FAILED_RUN.format(project=ALPHA) == str(refused.value)
+
+
+@pytest.mark.asyncio
+async def test_the_cached_path_still_builds_on_a_clean_durable_state() -> None:
+    """The control: a healthy project must still get its updater.
+
+    Without this, "always consult the marker and always refuse" passes the
+    test above while breaking every legitimate re-ingest.
+    """
+    from unittest.mock import MagicMock, patch
+
+    from codebase_rag.mcp.tools import MCPToolsRegistry
+
+    handler = MCPToolsRegistry.__new__(MCPToolsRegistry)
+    handler.ingestor = MagicMock()
+    handler.ingestor.list_projects = MagicMock(return_value=[ALPHA])
+    handler.project_root = "/repo"
+    handler._live_updater = None
+    handler._graph_incomplete = False
+    handler._incomplete_project = None
+    handler._flag_from_failed_clear = None
+    # Built with `__new__`, so every field `__init__` would set has to be
+    # set here. `_run_id` identifies this registry in the durable marker
+    # (issue #1709) and the mark inside the hydration reads it.
+    handler._run_id = "test-run-id"
+    handler._persisted_incomplete = MagicMock(return_value=False)
+    handler._ignore_sets = MagicMock(return_value=(None, None))
+    handler.parsers = {}
+    handler.queries = {}
+
+    with patch("codebase_rag.mcp.tools.GraphUpdater") as updater_cls:
+        built = handler._hydrate_reingest_updater(ALPHA)
+
+    assert built is updater_cls.return_value
+    handler._persisted_incomplete.assert_called_once_with(ALPHA)
+
+
+def test_a_renames_reingest_marks_before_it_writes() -> None:
+    """The rename path used the raw callback, with no marker (Greptile, #1547).
+
+    Every other re-ingest writes an incomplete-run marker before its first
+    delete and clears it after, so a process death mid-run leaves evidence
+    that a restarted server can see. The rename's callback was passed
+    straight through, so the one operation that rewrites source AND graph
+    together was the one without that protection: a crash part way left a
+    partial graph a fresh process read as complete.
+
+    Asserted on ORDER, not merely on the calls happening: marking after the
+    write would satisfy a call-count assertion while protecting nothing.
+    """
+    from unittest.mock import MagicMock, patch
+
+    handler = _registry_for_marker_clear(cleared=True)
+    handler._live_updater = MagicMock()
+    handler.ingestor.list_projects = MagicMock(return_value=[ALPHA])
+
+    order: list[str] = []
+    handler._require_marker = MagicMock(
+        side_effect=lambda *a, **k: order.append("mark") or None
+    )
+    handler._require_marker_cleared = MagicMock(
+        side_effect=lambda *a, **k: order.append("clear") or None
+    )
+    handler._begin_writing_or_refuse = MagicMock(
+        side_effect=lambda *a, **k: order.append("begin-writing")
+    )
+
+    updater = MagicMock()
+
+    def fake_reingest(*_a: object, before_write=None, **_k: object) -> str:
+        if before_write is not None:
+            before_write()
+        order.append("write")
+        return "done"
+
+    updater.reingest = fake_reingest
+
+    with patch.object(handler, "_hydrate_reingest_updater", return_value=updater):
+        callback = handler._guarded_rename_reingest(ALPHA)
+        assert callback is not None, (
+            "fixture guard: an indexed project must yield a callback, or this "
+            "test asserts nothing"
+        )
+        callback(["a.py"])
+
+    assert order.index("mark") < order.index("write"), (
+        f"the marker was not written before the first graph write: {order}"
+    )
+    assert order.index("begin-writing") < order.index("write"), (
+        f"the writing phase was not entered before the write: {order}"
+    )
+    assert order[-1] == "clear", (
+        f"the marker was not cleared after the run finished: {order}"
+    )
+
+
+def _guarded_failure(exc: BaseException) -> tuple[object, list[str]]:
+    """Drive `_guarded_rename_reingest` to a failure, returning (handler, cleared).
+
+    Shared so the two directions below differ ONLY in the exception, which is
+    what decides the classification.
+    """
+    from unittest.mock import MagicMock, patch
+
+    handler = _registry_for_marker_clear(cleared=True)
+    handler._live_updater = MagicMock()
+    handler.ingestor.list_projects = MagicMock(return_value=[ALPHA])
+    handler._require_marker = MagicMock(return_value=None)
+    handler._begin_writing_or_refuse = MagicMock()
+    cleared: list[str] = []
+    handler._require_marker_cleared = MagicMock(
+        side_effect=lambda p, *a, **k: cleared.append(p) or None
+    )
+
+    updater = MagicMock()
+    updater.reingest = MagicMock(side_effect=exc)
+
+    with patch.object(handler, "_hydrate_reingest_updater", return_value=updater):
+        callback = handler._guarded_rename_reingest(ALPHA)
+        assert callback is not None, "fixture guard: expected a callback"
+        with pytest.raises(type(exc)):
+            callback(["a.py"])
+    return handler, cleared
+
+
+def test_a_retained_updater_still_refuses_on_a_durable_marker() -> None:
+    """A warm updater must not bypass the marker another PROCESS left.
+
+    `_guarded_rename_reingest` reuses a retained same-project updater instead
+    of hydrating, because it is warm and `guarded()` does its own marking.
+    But `_require_marker` WRITES a marker; it never reads one, and
+    `_hydrate_reingest_updater` is the only place `_persisted_incomplete` is
+    consulted. So the shortcut skipped the one guard that survives a process
+    death, and identical incomplete state gave opposite outcomes purely on
+    whether an updater happened to be warm.
+
+    That is the #1679/#1783 defect on a new path: a guard reading
+    `_graph_incomplete` alone is process-local, and the durable marker is
+    what a peer registry's half-written graph leaves behind. Two registries
+    per project is a real configuration (#1709), and RENAME is deliberately
+    outside `_READS_THE_GRAPH`, so `_incomplete_refusal` does not cover it
+    either (greptile-local, PR #1547).
+
+    The self-inflicted case self-heals -- a mutating failure drops
+    `_live_updater`, so the next rename hydrates and refuses -- which is
+    exactly why this needs its own test: the reachable case is cross-process
+    and no existing test creates one.
+    """
+    from unittest.mock import MagicMock
+
+    handler = _registry_for_marker_clear(cleared=True)
+    retained = MagicMock()
+    retained.project_name = ALPHA
+    handler._live_updater = retained
+    handler.ingestor.list_projects = MagicMock(return_value=[ALPHA])
+    # Nothing in THIS process failed: the flag is down and the durable marker
+    # is the only evidence, which is the whole point.
+    handler._graph_incomplete = False
+    handler._incomplete_project = None
+    handler._persisted_incomplete = MagicMock(return_value=True)
+
+    with pytest.raises(ValueError) as refused:
+        handler._guarded_rename_reingest(ALPHA)
+
+    assert cs.MCP_REINGEST_AFTER_FAILED_RUN.format(project=ALPHA) == str(
+        refused.value
+    ), "a warm updater re-ingested over a graph a previous process left partial"
+
+
+def test_warm_and_cold_agree_on_a_RECOVERABLE_marker() -> None:
+    """The two paths must reach the same verdict from the same state.
+
+    `_persisted_incomplete` is not only a read: it CLEARS a stranded
+    `writing=false` marker, and the hydrating path relies on that, recovering
+    before it reads the latch. My first version of the retained-updater guard
+    read the latch first, so a project whose marker was recoverable refused on
+    a warm updater and proceeded on a cold one -- the same warm/cold
+    asymmetry this PR had just fixed, arriving back in the refusing direction
+    (Greptile, PR #1547).
+
+    Both paths now go through `_recover_then_persisted_incomplete`, which is
+    shared rather than restated, because restating it is how they diverged.
+    """
+    from unittest.mock import MagicMock, patch
+
+    def registry() -> object:
+        handler = _registry_for_marker_clear(cleared=True)
+        handler.ingestor.list_projects = MagicMock(return_value=[ALPHA])
+        # A failed CLEAR left the flag up and attributed to this project...
+        handler._graph_incomplete = True
+        handler._incomplete_project = ALPHA
+        handler._flag_from_failed_clear = ALPHA
+        # ...and the durable marker is gone, so the flag is recoverable.
+        handler._persisted_incomplete = MagicMock(return_value=False)
+        handler._require_marker = MagicMock(return_value=None)
+        handler._require_marker_cleared = MagicMock(return_value=None)
+        handler._begin_writing_or_refuse = MagicMock()
+        # The cold path builds a real updater, so it needs the fields
+        # `__init__` would have set on a registry this test creates by hand.
+        handler._ignore_sets = MagicMock(return_value=(None, None))
+        handler.project_root = "/repo"
+        handler.parsers = {}
+        handler.queries = {}
+        handler._run_id = "test-run-id"
+        return handler
+
+    cold = registry()
+    cold._live_updater = None
+    with patch("codebase_rag.mcp.tools.GraphUpdater"):
+        assert cold._guarded_rename_reingest(ALPHA) is not None, (
+            "fixture guard: the cold path must recover and proceed, or the "
+            "comparison below is vacuous"
+        )
+
+    warm = registry()
+    retained = MagicMock()
+    retained.project_name = ALPHA
+    warm._live_updater = retained
+
+    assert warm._guarded_rename_reingest(ALPHA) is not None, (
+        "a warm updater refused a rename the cold path allows from identical "
+        "state, so the outcome depends on whether an updater happens to be "
+        "warm rather than on the graph"
+    )
+
+
+def test_a_retained_updater_is_still_reused_on_a_clean_durable_state() -> None:
+    """The control: the refusal above must not cost the warm path.
+
+    Without this, "always consult the marker and always refuse" satisfies the
+    test above while making every legitimate rename hydrate a fresh updater.
+    """
+    from unittest.mock import MagicMock
+
+    handler = _registry_for_marker_clear(cleared=True)
+    retained = MagicMock()
+    retained.project_name = ALPHA
+    handler._live_updater = retained
+    handler.ingestor.list_projects = MagicMock(return_value=[ALPHA])
+    handler._graph_incomplete = False
+    handler._incomplete_project = None
+    handler._persisted_incomplete = MagicMock(return_value=False)
+    handler._require_marker = MagicMock(return_value=None)
+    handler._require_marker_cleared = MagicMock(return_value=None)
+    handler._begin_writing_or_refuse = MagicMock()
+    retained.reingest = MagicMock(return_value="REPORT")
+
+    callback = handler._guarded_rename_reingest(ALPHA)
+    assert callback is not None, "fixture guard: expected a callback"
+    assert callback(["a.py"]) == "REPORT", (
+        "a clean durable state must still reuse the warm updater"
+    )
+    assert retained.reingest.called, "the retained updater was not the one used"
+
+
+def test_a_mutating_rename_reingest_failure_KEEPS_the_marker() -> None:
+    """The P1: a failure that had already written must stay marked.
+
+    The clear used to sit in a blanket `finally`, so any failure released the
+    marker. That is safe only if the caller records the damage some other
+    way, and on the INITIAL postcondition re-ingest it does not: `measure()`
+    catches, returns `verdict=None`, and sets no `graph_incomplete`, so
+    `_run_rename` re-marks nothing and the rename returns `applied` over a
+    possibly-partial graph. The durable marker was the only record and the
+    `finally` dropped it.
+
+    A plain `MagicMock` updater has no usable `reingest_mutated` bool, so
+    `_reingest_mutated` falls back to the exception TYPE: a generic
+    `RuntimeError` means writing had begun. That is the direction under test.
+    """
+    handler, cleared = _guarded_failure(RuntimeError("re-ingest died"))
+
+    assert cleared == [], (
+        "a mutating failure cleared the durable marker, which is the only "
+        f"record that survives this process: cleared={cleared}"
+    )
+    assert handler._graph_incomplete is True, (
+        "a mutating failure left the in-process flag down, so nothing in "
+        "this process knows the graph may be partial"
+    )
+    assert handler._live_updater is None, (
+        "the retained updater describes a graph that no longer exists"
+    )
+
+
+def test_a_nothing_written_rename_reingest_failure_STILL_clears() -> None:
+    """The other direction, and the one that stops this becoming a worse bug.
+
+    Without it the fix could simply never clear, which an earlier round of
+    this PR actually shipped: a marker with no expressible exit refused every
+    later run for the process lifetime, which was worse than the leak it
+    replaced. A `ValueError` is rejected before anything is touched, so the
+    marker this call created describes a run that changed nothing.
+
+    The exception type is load-bearing, not decoration. `_reingest_mutated`
+    reads `reingest_mutated` off the updater and a MagicMock returns a truthy
+    child mock for ANY attribute, which the `isinstance(flag, bool)` guard
+    rejects -- so a double always lands on the type fallback. Pass a generic
+    exception here and this control silently tests the MUTATED branch above,
+    passing for the wrong reason.
+    """
+    handler, cleared = _guarded_failure(ValueError("bad path"))
+
+    assert cleared == [ALPHA], (
+        "a failure that wrote nothing left its marker up, so every later "
+        f"run is refused for a run that changed nothing: cleared={cleared}"
+    )
+    assert handler._graph_incomplete is False, (
+        "a failure that wrote nothing raised the incomplete flag anyway"
+    )
+
+
+def test_a_successful_rename_reingest_clears_the_marker() -> None:
+    """The success path still releases the marker.
+
+    Control for both tests above: if the classification were wired to keep
+    the marker whenever the code takes any exception path, this stays green
+    only when the non-raising path is genuinely separate.
+    """
+    from unittest.mock import MagicMock, patch
+
+    handler = _registry_for_marker_clear(cleared=True)
+    handler._live_updater = MagicMock()
+    handler.ingestor.list_projects = MagicMock(return_value=[ALPHA])
+    handler._require_marker = MagicMock(return_value=None)
+    handler._begin_writing_or_refuse = MagicMock()
+    cleared: list[str] = []
+    handler._require_marker_cleared = MagicMock(
+        side_effect=lambda p, *a, **k: cleared.append(p) or None
+    )
+
+    sentinel = MagicMock(name="report")
+    updater = MagicMock()
+    updater.reingest = MagicMock(return_value=sentinel)
+
+    with patch.object(handler, "_hydrate_reingest_updater", return_value=updater):
+        callback = handler._guarded_rename_reingest(ALPHA)
+        assert callback is not None, "fixture guard: expected a callback"
+        assert callback(["a.py"]) is sentinel, (
+            "the guarded callback must return the re-ingest's own report"
+        )
+
+    assert cleared == [ALPHA], (
+        f"a successful rename re-ingest left the marker up: cleared={cleared}"
+    )
+
+
+async def test_the_rename_handler_uses_the_guarded_reingest(tmp_path: Path) -> None:
+    """The WIRING, which the two tests above cannot see.
+
+    They call `_guarded_rename_reingest` directly, so reverting the call site
+    to pass the raw `updater.reingest` leaves both green -- the helper is
+    still correct, it is simply no longer used. A unit-level mutation cannot
+    see a severed connection; only driving the real handler can.
+
+    Asserts the callback `rename()` receives is NOT the updater's bound
+    method, which is exactly what the reverted call site would hand it.
+    """
+    from unittest.mock import MagicMock, patch
+
+    from codebase_rag import graph_query as graph_query_module
+    from codebase_rag.utils.path_utils import derive_project_name
+
+    handler = _registry_for_marker_clear(cleared=True)
+    handler.project_root = str(tmp_path)
+    project = derive_project_name(tmp_path)
+    handler._live_updater = MagicMock()
+    handler.ingestor.list_projects = MagicMock(return_value=[project])
+
+    updater = MagicMock()
+    seen: dict[str, object] = {}
+
+    def fake_rename(*_a: object, reingest: object = None, **_k: object) -> object:
+        seen["reingest"] = reingest
+        raise RuntimeError("stop here; the callback identity is the subject")
+
+    # Patched at the SOURCE module: `_run_rename` imports `rename` locally, so
+    # there is no `codebase_rag.mcp.tools.rename` attribute to replace.
+    with (
+        patch.object(handler, "_hydrate_reingest_updater", return_value=updater),
+        patch("codebase_rag.editing.rename.rename", fake_rename),
+        patch.object(graph_query_module, "source_root_for", return_value=tmp_path),
+        contextlib.suppress(Exception),
+    ):
+        await handler._run_rename(project, "pkg.mod.helper", "assist", False, False)
+
+    assert "reingest" in seen, (
+        "fixture guard: rename() was never reached, so the callback identity "
+        "was never observed and this test proves nothing"
+    )
+    assert seen["reingest"] is not updater.reingest, (
+        "the rename handler passed the updater's raw reingest, so a crash "
+        "mid-run leaves a partial graph with no marker recording it"
+    )

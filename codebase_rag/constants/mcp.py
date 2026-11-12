@@ -1,0 +1,426 @@
+# MCP server tool names, schema fields, and messages.
+
+from enum import StrEnum
+
+
+class MCPToolName(StrEnum):
+    LIST_PROJECTS = "list_projects"
+    DELETE_PROJECT = "delete_project"
+    WIPE_DATABASE = "wipe_database"
+    INDEX_REPOSITORY = "index_repository"
+    UPDATE_REPOSITORY = "update_repository"
+    REINGEST = "reingest"
+    # Deterministic graph queries (issue #1523): fixed Cypher, no LLM.
+    RESOLVE = "resolve"
+    DEFINITION = "definition"
+    CALLERS = "callers"
+    CALLEES = "callees"
+    IMPLEMENTORS = "implementors"
+    OVERRIDES = "overrides"
+    IMPORTERS = "importers"
+    TESTS_REACHING = "tests_reaching"
+    # Cross-service edges as questions (issue #1603): the endpoints a project
+    # exposes, the call sites in any project that reach one, and the remote
+    # dependencies a project has through the network.
+    ENDPOINTS = "endpoints"
+    ENDPOINT_CALLERS = "endpoint_callers"
+    REMOTE_DEPENDENCIES = "remote_dependencies"
+    # Graph-driven edit operations (issues #1532, #1533).
+    RENAME = "rename"
+    CHANGE_SIGNATURE = "change_signature"
+    MOVE = "move"
+    CONTEXT = "context"
+    QUERY_CODE_GRAPH = "query_code_graph"
+    GET_CODE_SNIPPET = "get_code_snippet"
+    SURGICAL_REPLACE_CODE = "surgical_replace_code"
+    READ_FILE = "read_file"
+    WRITE_FILE = "write_file"
+    LIST_DIRECTORY = "list_directory"
+    SEMANTIC_SEARCH = "semantic_search"
+    STRUCTURAL_SEARCH = "structural_search"
+    STRUCTURAL_REPLACE = "structural_replace"
+    FIND_DUPLICATE_CODE = "find_duplicate_code"
+    GET_FUNCTION_SOURCE = "get_function_source"
+    ASK_AGENT = "ask_agent"
+    FLOW_VERDICT = "flow_verdict"
+    EXPLAIN_TRACEBACK = "explain_traceback"
+    RANK_ROOT_CAUSES = "rank_root_causes"
+    # Agent-authored notes about code (issue #1808): written to the graph,
+    # never into source files, and read back per symbol.
+    ANNOTATE = "annotate"
+    GLOSSES = "glosses"
+
+
+# The tools that only read: the graph, the project's files, or an agent
+# answer whose writes `ask_agent` always denies. Named this way round so a new
+# tool counts as writing, and `--read-only` withholds it, until someone adds
+# it here; `test_every_tool_is_classified` keeps these sets in step (#3458).
+MCP_READ_ONLY_TOOLS = frozenset(
+    {
+        MCPToolName.LIST_PROJECTS,
+        MCPToolName.RESOLVE,
+        MCPToolName.DEFINITION,
+        MCPToolName.CALLERS,
+        MCPToolName.CALLEES,
+        MCPToolName.IMPLEMENTORS,
+        MCPToolName.OVERRIDES,
+        MCPToolName.IMPORTERS,
+        MCPToolName.TESTS_REACHING,
+        MCPToolName.ENDPOINTS,
+        MCPToolName.ENDPOINT_CALLERS,
+        MCPToolName.REMOTE_DEPENDENCIES,
+        MCPToolName.CONTEXT,
+        MCPToolName.QUERY_CODE_GRAPH,
+        MCPToolName.GET_CODE_SNIPPET,
+        MCPToolName.READ_FILE,
+        MCPToolName.LIST_DIRECTORY,
+        MCPToolName.SEMANTIC_SEARCH,
+        MCPToolName.STRUCTURAL_SEARCH,
+        MCPToolName.FIND_DUPLICATE_CODE,
+        MCPToolName.GET_FUNCTION_SOURCE,
+        MCPToolName.ASK_AGENT,
+        MCPToolName.FLOW_VERDICT,
+        MCPToolName.EXPLAIN_TRACEBACK,
+        MCPToolName.RANK_ROOT_CAUSES,
+        MCPToolName.GLOSSES,
+    }
+)
+# Writers that overwrite or remove what was there: source files, a project's
+# graph, the whole database. The other writers add a note or sync the graph
+# with the files.
+MCP_DESTRUCTIVE_TOOLS = frozenset(
+    {
+        MCPToolName.DELETE_PROJECT,
+        MCPToolName.WIPE_DATABASE,
+        MCPToolName.INDEX_REPOSITORY,
+        MCPToolName.RENAME,
+        MCPToolName.CHANGE_SIGNATURE,
+        MCPToolName.MOVE,
+        MCPToolName.SURGICAL_REPLACE_CODE,
+        MCPToolName.WRITE_FILE,
+        MCPToolName.STRUCTURAL_REPLACE,
+    }
+)
+# Writers that change nothing more when called again with the same arguments.
+MCP_IDEMPOTENT_TOOLS = frozenset(
+    {
+        MCPToolName.DELETE_PROJECT,
+        MCPToolName.WIPE_DATABASE,
+        MCPToolName.INDEX_REPOSITORY,
+        MCPToolName.UPDATE_REPOSITORY,
+        MCPToolName.REINGEST,
+        MCPToolName.WRITE_FILE,
+    }
+)
+MCP_READ_ONLY_REFUSED = (
+    "{name} writes, and this server runs read-only (--read-only or "
+    "MCP_READ_ONLY=true), so it was not run."
+)
+
+
+# The HTTP transport serves plain HTTP; a Host header leaves port 80 out.
+HTTP_SCHEME = "http"
+HTTP_DEFAULT_PORT = 80
+
+
+class MCPTransport(StrEnum):
+    STDIO = "stdio"
+    HTTP = "http"
+
+
+class MCPEnvVar(StrEnum):
+    TARGET_REPO_PATH = "TARGET_REPO_PATH"
+    # The workspace the server scopes to (issue #1494); an MCP client's
+    # launch config has an environment and no flags, so the option has an
+    # environment form too.
+    MCP_WORKSPACE = "MCP_WORKSPACE"
+    CLAUDE_PROJECT_ROOT = "CLAUDE_PROJECT_ROOT"
+    PWD = "PWD"
+
+
+class MCPSchemaType(StrEnum):
+    OBJECT = "object"
+    STRING = "string"
+    INTEGER = "integer"
+    # JSON Schema spells a float 'number'; 'integer' would reject a 0.8
+    # similarity threshold at the client before the call is even made.
+    NUMBER = "number"
+    BOOLEAN = "boolean"
+    ARRAY = "array"
+
+
+class MCPSchemaField(StrEnum):
+    TYPE = "type"
+    PROPERTIES = "properties"
+    REQUIRED = "required"
+    DESCRIPTION = "description"
+    DEFAULT = "default"
+
+
+class MCPParamName(StrEnum):
+    PROJECT_NAME = "project_name"
+    # The per-request retrieval scope (issue #1494). Distinct from
+    # PROJECT_NAME, which names the target of delete_project.
+    PROJECT = "project"
+    CONFIRM = "confirm"
+    NATURAL_LANGUAGE_QUERY = "natural_language_query"
+    QUALIFIED_NAME = "qualified_name"
+    FILE_PATH = "file_path"
+    TARGET_CODE = "target_code"
+    REPLACEMENT_CODE = "replacement_code"
+    OFFSET = "offset"
+    LIMIT = "limit"
+    CONTENT = "content"
+    DIRECTORY_PATH = "directory_path"
+    TOP_K = "top_k"
+    QUESTION = "question"
+    PATTERN = "pattern"
+    REWRITE = "rewrite"
+    LANGUAGE = "language"
+    SOURCE_QN = "source_qualified_name"
+    SINK_QN = "sink_qualified_name"
+    DRY_RUN = "dry_run"
+    TRACEBACK_TEXT = "traceback_text"
+    PATH_PREFIX_MAP = "path_prefix_map"
+    NODE_ID = "node_id"
+    THRESHOLD = "threshold"
+    MIN_SIZE = "min_size"
+    PATHS = "paths"
+    DELETED = "deleted"
+    TARGET = "target"
+    DEPTH = "depth"
+    BODY = "body"
+    KIND = "kind"
+    MENTIONS = "mentions"
+    AUTHOR = "author"
+    MODULE_QN = "module_qualified_name"
+    THROUGH_REEXPORTS = "through_reexports"
+    NEW_NAME = "new_name"
+    ALLOW_HEURISTIC = "allow_heuristic"
+    NEW_PARAMS = "new_params"
+    MAPPING = "mapping"
+    TARGET_MODULE = "target_module"
+    KEEP_ALIAS = "keep_alias"
+    BUDGET_TOKENS = "budget_tokens"
+
+
+# MCP server constants
+MCP_SERVER_NAME = "code-graph-rag"
+MCP_CONTENT_TYPE_TEXT = "text"
+MCP_DEFAULT_DIRECTORY = "."
+MCP_JSON_INDENT = 2
+MCP_LOG_LEVEL_INFO = "INFO"
+MCP_LOG_FORMAT = "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <level>{message}</level>"
+MCP_PAGINATION_HEADER = "# Lines {start}-{end} of {total}\n"
+# `read_file`'s window, refused in its own terms rather than as whatever
+# `islice()` says of a negative index, or as "Lines 1001-1000 of 7"
+# (issue #3244). The schema bounds them too; a direct call is checked here.
+MCP_READ_OFFSET_MINIMUM = 0
+MCP_READ_LIMIT_MINIMUM = 1
+MCP_READ_OFFSET_NEGATIVE = "offset {offset} is negative"
+MCP_READ_LIMIT_NOT_POSITIVE = "limit {limit} is not positive"
+MCP_READ_PAST_END = "offset {offset} is past the end of {path} ({total} lines)"
+# A likely credential store is not served: the client's model would read
+# it, and repository text can ask for it as easily as for source (#3457).
+MCP_READ_SENSITIVE_REFUSED = (
+    "{path} looks like a credential file, so it is not served over MCP. "
+    "Export CGR_ALLOW_SENSITIVE_READS=true in the server's environment to serve it."
+)
+MCP_WRITE_SENSITIVE_REFUSED = (
+    "{path} looks like a credential file, so it is not changed over MCP. "
+    "Export CGR_ALLOW_SENSITIVE_WRITES=true in the server's environment to allow it."
+)
+# A `path:line` target whose line no source file can reach; sent on, it
+# overflows the 64-bit Bolt integer in the driver.
+MCP_RESOLVE_LINE_OUT_OF_RANGE = "Line {line} of {path} is out of range."
+
+# MCP response messages
+MCP_INDEX_SUCCESS = "Successfully indexed repository at {path}. Knowledge graph has been updated (previous data cleared)."
+MCP_INDEX_SUCCESS_PROJECT = "Successfully indexed repository at {path}. Project '{project_name}' has been updated."
+MCP_INDEX_ERROR = "Error indexing repository: {error}"
+MCP_WRITE_SUCCESS = "Successfully wrote file: {path}"
+MCP_UNKNOWN_TOOL_ERROR = "Unknown tool: {name}"
+MCP_TOOL_EXEC_ERROR = "Error executing tool '{name}': {error}"
+MCP_INPUT_VALIDATION_ERROR = "Input validation error: {error}"
+MCP_UPDATE_SUCCESS = "Successfully updated repository at {path} (no database wipe)."
+MCP_UPDATE_ERROR = "Error updating repository: {error}"
+MCP_REINGEST_ERROR = "Error re-ingesting files: {error}"
+# Structural delta appended to write tools (issue #1525).
+MCP_DELTA_HEADER = "Structural delta:"
+CONTEXT_DEFAULT_BUDGET = 4000
+MCP_CONTEXT_BUDGET_INVALID = "budget_tokens must be at least 1, got {budget}"
+MCP_DELTA_ERROR = "Structural delta unavailable: {error}"
+MCP_REINGEST_NEEDS_INDEX = (
+    "Project {project} is not indexed; run index_repository or update_repository "
+    "before reingest"
+)
+MCP_INCOMPLETE_MARKER_STUCK = (
+    "{project} was processed, but its incomplete-run marker could not be "
+    "cleared. Later scoped re-ingests will refuse until it goes. The next "
+    "index or update retries the removal; check the graph store is writable."
+)
+MCP_INCOMPLETE_MARKER_REQUIRED = (
+    "Refusing to change the graph of {project}: the incomplete-run marker could "
+    "not be written. Without it a crash part way through would leave a "
+    "partial graph that a fresh process cannot recognise, and a later scoped "
+    "reingest would treat it as authoritative. Check the graph store is "
+    "writable and retry."
+)
+MCP_REINGEST_AFTER_FAILED_RUN = (
+    "The last index or update of project {project} failed part way, so its "
+    "graph is incomplete; run update_repository before reingest"
+)
+MCP_QUERY_AFTER_FAILED_RUN = (
+    "The last index or update of project {project} failed part way, so its "
+    "graph is incomplete; {tool} would answer from a partial graph. Run "
+    "update_repository before reading it"
+)
+# An empty endpoint answer from a project whose last sync left out the
+# group the tool reads is not "none": nothing could have been recorded
+# (issue #2521). The capture is part of the parser fingerprint, so the
+# re-index re-parses the whole repository.
+MCP_CAPTURE_GROUP_MISSING = (
+    "{tool} has nothing to read for project {project!r}: its last sync did "
+    "not capture the `{groups}` group ({relationships}), so an empty list "
+    "here would not mean there are none. Re-index with `cgr start "
+    "--repo-path {root} --update-graph --capture {groups}`, or run "
+    "update_repository on a server started with CGR_CAPTURE={groups}."
+)
+REINGEST_OUTSIDE_REPO = "Path is outside the repository: {path}"
+REINGEST_IS_DIRECTORY = "Path is a directory, not a file: {path}"
+MCP_GRAPH_QUERY_ERROR = "Error running {tool}: {error}"
+GRAPH_QUERY_MAX_DEPTH = 5
+# A `path:line` target whose file the project does not hold (issue #2611).
+# Answered with `[]`, it read as "no definition spans that line", and an
+# agent holding an absolute path concluded nothing was defined there. A file
+# is held when the project has a Module at its path (source or document);
+# File nodes are shared by projects indexed from one root, so they cannot
+# say whose a file is.
+GRAPH_LOCATION_UNKNOWN_FILE = (
+    "No source file {path!r} in project {project!r}. A path:line target takes "
+    "the file's path relative to the root the project was indexed from, or an "
+    "absolute path inside that root."
+)
+# `x:a:b` when the project holds both `x` and `x:a`: either reading may be
+# the one meant, so neither is answered.
+GRAPH_LOCATION_AMBIGUOUS = (
+    "{target!r} is line {line} of {path!r} or line {other_line} of "
+    "{other_path!r}, and project {project!r} holds both files. Write "
+    "'{path}:{line}' for the first or '{other_path}:{other_line}:1' for the second."
+)
+MCP_SEMANTIC_NOT_AVAILABLE_RESPONSE = (
+    "Semantic search is not available. Install with: uv sync --extra semantic"
+)
+MCP_ASK_AGENT_ERROR = "Error running ask_agent: {error}"
+MCP_ASK_AGENT_APPROVAL_DENIED = (
+    "ask_agent cannot edit files or run non-read-only commands; answer "
+    "without them. The client can make the change with the MCP edit tools."
+)
+# Refused rather than answered with zero rows: an empty result for a
+# misspelled project name is indistinguishable from a genuine empty result.
+MCP_UNKNOWN_PROJECT = "Unknown project {project!r}. Indexed projects: {known}"
+# With a close match the full list is noise: a shared graph holds dozens of
+# `<dir>__<hash>` names, and the one meant is the one to name (issue #2461).
+MCP_UNKNOWN_PROJECT_NAMED = "Unknown project {project!r}."
+# Under a workspace the list is the workspace's own indexed projects: the
+# graph is shared, and a project outside the workspace is not this server's
+# to name (CodeRabbit, PR #2562).
+MCP_UNKNOWN_WORKSPACE_PROJECT = (
+    "Unknown project {project!r}. Indexed projects of workspace {workspace!r}: {known}"
+)
+MCP_UNKNOWN_WORKSPACE_PROJECT_NONE_INDEXED = (
+    "Unknown project {project!r}. No project of workspace {workspace!r} is indexed."
+)
+MCP_ROOT_NOT_INDEXED = (
+    "No project is indexed for this server's root {path}; run "
+    "index_repository or update_repository first, or pass `project`."
+)
+# flow_verdict, explain_traceback and rank_root_causes take no `project`, so
+# their refusal cannot advise passing one (issue #3193).
+MCP_FIXED_ROOT_NOT_INDEXED = (
+    "No project is indexed for this server's root {path}; run "
+    "index_repository or update_repository first."
+)
+# An empty answer for a name the graph does not hold read as "nothing calls
+# it" / "no test reaches it" (issue #2461).
+MCP_UNKNOWN_TARGET = "{qualified_name!r} is not in the graph."
+MCP_UNKNOWN_TARGET_HINT = " `resolve` lists the qualified names a name matches."
+MCP_UNKNOWN_ENDPOINT = (
+    "{target!r} names no endpoint project {project!r} exposes: neither a "
+    "handler nor an endpoint identity."
+)
+MCP_UNKNOWN_ENDPOINT_HINT = " `endpoints` lists the project's identities and handlers."
+# `flow_verdict` with a source or sink it cannot walk from (issue #2939).
+MCP_FLOW_SOURCE = "source"
+MCP_FLOW_SINK = "sink"
+MCP_FLOW_ENDPOINT = "The {side}: {problem}"
+MCP_FLOW_SOURCE_ELSEWHERE = (
+    "The source {qualified_name!r} belongs to project {owner!r}; flow_verdict "
+    "walks the flow edges of {project!r}, this server's project."
+)
+GRAPH_DID_YOU_MEAN = " Did you mean: {names}?"
+# How many close matches a refusal names, and how close a spelling must be
+# (difflib's ratio) to be offered at all.
+GRAPH_SUGGESTION_LIMIT = 5
+GRAPH_SUGGESTION_CUTOFF = 0.6
+# A workspace narrows the choice to its own projects (issue #1494). This is
+# an allow-list on top of the graph check, never a substitute: a name in the
+# workspace that is not indexed is still refused as unknown.
+MCP_PROJECT_OUTSIDE_WORKSPACE = (
+    "Project {project!r} is not in workspace {workspace!r}. Workspace projects: {known}"
+)
+MCP_NAME_OUTSIDE_WORKSPACE = (
+    "{name!r} belongs to no project of workspace {workspace!r}. Workspace "
+    "projects: {known}"
+)
+MCP_WORKSPACE_SOURCE_UNPROVEN = (
+    "{name!r} belongs to project {project!r} of workspace {workspace!r}, but the "
+    "graph does not show that project indexed from the workspace's checkout; "
+    "re-index it from there to read its source"
+)
+MCP_WORKSPACE_DEFAULT_AMBIGUOUS = (
+    "Workspace {workspace!r} holds {count} projects and none is rooted at this "
+    "server's directory; pass `project` (one of: {known})"
+)
+MCP_GLOSS_TARGET_NOT_FOUND = "No definition matches {target!r} in project {project!r}."
+# A property's getter, setter and deleter share one qualified name; the
+# registry names the later ones `x@<line>`, which shifts with the file. The
+# descriptor names the member stably (issue #1808).
+GLOSS_DESCRIPTOR_SEPARATOR = "#"
+GLOSS_DESCRIPTORS: dict[str, str] = {
+    "getter": "@property",
+    "setter": ".setter",
+    "deleter": ".deleter",
+}
+MCP_GLOSS_DESCRIPTOR_UNKNOWN = (
+    "{descriptor!r} is not a descriptor; use one of {known} after '#'."
+)
+MCP_GLOSS_DESCRIPTOR_NOT_FOUND = (
+    "{target!r} resolved to {qn!r}, but no definition of that name carries the "
+    "{descriptor} decorator."
+)
+MCP_GLOSS_TARGET_AMBIGUOUS = (
+    "{target!r} names {count} definitions; pass one of the qualified names "
+    "listed under 'candidates'."
+)
+MCP_GLOSS_MENTION_REFUSED = "mention {name!r}: {error}"
+MCP_GLOSS_KIND_UNKNOWN = "Unknown gloss kind {kind!r}. Kinds: {kinds}"
+MCP_GLOSS_BODY_EMPTY = "A gloss needs a non-empty body."
+MCP_GLOSS_NOT_WRITTEN = (
+    "The gloss on {target!r} was not written: its subject or a mentioned "
+    "definition left the graph between resolving and writing. Re-index and retry."
+)
+MCP_PROJECT_DELETED = "Successfully deleted project '{project_name}'."
+MCP_WIPE_CANCELLED = "Database wipe cancelled. Set confirm=true to proceed."
+MCP_WIPE_SUCCESS = "Database completely wiped. All projects have been removed."
+MCP_WIPE_ERROR = "Error wiping database: {error}"
+
+# MCP dict keys and values
+MCP_KEY_RESULTS = "results"
+MCP_KEY_ERROR = "error"
+MCP_KEY_FOUND = "found"
+MCP_KEY_ERROR_MESSAGE = "error_message"
+MCP_KEY_QUERY_USED = "query_used"
+MCP_KEY_SUMMARY = "summary"
+MCP_NOT_AVAILABLE = "N/A"
+MCP_TOOL_NAME_QUERY = "query"

@@ -1,0 +1,1507 @@
+"""Deterministic graph queries for agents and the `cgr graph` commands.
+
+`query_code_graph` turns natural language into Cypher through an LLM, which
+is the wrong shape for "go to definition" or "find callers": those must be
+exact and repeatable. Everything here is fixed Cypher scoped to one project
+plus client-side walks over the fetched rows, with every result list
+sorted, so the same graph always yields the same JSON (issue #1523).
+
+`callers` and `callees` return one row per call SITE: the CALLS edges carry
+the site location from issue #1522, so an agent can jump to, check, or
+rewrite each call. Edges written without a site (libclang macro uses,
+Roslyn facts, trace write-back) return `null` positions. In both directions
+`path` is the file the site sits in (its caller's), so `path:line` is always
+the call; `callee_path` is where the invoked symbol is defined (issue #2460).
+"""
+
+from __future__ import annotations
+
+import difflib
+from collections.abc import Callable, Iterable, Sequence
+from pathlib import Path, PurePosixPath, PureWindowsPath
+from typing import NamedTuple, TypedDict
+
+from . import constants as cs
+from . import cypher_queries as cq
+from .dead_code import (
+    _as_str_list,
+    _is_test_symbol,
+    _node_props,
+    _NodeId,
+    _rust_test_fn_spans,
+    _rust_test_modules_from_nodes,
+)
+from .types_defs import PropertyDict, PropertyParams, ResultRow
+from .utils.path_utils import portable_posix, project_roots_from_rows
+from .utils.source_extraction import extract_source_lines
+
+QueryFn = Callable[[str, PropertyParams | None], list[ResultRow]]
+
+_DEFINITION_LABELS = frozenset(
+    {
+        cs.NodeLabel.FUNCTION.value,
+        cs.NodeLabel.METHOD.value,
+        cs.NodeLabel.CLASS.value,
+        cs.NodeLabel.INTERFACE.value,
+        cs.NodeLabel.ENUM.value,
+        cs.NodeLabel.TYPE.value,
+        cs.NodeLabel.UNION.value,
+        cs.NodeLabel.MODULE.value,
+    }
+)
+_REACH_RELS = frozenset(
+    {
+        cs.RelationshipType.CALLS.value,
+        cs.RelationshipType.REFERENCES.value,
+        cs.RelationshipType.INSTANTIATES.value,
+    }
+)
+
+
+class SymbolRow(TypedDict):
+    label: str
+    qualified_name: str
+    path: str | None
+    start_line: int | None
+    end_line: int | None
+
+
+class DefinitionRow(SymbolRow):
+    # `start_line` and `source` open at the first decorator, as
+    # `inspect.getsource` does; `name_line` is the line of the definition's
+    # name, its `def`/`class` line, or the node's own start where the graph
+    # records no name position (issue #2428).
+    name_line: int | None
+    decorators: list[str]
+    name: str | None
+    docstring: str | None
+    source: str | None
+    found: bool
+
+
+class EndpointRow(TypedDict):
+    endpoint: str
+    kind: str | None
+    label: str
+    handler: str
+    path: str | None
+    callers: int
+
+
+class EndpointCallerRow(TypedDict):
+    label: str
+    qualified_name: str
+    path: str | None
+    url: str | None
+    direction: str | None
+    endpoint: str
+    handler: str
+
+
+class RemoteDependencyRow(TypedDict):
+    label: str
+    qualified_name: str
+    path: str | None
+    url: str | None
+    direction: str | None
+    endpoint: str | None
+    handler: str | None
+    handler_project: str | None
+
+
+class CaptureGap(TypedDict):
+    groups: list[str]
+    relationships: list[str]
+    root_path: str | None
+
+
+class CallSiteRow(TypedDict):
+    label: str
+    qualified_name: str
+    path: str | None
+    callee_path: str | None
+    line: int | None
+    col: int | None
+    end_line: int | None
+    end_col: int | None
+    arg_count: int | None
+    kwarg_names: list[str] | None
+    resolution: str | None
+    depth: int
+    through: str
+
+
+class RelatedRow(TypedDict):
+    label: str
+    qualified_name: str
+    path: str | None
+    relationship: str
+
+
+class TransitiveRelatedRow(RelatedRow):
+    # Hops from the queried name, and the node this row's edge hangs off,
+    # as `callers` rows carry them (issue #2624).
+    depth: int
+    through: str
+
+
+class ImporterRow(TypedDict):
+    module: str
+    path: str | None
+    line: int | None
+    col: int | None
+    end_line: int | None
+    end_col: int | None
+    alias: str | None
+    imported_name: str | None
+
+
+class ReexportImporterRow(ImporterRow):
+    # The import statements the row reaches the module through, consumer
+    # side first; empty for a direct importer (issue #2573).
+    via: list[ImporterRow]
+
+
+class _ReexportEntry(TypedDict):
+    # One statement that reached the module, and the names its importer
+    # binds from it for the next hop; None is every name (a `*` import).
+    row: ImporterRow
+    via: list[ImporterRow]
+    names: frozenset[str] | None
+
+
+class TestReachRow(TypedDict):
+    label: str
+    qualified_name: str
+    path: str | None
+    depth: int
+    through: str
+
+
+def _owner_check(fetch_all: QueryFn, project_name: str) -> Callable[[str], bool]:
+    """Whether `project_name`, and not a longer-named registered project it
+    is a dotted prefix of, owns a qualified name (issue #1982).
+
+    Every read here is scoped by `STARTS WITH $project_prefix`, and `foo.`
+    selects `foo.bar`'s rows too. The owner is the LONGEST registered
+    project name the qn sits under, the way the updater and the gloss
+    repair decide it; the project list is read once per call, and a failed
+    read keeps the prefix rule rather than dropping every row.
+    """
+    prefix = _prefix(project_name)
+    names: set[str] = {project_name}
+    try:
+        rows = fetch_all(cq.CYPHER_LIST_PROJECTS, None)
+    except Exception:
+        rows = []
+    for row in rows:
+        name = row.get(cs.KEY_NAME)
+        if isinstance(name, str) and name:
+            names.add(name)
+    longest_first = sorted(names, key=len, reverse=True)
+
+    def owns(qn: str) -> bool:
+        if qn != project_name and not qn.startswith(prefix):
+            return False
+        for name in longest_first:
+            if qn == name or qn.startswith(f"{name}{cs.SEPARATOR_DOT}"):
+                return name == project_name
+        return True
+
+    return owns
+
+
+def _prefix(project_name: str) -> str:
+    return f"{project_name}{cs.SEPARATOR_DOT}"
+
+
+def _longer_project_prefixes(fetch_all: QueryFn, project_name: str) -> tuple[str, ...]:
+    """Return registered project names that can own a longer qualified name."""
+    requested_prefix = f"{project_name}{cs.SEPARATOR_DOT}"
+    names = {
+        name
+        for row in fetch_all(cq.CYPHER_LIST_PROJECTS, None)
+        if isinstance(name := row.get(cs.KEY_NAME), str)
+        and name.startswith(requested_prefix)
+    }
+    return tuple(sorted(names))
+
+
+def _text_qn(row: ResultRow) -> str:
+    return str(row.get(cs.KEY_QUALIFIED_NAME, ""))
+
+
+def _opt_int(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _opt_str(value: object) -> str | None:
+    return value if isinstance(value, str) else None
+
+
+def _symbol_row(row: ResultRow) -> SymbolRow:
+    return SymbolRow(
+        label=str(row.get(cs.KEY_LABEL, "")),
+        qualified_name=str(row.get(cs.KEY_QUALIFIED_NAME, "")),
+        path=_opt_str(row.get(cs.KEY_PATH)),
+        start_line=_opt_int(row.get(cs.KEY_START_LINE)),
+        end_line=_opt_int(row.get(cs.KEY_END_LINE)),
+    )
+
+
+def _symbol_key(row: SymbolRow) -> tuple[str, str]:
+    return (row["qualified_name"], row["path"] or "")
+
+
+class TargetRefusal(TypedDict):
+    error: str
+
+
+class Location(NamedTuple):
+    path: str
+    line: int
+
+
+def parse_location(target: str) -> Location | None:
+    """`(path, line)` when `target` is a `path:line` location, else None.
+
+    One parser for every tool that accepts a resolve target, so "is this a
+    location" is answered the same way by `resolve` and by anything that
+    decides differently for a location (a gloss anchors to the innermost
+    definition spanning a line, and refuses an ambiguous NAME).
+    `path:line:col`, the form compilers, linters and `grep -n` print, is a
+    location too; the column cannot change which definitions span the line
+    (issue #2611).
+    """
+    readings = _location_readings(target)
+    return readings[0] if readings else None
+
+
+def _location_readings(target: str) -> list[Location]:
+    """Every way `target` reads as a location, the likeliest first.
+
+    A trailing `:<digits>` is the line. When what precedes it also ends in
+    `:<digits>` that is a line and a column, but a POSIX file name may
+    itself end in `:<digits>`, so the longer path is kept as a second
+    reading for `resolve` to try. Any other colon (a Windows drive, one
+    inside a directory name) stays part of the path.
+    """
+    head, sep, last = target.rpartition(cs.CHAR_COLON)
+    if not (sep and head and last.isdecimal()):
+        return []
+    whole = Location(head, int(last))
+    path, sep, line = head.rpartition(cs.CHAR_COLON)
+    if sep and path and line.isdecimal():
+        return [Location(path, int(line)), whole]
+    return [whole]
+
+
+def _is_absolute(path: str) -> bool:
+    # A Windows path is absolute wherever the graph is read: the root the
+    # project was indexed under may be one.
+    return PurePosixPath(path).is_absolute() or PureWindowsPath(path).is_absolute()
+
+
+def _spellings(path: str) -> list[str]:
+    """`path` as written and, when native here, with its symlinks resolved:
+    the stored root is resolved at index time, a caller's path may not be
+    (`$PWD` through a symlink, `/tmp` on macOS)."""
+    forms = [portable_posix(path)]
+    native = Path(path)
+    if native.is_absolute():
+        try:
+            forms.append(native.resolve().as_posix())
+        except (OSError, RuntimeError):
+            pass
+    return list(dict.fromkeys(forms))
+
+
+def _relative_under(path: str, root: str) -> str | None:
+    base = root.rstrip(cs.SEPARATOR_SLASH) + cs.SEPARATOR_SLASH
+    head, rest = path[: len(base)], path[len(base) :]
+    # A Windows drive compares case-insensitively: an editor reports `c:\`
+    # for the `C:\` the root was stored under.
+    if PureWindowsPath(base).drive:
+        head, base = head.casefold(), base.casefold()
+    return rest if head == base and rest else None
+
+
+def _location_paths(path: str, roots: Sequence[str]) -> list[str]:
+    """The stored, repo-relative paths `path` may name, likeliest first.
+
+    An absolute path inside a root is made relative to it. One inside no
+    root is kept as written: it matches nothing, and a refusal names it
+    rather than guessing at a suffix that may be another checkout's file.
+    """
+    posix = portable_posix(path)
+    if not _is_absolute(posix):
+        return [posix]
+    root_forms = [form for root in roots if root for form in _spellings(root)]
+    relative = [
+        rest
+        for form in _spellings(posix)
+        for root in root_forms
+        if (rest := _relative_under(form, root)) is not None
+    ]
+    return list(dict.fromkeys(relative)) or [posix]
+
+
+def _stored_root(fetch_all: QueryFn, project_name: str) -> str | None:
+    """The root the project was indexed from, as its Project node holds it."""
+    rows = fetch_all(
+        cq.CYPHER_PROJECT_ROOT_PATH,
+        {
+            cs.KEY_PROJECT_NAME: project_name,
+            cs.KEY_PROJECT_PREFIX: _prefix(project_name),
+        },
+    )
+    return _opt_str(rows[0].get(cs.KEY_ROOT_PATH)) if rows else None
+
+
+def _location_roots(fetch_all: QueryFn, project_name: str) -> list[str]:
+    """Where an absolute location path is made relative from: only the root
+    the project was indexed from. A caller's checkout is not trusted for it:
+    an unrelated checkout holding the same relative file would turn its path
+    into this project's symbol, and `annotate` would write on it (bot
+    review). The project's own root reached through a symlink still
+    matches, since `_spellings` resolves the target as well as the root."""
+    stored = _stored_root(fetch_all, project_name)
+    return [stored] if stored else []
+
+
+# --- resolve ------------------------------------------------------------------
+
+
+def resolve(fetch_all: QueryFn, project_name: str, target: str) -> list[SymbolRow]:
+    """Definitions a name or `path:line` refers to, exact first, then suffix.
+
+    `target` is a qualified name, a bare name (`helper`, `Store.get`), or
+    `path:line[:col]` (1-based line; the path relative to the repository
+    root, or absolute inside the root the project was indexed from). Names
+    match on the node's `name` or as a dotted suffix of its qualified name;
+    a location returns the innermost definitions spanning that line, and
+    nothing when `resolve_or_refuse` would refuse it.
+    """
+    prefix = _prefix(project_name)
+    owns = _owner_check(fetch_all, project_name)
+    if parse_location(target) is not None:
+        found = _resolve_location(fetch_all, project_name, target, owns)
+        return found if isinstance(found, list) else []
+    rows = fetch_all(
+        cq.CYPHER_GRAPH_RESOLVE_NAME,
+        {
+            cs.KEY_PROJECT_PREFIX: prefix,
+            cs.KEY_NAME: target.rsplit(cs.SEPARATOR_DOT, 1)[-1],
+            cs.KEY_SUFFIX: f"{cs.SEPARATOR_DOT}{target}",
+            cs.KEY_QN: target,
+        },
+    )
+    owned = [r for r in rows if owns(_text_qn(r))]
+    symbols = [_symbol_row(r) for r in owned]
+    # A C# type reached by `<namespace>.<name>` ranks with the dotted-suffix
+    # matches: that is the name its qualified name used to end with before
+    # the mirrored namespace was left out of it (issue #1629).
+    natural = {
+        str(r.get(cs.KEY_QUALIFIED_NAME, ""))
+        for r in owned
+        if r.get(cs.KEY_NAMESPACE)
+        and f"{r[cs.KEY_NAMESPACE]}{cs.SEPARATOR_DOT}{r.get(cs.KEY_NAME)}" == target
+    }
+    exact = [s for s in symbols if s["qualified_name"] == target]
+    suffix = [
+        s
+        for s in symbols
+        if s["qualified_name"] != target
+        and (
+            s["qualified_name"].endswith(f"{cs.SEPARATOR_DOT}{target}")
+            or s["qualified_name"] in natural
+        )
+    ]
+    by_name = [s for s in symbols if s not in exact and s not in suffix]
+    ordered: list[SymbolRow] = []
+    for bucket in (exact, suffix, by_name):
+        ordered.extend(sorted(bucket, key=_symbol_key))
+    return ordered
+
+
+def resolve_or_refuse(
+    fetch_all: QueryFn, project_name: str, target: str
+) -> list[SymbolRow] | TargetRefusal:
+    """`resolve`, or a refusal when `target` is a location the project
+    cannot answer for: a file it does not hold, or two held files the target
+    could equally name (issue #2611). `cgr graph resolve` and the MCP
+    `resolve`, `annotate` and `glosses` tools all answer through this, so a
+    target is refused, or not, the same way everywhere."""
+    if parse_location(target) is None:
+        return resolve(fetch_all, project_name, target)
+    owns = _owner_check(fetch_all, project_name)
+    return _resolve_location(fetch_all, project_name, target, owns)
+
+
+def _held_paths(
+    fetch_all: QueryFn,
+    project_name: str,
+    paths: Sequence[str],
+    owns: Callable[[str], bool],
+) -> set[str]:
+    rows = fetch_all(
+        cq.CYPHER_GRAPH_LOCATION_FILES,
+        {
+            cs.KEY_PROJECT_PREFIX: _prefix(project_name),
+            cs.CYPHER_PARAM_PATHS: sorted(set(paths)),
+        },
+    )
+    return {
+        path
+        for row in rows
+        if owns(_text_qn(row)) and (path := _opt_str(row.get(cs.KEY_PATH)))
+    }
+
+
+def _definitions_at(
+    fetch_all: QueryFn,
+    project_name: str,
+    location: Location,
+    owns: Callable[[str], bool],
+) -> list[SymbolRow]:
+    if location.line > cs.GRAPH_MAX_SOURCE_LINE:
+        # No file has the line, and Bolt could not carry it (#3244).
+        return []
+    rows = fetch_all(
+        cq.CYPHER_GRAPH_RESOLVE_LOCATION,
+        {
+            cs.KEY_PROJECT_PREFIX: _prefix(project_name),
+            cs.KEY_PATH: location.path,
+            cs.KEY_LINE: location.line,
+        },
+    )
+    symbols = [_symbol_row(r) for r in rows if owns(_text_qn(r))]
+    # Innermost first: the tightest span is what the line "is in".
+    symbols.sort(
+        key=lambda s: (
+            (s["end_line"] or 0) - (s["start_line"] or 0),
+            s["qualified_name"],
+        )
+    )
+    return symbols
+
+
+def _resolve_location(
+    fetch_all: QueryFn,
+    project_name: str,
+    target: str,
+    owns: Callable[[str], bool],
+) -> list[SymbolRow] | TargetRefusal:
+    readings = _location_readings(target)
+    absolute = any(_is_absolute(portable_posix(r.path)) for r in readings)
+    roots = _location_roots(fetch_all, project_name) if absolute else []
+    spelled = {r: _location_paths(r.path, roots) for r in readings}
+    every_path = [path for paths in spelled.values() for path in paths]
+    held: set[str] | None = None
+    if len(readings) > 1:
+        # `x:a:b` is line a of `x` or line b of `x:a`. Only a reading whose
+        # file the project holds is tried, and when it holds both neither
+        # is: falling through to the second reading when the first line has
+        # no definition would answer from the other file (bot review).
+        held = _held_paths(fetch_all, project_name, every_path, owns)
+        holding = [r for r in readings if held.intersection(spelled[r])]
+        if len(holding) > 1:
+            first, second = (
+                Location(next(p for p in spelled[r] if p in held), r.line)
+                for r in holding
+            )
+            return TargetRefusal(
+                error=cs.GRAPH_LOCATION_AMBIGUOUS.format(
+                    target=target,
+                    project=project_name,
+                    path=first.path,
+                    line=first.line,
+                    other_path=second.path,
+                    other_line=second.line,
+                )
+            )
+        spelled = {r: spelled[r] for r in holding}
+    # The spellings of one reading are of one file: the first that names
+    # definitions wins.
+    for reading, paths in spelled.items():
+        for path in paths:
+            if symbols := _definitions_at(
+                fetch_all, project_name, Location(path, reading.line), owns
+            ):
+                return symbols
+    # Only an empty answer pays for the file lookup when it was not needed
+    # above: `[]` for a held file means no definition spans the line.
+    if held is None:
+        held = _held_paths(fetch_all, project_name, every_path, owns)
+    if held:
+        return []
+    return TargetRefusal(
+        error=cs.GRAPH_LOCATION_UNKNOWN_FILE.format(
+            path=every_path[0], project=project_name
+        )
+    )
+
+
+# --- definition ---------------------------------------------------------------
+
+
+def source_root_for(
+    fetch_all: QueryFn, project_name: str, repo_root: Path
+) -> Path | None:
+    """`repo_root` when the graph project was indexed from it, else None.
+
+    A definition of another project carries a relative path that may also
+    exist under `repo_root`; reading it there would return the wrong file. A
+    matching project name is not enough either: the Project node's stored
+    root path must be this repository.
+    """
+    stored = _stored_root(fetch_all, project_name)
+    if not stored:
+        return None
+    local = repo_root.resolve()
+    return local if Path(stored).resolve() == local else None
+
+
+def _decorated_start(row: ResultRow, own_start: int | None) -> int | None:
+    """The first decorator's line when the node records one above its own
+    start, else that start (issue #2428).
+
+    A graph indexed before the property existed has none and keeps the span
+    it always answered with; a value that is not a line above the definition
+    cannot be a decorator of it and is not trusted.
+    """
+    decorated = _opt_int(row.get(cs.KEY_DECORATED_START_LINE))
+    if decorated is None or own_start is None or not 0 < decorated < own_start:
+        return own_start
+    return decorated
+
+
+def definition(
+    fetch_all: QueryFn, project_name: str, qualified_name: str, repo_root: Path | None
+) -> DefinitionRow:
+    """File, span, decorators, docstring and source of one definition.
+
+    The span and source include the decorators written above it (issue
+    #2428). Source is read from `repo_root` when the node's repo-relative path
+    stays inside it; a graph indexed elsewhere still answers with the span.
+    """
+    rows = fetch_all(
+        cq.CYPHER_GRAPH_DEFINITION,
+        {cs.KEY_PROJECT_PREFIX: _prefix(project_name), cs.KEY_QN: qualified_name},
+    )
+    owns = _owner_check(fetch_all, project_name)
+    rows = [r for r in rows if owns(_text_qn(r))]
+    if not rows:
+        return DefinitionRow(
+            label="",
+            qualified_name=qualified_name,
+            path=None,
+            start_line=None,
+            end_line=None,
+            name_line=None,
+            decorators=[],
+            name=None,
+            docstring=None,
+            source=None,
+            found=False,
+        )
+    row = rows[0]
+    symbol = _symbol_row(row)
+    source: str | None = None
+    path, own_start, end = symbol["path"], symbol["start_line"], symbol["end_line"]
+    start = _decorated_start(row, own_start)
+    if repo_root is not None and path and start and end:
+        candidate = (repo_root / path).resolve()
+        if candidate.is_relative_to(repo_root.resolve()) and candidate.is_file():
+            source = extract_source_lines(candidate, start, end)
+    return DefinitionRow(
+        label=symbol["label"],
+        qualified_name=symbol["qualified_name"],
+        path=path,
+        start_line=start,
+        end_line=end,
+        name_line=_opt_int(row.get(cs.KEY_NAME_START_LINE)) or own_start,
+        decorators=_as_str_list(row.get(cs.KEY_DECORATORS)),
+        name=_opt_str(row.get(cs.KEY_NAME)),
+        docstring=_opt_str(row.get(cs.KEY_DOCSTRING)),
+        source=source,
+        found=True,
+    )
+
+
+# --- callers / callees --------------------------------------------------------
+
+
+def _site_row(row: ResultRow, depth: int, through: str) -> CallSiteRow:
+    kwargs = row.get(cs.KEY_KWARG_NAMES)
+    return CallSiteRow(
+        label=str(row.get(cs.KEY_LABEL, "")),
+        qualified_name=str(row.get(cs.KEY_QUALIFIED_NAME, "")),
+        path=_opt_str(row.get(cs.KEY_PATH)),
+        callee_path=_opt_str(row.get(cs.KEY_CALLEE_PATH)),
+        line=_opt_int(row.get(cs.KEY_LINE)),
+        col=_opt_int(row.get(cs.KEY_COL)),
+        end_line=_opt_int(row.get(cs.KEY_END_LINE)),
+        end_col=_opt_int(row.get(cs.KEY_END_COL)),
+        arg_count=_opt_int(row.get(cs.KEY_ARG_COUNT)),
+        kwarg_names=[str(k) for k in kwargs] if isinstance(kwargs, list) else None,
+        resolution=_opt_str(row.get(cs.KEY_RESOLUTION)),
+        depth=depth,
+        through=through,
+    )
+
+
+def _site_sort_key(row: CallSiteRow) -> tuple[int, str, str, int, int]:
+    return (
+        row["depth"],
+        row["through"],
+        row["qualified_name"],
+        row["line"] if row["line"] is not None else -1,
+        row["col"] if row["col"] is not None else -1,
+    )
+
+
+class _CallReads(TypedDict):
+    # The start's own read (`$qn`), the read of a whole later level (`$qns`),
+    # and that read's column naming the frontier node a row hangs off.
+    start: str
+    level: str
+    through: str
+
+
+_CALLERS_READS = _CallReads(
+    start=cq.CYPHER_GRAPH_CALLERS,
+    level=cq.CYPHER_GRAPH_CALLERS_OF,
+    through=cs.KEY_TO_QN,
+)
+_CALLEES_READS = _CallReads(
+    start=cq.CYPHER_GRAPH_CALLEES,
+    level=cq.CYPHER_GRAPH_CALLEES_OF,
+    through=cs.KEY_FROM_QN,
+)
+
+
+def _walk_sites(
+    fetch_all: QueryFn, project_name: str, reads: _CallReads, start: str, depth: int
+) -> list[CallSiteRow]:
+    # Breadth-first over endpoints, one query per LEVEL: one per frontier
+    # node was 886 round trips for a depth-2 walk on django (issue #2597).
+    # The start is read on its own, so depth 1, the default, is still the one
+    # single-node read. A node's sites appear at the depth it was first
+    # reached and never again, so a cycle terminates and the output stays a
+    # finite, ordered list.
+    prefix = _prefix(project_name)
+    owns = _owner_check(fetch_all, project_name)
+    seen: set[str] = {start}
+    frontier: list[str] = [start]
+    out: list[CallSiteRow] = []
+    for level in range(1, max(1, depth) + 1):
+        if level == 1:
+            rows = fetch_all(
+                reads["start"], {cs.KEY_PROJECT_PREFIX: prefix, cs.KEY_QN: start}
+            )
+            hops = [(start, row) for row in rows]
+        else:
+            rows = fetch_all(
+                reads["level"],
+                {cs.KEY_PROJECT_PREFIX: prefix, cs.KEY_QNS: sorted(frontier)},
+            )
+            hops = [(str(row.get(reads["through"], "")), row) for row in rows]
+        next_frontier: list[str] = []
+        for through, row in hops:
+            # A foreign row is neither reported nor a hop the walk continues
+            # through (issue #1982).
+            if not owns(_text_qn(row)):
+                continue
+            site = _site_row(row, level, through)
+            out.append(site)
+            other = site["qualified_name"]
+            if other not in seen:
+                seen.add(other)
+                next_frontier.append(other)
+        frontier = next_frontier
+        if not frontier:
+            break
+    return sorted(out, key=_site_sort_key)
+
+
+def callers(
+    fetch_all: QueryFn, project_name: str, qualified_name: str, depth: int = 1
+) -> list[CallSiteRow]:
+    """Call sites that reach `qualified_name`, one row per site.
+
+    `depth` > 1 follows the callers' callers; `through` names the callee
+    each row's site invokes, so a transitive row is still one exact site.
+    """
+    return _walk_sites(fetch_all, project_name, _CALLERS_READS, qualified_name, depth)
+
+
+def callees(
+    fetch_all: QueryFn, project_name: str, qualified_name: str, depth: int = 1
+) -> list[CallSiteRow]:
+    """Call sites inside `qualified_name`, one row per site (`through` = caller).
+
+    `path` is `through`'s file, where the site is, not the callee's: that
+    one is `callee_path`, so a hop past depth 1 still reads as `path:line`.
+    """
+    return _walk_sites(fetch_all, project_name, _CALLEES_READS, qualified_name, depth)
+
+
+# --- implementors / overrides / importers ---------------------------------------
+
+
+def _related_rows(
+    fetch_all: QueryFn, project_name: str, query: str, qn: str
+) -> list[RelatedRow]:
+    rows = fetch_all(
+        query, {cs.KEY_PROJECT_PREFIX: _prefix(project_name), cs.KEY_QN: qn}
+    )
+    owns = _owner_check(fetch_all, project_name)
+    rows = [r for r in rows if owns(_text_qn(r))]
+    out = [
+        RelatedRow(
+            label=str(r.get(cs.KEY_LABEL, "")),
+            qualified_name=str(r.get(cs.KEY_QUALIFIED_NAME, "")),
+            path=_opt_str(r.get(cs.KEY_PATH)),
+            relationship=str(r.get(cs.KEY_REL_TYPE, "")),
+        )
+        for r in rows
+    ]
+    return sorted(out, key=lambda r: (r["qualified_name"], r["relationship"]))
+
+
+def _walk_related(
+    fetch_all: QueryFn,
+    project_name: str,
+    start: str,
+    depth: int,
+    hop_queries: tuple[str, ...],
+) -> list[TransitiveRelatedRow]:
+    """Breadth-first over `hop_queries`, one batched query per hop and query.
+
+    Each query keeps its own frontier, so a direction is only ever followed
+    onwards in that same direction. A node is listed at the depth it is
+    first reached, once per edge reaching it there (a diamond's two
+    parents), and never again, so a cycle ends and the start is never its
+    own subtype. A foreign row is neither listed nor a hop (issue #1982).
+    """
+    prefix = _prefix(project_name)
+    owns = _owner_check(fetch_all, project_name)
+    reached = {start}
+    # One list per query: each frontier is that query's own.
+    frontiers = {query: [start] for query in hop_queries}
+    out: list[TransitiveRelatedRow] = []
+    for level in range(1, depth + 1):
+        found: dict[str, set[str]] = {query: set() for query in hop_queries}
+        for query, frontier in frontiers.items():
+            if not frontier:
+                continue
+            rows = fetch_all(
+                query, {cs.KEY_PROJECT_PREFIX: prefix, cs.KEY_QNS: frontier}
+            )
+            hop = _first_reached_rows(rows, reached, owns, level)
+            out.extend(hop)
+            found[query].update(row["qualified_name"] for row in hop)
+        for qns in found.values():
+            reached.update(qns)
+        frontiers = {query: sorted(qns) for query, qns in found.items()}
+        if not any(frontiers.values()):
+            break
+    return sorted(
+        out,
+        key=lambda r: (
+            r["depth"],
+            r["through"],
+            r["qualified_name"],
+            r["relationship"],
+        ),
+    )
+
+
+def _first_reached_rows(
+    rows: list[ResultRow],
+    reached: set[str],
+    owns: Callable[[str], bool],
+    level: int,
+) -> list[TransitiveRelatedRow]:
+    # The rows of one hop that reach a project node not reached at an
+    # earlier level, listed at `level`.
+    return [
+        TransitiveRelatedRow(
+            label=str(r.get(cs.KEY_LABEL, "")),
+            qualified_name=qn,
+            path=_opt_str(r.get(cs.KEY_PATH)),
+            relationship=str(r.get(cs.KEY_REL_TYPE, "")),
+            depth=level,
+            through=str(r.get(cs.KEY_THROUGH, "")),
+        )
+        for r in rows
+        if (qn := _text_qn(r)) not in reached and owns(qn)
+    ]
+
+
+def implementors(
+    fetch_all: QueryFn, project_name: str, qualified_name: str, depth: int = 1
+) -> list[RelatedRow] | list[TransitiveRelatedRow]:
+    """Types that INHERIT from or IMPLEMENT `qualified_name`.
+
+    Direct subtypes only by default. `depth` > 1 also follows their own
+    subtypes, so every class implementing an interface through an abstract
+    base is listed; each row then carries its `depth` and the type it was
+    reached `through`.
+    """
+    if depth > 1:
+        return _walk_related(
+            fetch_all,
+            project_name,
+            qualified_name,
+            depth,
+            (cq.CYPHER_GRAPH_IMPLEMENTORS_OF,),
+        )
+    return _related_rows(
+        fetch_all, project_name, cq.CYPHER_GRAPH_IMPLEMENTORS, qualified_name
+    )
+
+
+def overrides(
+    fetch_all: QueryFn, project_name: str, qualified_name: str, depth: int = 1
+) -> list[RelatedRow] | list[TransitiveRelatedRow]:
+    """Methods that OVERRIDE `qualified_name`, and the method it overrides.
+
+    Direct only by default. `depth` > 1 follows each direction on its own:
+    the overriders' overriders, and what the overridden method overrides in
+    turn, never a sibling override of the same method.
+    """
+    if depth > 1:
+        return _walk_related(
+            fetch_all,
+            project_name,
+            qualified_name,
+            depth,
+            (cq.CYPHER_GRAPH_OVERRIDERS_OF, cq.CYPHER_GRAPH_OVERRIDDEN_BY),
+        )
+    return _related_rows(
+        fetch_all, project_name, cq.CYPHER_GRAPH_OVERRIDES, qualified_name
+    )
+
+
+def _importer_row(r: ResultRow) -> ImporterRow:
+    return ImporterRow(
+        module=str(r.get(cs.KEY_QUALIFIED_NAME, "")),
+        path=_opt_str(r.get(cs.KEY_PATH)),
+        line=_opt_int(r.get(cs.KEY_LINE)),
+        col=_opt_int(r.get(cs.KEY_COL)),
+        end_line=_opt_int(r.get(cs.KEY_END_LINE)),
+        end_col=_opt_int(r.get(cs.KEY_END_COL)),
+        alias=_opt_str(r.get(cs.KEY_ALIAS)),
+        imported_name=_opt_str(r.get(cs.KEY_IMPORTED_NAME)),
+    )
+
+
+def _importer_key(r: ImporterRow) -> tuple[str, int, int, str, str]:
+    return (
+        r["module"],
+        r["line"] if r["line"] is not None else -1,
+        # `or -1` would fold a real column 0 -- the common case, an import
+        # at the start of a line -- into the same key as a missing column,
+        # leaving co-located rows in the arbitrary order the graph
+        # returned them.
+        r["col"] if r["col"] is not None else -1,
+        r["alias"] or "",
+        r["imported_name"] or "",
+    )
+
+
+def importers(
+    fetch_all: QueryFn, project_name: str, module_qn: str
+) -> list[ImporterRow]:
+    """Modules importing `module_qn`, with each import statement's location.
+
+    Direct importers only: a module reaching `module_qn` through a package
+    facade is answered by `importers_through_reexports`.
+    """
+    rows = fetch_all(
+        cq.CYPHER_GRAPH_IMPORTERS,
+        {cs.KEY_PROJECT_PREFIX: _prefix(project_name), cs.KEY_QN: module_qn},
+    )
+    owns = _owner_check(fetch_all, project_name)
+    return sorted(
+        (_importer_row(r) for r in rows if owns(_text_qn(r))), key=_importer_key
+    )
+
+
+def _binds_whole(row: ImporterRow, imported_qn: str) -> bool:
+    """Whether `row` imports all of `imported_qn` rather than one name of it.
+
+    `import pkg` and `const m = require(...)` record no imported name,
+    `from pkg import *` and `import * as ns` record `*`, and Rust records
+    `use crate::m;` and `pub use crate::m::*;` under the module's own name,
+    as Python does `from pkg import m`. A JS/TS named import binds one
+    export whatever its name: `import { index } from './index'` is the
+    barrel's `index`, not the barrel (#2573 review).
+    """
+    name = row["imported_name"]
+    if name is None or name == cs.IMPORTED_NAME_WILDCARD:
+        return True
+    if (row["path"] or "").endswith(cs.JS_TS_ALL_EXTENSIONS):
+        return False
+    return name == imported_qn.rpartition(cs.SEPARATOR_DOT)[2]
+
+
+def _bound_names(
+    row: ImporterRow, imported_qn: str, forwarded: frozenset[str] | None
+) -> frozenset[str] | None:
+    """The names `row`'s module binds from `imported_qn`: its alias, or,
+    for a `*` import (no alias), every name `forwarded` to it."""
+    if row["alias"] is None and _binds_whole(row, imported_qn):
+        return forwarded
+    name = row["alias"] or row["imported_name"]
+    return frozenset({name}) if name else frozenset()
+
+
+def _is_facade(path: str | None) -> bool:
+    if not path:
+        return False
+    return Path(path).name.partition(cs.SEPARATOR_DOT)[0] in cs.REEXPORT_FACADE_STEMS
+
+
+def _reach(
+    row: ImporterRow, imported_qn: str, entries: list[_ReexportEntry]
+) -> tuple[_ReexportEntry, frozenset[str] | None] | None:
+    """The entry `row` reaches the target through, and the names it binds
+    for the next hop; None when it takes nothing the entries carry.
+
+    A name imported from a module proves the module exports it, whatever
+    the language. All of a module (`import pkg`, `*`) reaches what it
+    imports only when it is a facade: the graph does not record whether an
+    import is public (`pub use`, `export ... from`), and a plain module
+    that merely uses the target would otherwise pass it on to every module
+    importing it.
+    """
+    if _binds_whole(row, imported_qn):
+        matched = entries if _is_facade(entries[0]["row"]["path"]) else []
+    else:
+        name = row["imported_name"]
+        matched = [e for e in entries if e["names"] is None or name in e["names"]]
+    if not matched:
+        return None
+    # A `*` import passes on every name the statements it matched carry.
+    forwarded = _union_names(entry["names"] for entry in matched)
+    return matched[0], _bound_names(row, imported_qn, forwarded)
+
+
+def _union_names(
+    name_sets: Iterable[frozenset[str] | None],
+) -> frozenset[str] | None:
+    """Every name in `name_sets`; None (every name) when any of them is."""
+    union: frozenset[str] = frozenset()
+    for names in name_sets:
+        if names is None:
+            return None
+        union |= names
+    return union
+
+
+def _new_names(
+    names: frozenset[str] | None, walked: frozenset[str] | None
+) -> frozenset[str] | None:
+    """The part of `names` not already in `walked`; None is every name."""
+    if walked is None:
+        return frozenset()
+    if names is None:
+        return None
+    return names - walked
+
+
+def _reexport_hops(
+    fetch_all: QueryFn,
+    project_name: str,
+    qns: list[str],
+    owns: Callable[[str], bool],
+) -> list[tuple[str, ImporterRow]]:
+    """(imported module, importer row) for every importer of `qns`, in order.
+
+    A foreign importer is neither listed nor a hop (issue #1982).
+    """
+    rows = fetch_all(
+        cq.CYPHER_GRAPH_IMPORTERS_OF,
+        {cs.KEY_PROJECT_PREFIX: _prefix(project_name), cs.KEY_QNS: qns},
+    )
+    return sorted(
+        (
+            (str(r.get(cs.KEY_TO_QN, "")), _importer_row(r))
+            for r in rows
+            if owns(_text_qn(r))
+        ),
+        key=lambda hop: (hop[0], _importer_key(hop[1])),
+    )
+
+
+def _reexport_step(
+    hops: list[tuple[str, ImporterRow]],
+    frontier: dict[str, list[_ReexportEntry]],
+    walked: dict[str, frozenset[str] | None],
+    out: list[ReexportImporterRow],
+) -> dict[str, list[_ReexportEntry]]:
+    """One breadth-first hop: the next frontier, listing new modules in `out`."""
+    found: dict[str, list[_ReexportEntry]] = {}
+    for imported_qn, row in hops:
+        entries = frontier.get(imported_qn)
+        reach = _reach(row, imported_qn, entries) if entries else None
+        if reach is None:
+            continue
+        through, names = reach
+        module = row["module"]
+        via = [through["row"], *through["via"]]
+        if module in walked:
+            # Listed at an earlier depth: walked on only with what this path
+            # brings it that the earlier one did not.
+            names = _new_names(names, walked[module])
+            if names is not None and not names:
+                continue
+        else:
+            out.append(ReexportImporterRow(**row, via=via))
+        found.setdefault(module, []).append(
+            _ReexportEntry(row=row, via=via, names=names)
+        )
+    return found
+
+
+def importers_through_reexports(
+    fetch_all: QueryFn, project_name: str, module_qn: str
+) -> list[ReexportImporterRow]:
+    """`importers`, plus the modules reaching `module_qn` through re-exports.
+
+    A facade (`pkg/__init__.py` with `from ._client import Client`, a Rust
+    `lib.rs` with `pub use frame::Frame;`, an `index.ts` barrel) is often
+    the only direct importer of what it exposes (issue #2573). A module is
+    reached through an importer X when it imports from X a name X bound by
+    importing it, or when it imports all of X and X is a facade; see
+    `_reach`. Each row keeps its own statement and lists in `via` the
+    statements it came through, consumer side first.
+
+    Breadth-first, one query per hop: a module is listed at the depth it is
+    first reached, with the statements that reach it there, and never again,
+    so a direct importer is listed once. A later path bringing it a name it
+    did not bind there is still walked on, for that name alone, so a module
+    importing the name from it is reached; a module is walked again only
+    for names new to it, so a cycle of re-exports ends.
+    """
+    direct = importers(fetch_all, project_name, module_qn)
+    out = [ReexportImporterRow(**row, via=[]) for row in direct]
+    frontier: dict[str, list[_ReexportEntry]] = {}
+    for row in direct:
+        names = _bound_names(row, module_qn, None)
+        frontier.setdefault(row["module"], []).append(
+            _ReexportEntry(row=row, via=[], names=names)
+        )
+    # The names each module has been walked on with; the target passes
+    # nothing back to itself.
+    walked: dict[str, frozenset[str] | None] = {module_qn: None}
+    for module, entries in frontier.items():
+        walked[module] = _union_names(entry["names"] for entry in entries)
+    owns = _owner_check(fetch_all, project_name)
+    while frontier:
+        hops = _reexport_hops(fetch_all, project_name, sorted(frontier), owns)
+        found = _reexport_step(hops, frontier, walked, out)
+        for module, entries in found.items():
+            walked[module] = _union_names(
+                [walked.get(module, frozenset()), *(e["names"] for e in entries)]
+            )
+        frontier = found
+    return sorted(out, key=lambda r: (len(r["via"]), *_importer_key(r)))
+
+
+# --- tests_reaching ------------------------------------------------------------
+
+
+class ReachIndex:
+    """The project's reverse call graph plus the test classifier's inputs.
+
+    Built once from the dead-code fetch (one query each for nodes and edges)
+    and walked backwards from one symbol; the structural delta (issue #1525)
+    walks callers per hop instead and does not use it.
+    """
+
+    def __init__(
+        self,
+        nodes: dict[_NodeId, PropertyDict],
+        reverse: dict[str, set[str]],
+    ) -> None:
+        self._by_qn: dict[str, tuple[str, PropertyDict]] = {
+            str(qn): (label, props) for (label, qn), props in nodes.items()
+        }
+        self._reverse = reverse
+        self._rust_modules = _rust_test_modules_from_nodes(nodes)
+        self._rust_spans = _rust_test_fn_spans(nodes)
+
+    @classmethod
+    def build(cls, fetch_all: QueryFn, project_name: str) -> ReachIndex:
+        params = {cs.KEY_PROJECT_PREFIX: _prefix(project_name)}
+        nodes: dict[_NodeId, PropertyDict] = {}
+        owns = _owner_check(fetch_all, project_name)
+        for row in fetch_all(cq.CYPHER_DEAD_CODE_NODES, params):
+            qn = str(row.get(cs.KEY_QUALIFIED_NAME) or "")
+            if not owns(qn):
+                continue
+            if qn:
+                nodes[(str(row.get(cs.KEY_LABEL, "")), qn)] = _node_props(row)
+        reverse: dict[str, set[str]] = {}
+        for row in fetch_all(cq.CYPHER_DEAD_CODE_RELS, params):
+            if str(row.get(cs.KEY_REL_TYPE, "")) not in _REACH_RELS:
+                continue
+            src = str(row.get(cs.KEY_FROM_QN) or "")
+            dst = str(row.get(cs.KEY_TO_QN) or "")
+            # Both ends owned: a foreign caller must neither be reported
+            # nor be a hop the walk continues through (issue #1982).
+            if src and dst and owns(src) and owns(dst):
+                reverse.setdefault(dst, set()).add(src)
+        return cls(nodes, reverse)
+
+    def _walk(self, qualified_name: str) -> tuple[dict[str, int], dict[str, str]]:
+        depth_of: dict[str, int] = {qualified_name: 0}
+        through_of: dict[str, str] = {qualified_name: qualified_name}
+        frontier = [qualified_name]
+        while frontier:
+            next_frontier: list[str] = []
+            for qn in sorted(frontier):
+                for caller in sorted(self._reverse.get(qn, ())):
+                    if caller in depth_of:
+                        continue
+                    depth_of[caller] = depth_of[qn] + 1
+                    through_of[caller] = qn
+                    next_frontier.append(caller)
+            frontier = next_frontier
+        return depth_of, through_of
+
+    def tests_reaching(self, qualified_name: str) -> list[TestReachRow]:
+        depth_of, through_of = self._walk(qualified_name)
+        out: list[TestReachRow] = []
+        for qn, depth in depth_of.items():
+            if qn == qualified_name:
+                continue
+            entry = self._by_qn.get(qn)
+            if entry is None:
+                continue
+            label, props = entry
+            path = str(props.get(cs.KEY_PATH) or "")
+            if _is_test_symbol(props, qn, path, self._rust_modules, self._rust_spans):
+                out.append(
+                    TestReachRow(
+                        label=label,
+                        qualified_name=qn,
+                        path=path or None,
+                        depth=depth,
+                        through=through_of[qn],
+                    )
+                )
+        return sorted(out, key=lambda r: (r["depth"], r["qualified_name"]))
+
+
+def tests_reaching(
+    fetch_all: QueryFn,
+    project_name: str,
+    qualified_name: str,
+) -> list[TestReachRow]:
+    """Test symbols from which `qualified_name` is reachable, with distance.
+
+    Walks CALLS / REFERENCES / INSTANTIATES backwards over the project's
+    edges (the dead-code fetch, one query each for nodes and edges) and keeps
+    the reached definitions the dead-code root classifier calls tests, so
+    Rust `#[cfg(test)]` modules count exactly as they do there.
+    """
+    return ReachIndex.build(fetch_all, project_name).tests_reaching(qualified_name)
+
+
+# --- cross-service edges (issue #1603) ---------------------------------------
+
+
+def _endpoint_row(row: ResultRow) -> EndpointRow:
+    callers = row.get(cs.KEY_CALLERS)
+    return EndpointRow(
+        endpoint=str(row.get(cs.KEY_ENDPOINT) or ""),
+        kind=_opt_str(row.get(cs.KEY_KIND)),
+        label=str(row.get(cs.KEY_LABEL) or ""),
+        handler=str(row.get(cs.KEY_HANDLER) or ""),
+        path=_opt_str(row.get(cs.KEY_PATH)),
+        callers=callers if isinstance(callers, int) else 0,
+    )
+
+
+def _endpoint_caller_row(row: ResultRow) -> EndpointCallerRow:
+    return EndpointCallerRow(
+        label=str(row.get(cs.KEY_LABEL) or ""),
+        qualified_name=str(row.get(cs.KEY_QUALIFIED_NAME) or ""),
+        path=_opt_str(row.get(cs.KEY_PATH)),
+        url=_opt_str(row.get(cs.KEY_URL)),
+        direction=_opt_str(row.get(cs.KEY_DIRECTION)),
+        endpoint=str(row.get(cs.KEY_ENDPOINT) or ""),
+        handler=str(row.get(cs.KEY_HANDLER) or ""),
+    )
+
+
+def capture_gap(
+    fetch_all: QueryFn,
+    project_name: str,
+    required: frozenset[cs.RelationshipType],
+) -> CaptureGap | None:
+    """What the project's last sync left out of `required`, or None.
+
+    None when every required relationship was captured, and also for a
+    graph synced before the capture was recorded: an unknown selection is
+    not evidence that a group was off, so it stays silent (issue #2521).
+    """
+    rows = fetch_all(cq.CYPHER_PROJECT_CAPTURE, {cs.KEY_PROJECT_NAME: project_name})
+    recorded = rows[0].get(cs.KEY_CAPTURED_RELATIONSHIPS) if rows else None
+    if not isinstance(recorded, list):
+        return None
+    missing = {rel for rel in required if rel.value not in recorded}
+    if not missing:
+        return None
+    return CaptureGap(
+        groups=sorted(
+            group.value
+            for group, rels in cs.CAPTURE_GROUP_RELS.items()
+            if rels & missing
+        ),
+        relationships=sorted(rel.value for rel in missing),
+        root_path=_opt_str(rows[0].get(cs.KEY_ROOT_PATH)),
+    )
+
+
+def endpoints(fetch_all: QueryFn, project_name: str) -> list[EndpointRow]:
+    """The endpoints a project exposes, each with its handler and how many
+    call sites in the whole graph reach it. Zero callers on a graph that
+    holds only this project means "none indexed", not "dead"."""
+    params = {cs.KEY_PROJECT_PREFIX: _prefix(project_name)}
+    return [_endpoint_row(row) for row in fetch_all(cq.CYPHER_GRAPH_ENDPOINTS, params)]
+
+
+class UnknownEndpointError(ValueError):
+    """An `endpoint_callers` target that names no endpoint the project
+    exposes; the message carries the close identities and handlers."""
+
+
+def endpoint_callers(
+    fetch_all: QueryFn, project_name: str, target: str
+) -> list[EndpointCallerRow]:
+    """Call sites, in any project, that reach the endpoint `target` names:
+    the handler's qualified name or the endpoint identity. An identity
+    matches in any framework's path-parameter syntax (`GET /users/{id}`,
+    `:id`, `<id>`), and a concrete request (`GET /users/42`) matches the
+    templates it would be routed to.
+
+    Through a NETWORK resource that RESOLVES_TO the endpoint, or directly for
+    the RPC and dispatch kinds, which join without RESOLVES_TO. A target that
+    names no endpoint raises `UnknownEndpointError`: an empty answer means
+    the endpoint exists and nothing reaches it (issue #3186).
+    """
+    prefix = _prefix(project_name)
+    # `foo.` selects `foo.bar`'s handlers too, and a concrete or re-spelled
+    # target would resolve to that project's route: only this project's own
+    # endpoints are matched and answered for. The callers stay unscoped, as
+    # they are reported from any project.
+    owns = _owner_check(fetch_all, project_name)
+    exposed = [
+        row
+        for row in fetch_all(
+            cq.CYPHER_GRAPH_EXPOSED_ENDPOINTS, {cs.KEY_PROJECT_PREFIX: prefix}
+        )
+        if owns(str(row.get(cs.KEY_HANDLER)))
+    ]
+    keys = _endpoint_keys(exposed, target, project_name)
+    if not keys:
+        raise UnknownEndpointError(_unknown_endpoint(exposed, project_name, target))
+    rows = {
+        _endpoint_caller_key(row): row
+        for key in keys
+        for query in (
+            cq.CYPHER_GRAPH_ENDPOINT_CALLERS,
+            cq.CYPHER_GRAPH_ENDPOINT_DIRECT_CALLERS,
+        )
+        for row in map(
+            _endpoint_caller_row,
+            fetch_all(query, {cs.KEY_PROJECT_PREFIX: prefix, cs.KEY_QN: key}),
+        )
+        if owns(row["handler"])
+    }
+    # Every field in the key: a caller that both reads and writes one URL is
+    # two rows, and two handlers can share a caller (bot review on PR #1975).
+    return [rows[key] for key in sorted(rows)]
+
+
+def _endpoint_caller_key(row: EndpointCallerRow) -> tuple[str, ...]:
+    return (
+        row["qualified_name"],
+        row["url"] or "",
+        row["path"] or "",
+        row["direction"] or "",
+        row["endpoint"],
+        row["handler"],
+    )
+
+
+def _endpoint_keys(
+    exposed: list[ResultRow], target: str, project_name: str
+) -> list[str]:
+    # The handler or stored identities `target` means: itself when the
+    # project exposes it as written, else the routes a `METHOD /path`
+    # request reaches, by the same rule that links a client's URL to a
+    # route. A parameter segment in the target (`{id}`) is a value like any
+    # other, so it reaches the route's parameter in whichever syntax that
+    # route declares it (`:id`, `<id>`, `<int:id>`).
+    from .parsers.endpoint_routes import METHOD_ANY
+    from .parsers.endpoints import inferred_route_identities, url_matches_template
+
+    handlers = {str(row.get(cs.KEY_HANDLER)) for row in exposed}
+    identities = sorted({str(row.get(cs.KEY_ENDPOINT)) for row in exposed})
+    if target in handlers or target in identities:
+        return [target]
+    method, _, path = target.strip().partition(" ")
+    method, path = method.upper(), path.strip()
+    if not path.startswith(cs.SEPARATOR_SLASH):
+        # An RPC or dispatch identity has no path: it matches as written.
+        return []
+    served: list[str] = []
+    for identity in identities:
+        route_method, _, template = identity.partition(" ")
+        if route_method.upper() in (method, METHOD_ANY) and url_matches_template(
+            path, template.strip()
+        ):
+            served.append(identity)
+    # A client-facing path behind a proxy prefix or a router mount reaches
+    # the route the linker inferred for it, so the callers it linked answer.
+    return served or inferred_route_identities(path, method, identities, project_name)
+
+
+def _unknown_endpoint(exposed: list[ResultRow], project_name: str, target: str) -> str:
+    names = sorted(
+        {str(row.get(cs.KEY_ENDPOINT)) for row in exposed}
+        | {str(row.get(cs.KEY_HANDLER)) for row in exposed}
+    )
+    close = difflib.get_close_matches(
+        target, names, n=cs.GRAPH_SUGGESTION_LIMIT, cutoff=cs.GRAPH_SUGGESTION_CUTOFF
+    )
+    return cs.MCP_UNKNOWN_ENDPOINT.format(target=target, project=project_name) + (
+        did_you_mean(close) if close else cs.MCP_UNKNOWN_ENDPOINT_HINT
+    )
+
+
+def remote_dependencies(
+    fetch_all: QueryFn, project_name: str
+) -> list[RemoteDependencyRow]:
+    """Every network access a project makes, with the handler and project it
+    resolves to; an unresolved row (no endpoint) is a dependency the graph
+    cannot place -- a dynamic URL, or a service not indexed."""
+    params = {cs.KEY_PROJECT_PREFIX: _prefix(project_name)}
+    return [
+        RemoteDependencyRow(
+            label=str(row.get(cs.KEY_LABEL) or ""),
+            qualified_name=str(row.get(cs.KEY_QUALIFIED_NAME) or ""),
+            path=_opt_str(row.get(cs.KEY_PATH)),
+            url=_opt_str(row.get(cs.KEY_URL)),
+            direction=_opt_str(row.get(cs.KEY_DIRECTION)),
+            endpoint=_opt_str(row.get(cs.KEY_ENDPOINT)),
+            handler=_opt_str(row.get(cs.KEY_HANDLER)),
+            handler_project=_opt_str(row.get(cs.KEY_HANDLER_PROJECT)),
+        )
+        for row in fetch_all(cq.CYPHER_GRAPH_REMOTE_DEPENDENCIES, params)
+    ]
+
+
+# --- unknown projects and names (issue #2461) ----------------------------------
+#
+# Every read above is scoped by a project prefix and walks edges from a name,
+# so a project the graph does not hold and a name it never saw both answer
+# with nothing -- the same `[]` a definition nobody calls gets. The CLI and
+# the MCP tools tell them apart with these, and only once an answer is empty.
+
+
+def indexed_projects(fetch_all: QueryFn) -> dict[str, str | None]:
+    """{project name: the root it was indexed from} for every project."""
+    return project_roots_from_rows(fetch_all(cq.CYPHER_LIST_PROJECTS, None))
+
+
+def close_project_names(project_name: str, known: Iterable[str]) -> list[str]:
+    """The indexed projects a mistyped or stale `project_name` most likely
+    means, closest spelling first.
+
+    Names are `<dir>__<hash>`: a close spelling catches a typo in the hash,
+    and the same `<dir>` part catches a bare directory name, a stale hash or
+    another checkout, which a spelling ratio misses once the hash differs.
+    """
+    names = sorted(set(known))
+    close = difflib.get_close_matches(
+        project_name,
+        names,
+        n=cs.GRAPH_SUGGESTION_LIMIT,
+        cutoff=cs.GRAPH_SUGGESTION_CUTOFF,
+    )
+    stem = project_name.split(cs.PROJECT_NAME_DIGEST_MARKER, 1)[0]
+    same_dir = [
+        name
+        for name in names
+        if name.split(cs.PROJECT_NAME_DIGEST_MARKER, 1)[0] == stem
+    ]
+    return list(dict.fromkeys([*close, *same_dir]))[: cs.GRAPH_SUGGESTION_LIMIT]
+
+
+def projects_rooted_at(roots: dict[str, str | None], repo_root: Path) -> list[str]:
+    """The projects indexed from `repo_root`, whatever they were named.
+
+    A repository indexed with a name of its own is not the `<dir>__<hash>`
+    its path derives, so a query run from inside it misses it by name alone.
+    """
+    here = repo_root.resolve()
+    return sorted(
+        name for name, root in roots.items() if root and Path(root).resolve() == here
+    )
+
+
+def node_exists(fetch_all: QueryFn, qualified_name: str) -> bool:
+    """Whether any node, in any project, carries `qualified_name`."""
+    return bool(fetch_all(cq.CYPHER_GRAPH_NODE_EXISTS, {cs.KEY_QN: qualified_name}))
+
+
+def similar_targets(
+    fetch_all: QueryFn, project_name: str, qualified_name: str
+) -> list[str]:
+    """This project's definitions a missing `qualified_name` most likely
+    means: close spellings of its last part under the same parent, then the
+    definitions that carry that last part as their name, wherever they are.
+    """
+    owns = _owner_check(fetch_all, project_name)
+    parent, _, leaf = qualified_name.rpartition(cs.SEPARATOR_DOT)
+    close: list[str] = []
+    # Under the project root itself the pool would be the whole project.
+    if parent.startswith(_prefix(project_name)):
+        under = _prefix(parent)
+        rows = fetch_all(
+            cq.CYPHER_GRAPH_DEFINITIONS_UNDER, {cs.KEY_PROJECT_PREFIX: under}
+        )
+        # Scored on the part after the parent: the shared prefix would make
+        # every sibling look close.
+        by_rest = {qn[len(under) :]: qn for r in rows if owns(qn := _text_qn(r))}
+        close = [
+            by_rest[rest]
+            for rest in difflib.get_close_matches(
+                leaf,
+                sorted(by_rest),
+                n=cs.GRAPH_SUGGESTION_LIMIT,
+                cutoff=cs.GRAPH_SUGGESTION_CUTOFF,
+            )
+        ]
+    same_name = (
+        [s["qualified_name"] for s in resolve(fetch_all, project_name, leaf)]
+        if leaf
+        else []
+    )
+    named = [qn for qn in same_name if qn.rpartition(cs.SEPARATOR_DOT)[2] == leaf]
+    return list(dict.fromkeys([*close, *named]))[: cs.GRAPH_SUGGESTION_LIMIT]
+
+
+def did_you_mean(names: Sequence[str]) -> str:
+    """The " Did you mean: ...?" tail of a refusal, or nothing."""
+    if not names:
+        return ""
+    return cs.GRAPH_DID_YOU_MEAN.format(names=cs.SEPARATOR_COMMA_SPACE.join(names))

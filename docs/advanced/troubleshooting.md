@@ -1,0 +1,72 @@
+---
+description: "Troubleshoot common Code-Graph-RAG issues with Memgraph, Ollama, and model configuration."
+---
+
+# Troubleshooting
+
+## pymgclient Build Fails on macOS
+
+When pip has no prebuilt `pymgclient` wheel for your platform it builds from
+source, and the build can fail first on a missing CMake and then on OpenSSL
+headers CMake cannot locate (Homebrew does not put OpenSSL on the default
+search paths). Install the build dependencies and point CMake at Homebrew's
+OpenSSL:
+
+```bash
+brew install cmake pkg-config openssl
+export OPENSSL_ROOT_DIR="$(brew --prefix openssl)"
+export PKG_CONFIG_PATH="$(brew --prefix openssl)/lib/pkgconfig:$PKG_CONFIG_PATH"
+```
+
+Then rerun the install in the same shell. Verified recipe: with those
+variables set, `pip install --no-binary pymgclient pymgclient` builds and
+imports cleanly.
+
+## Check Memgraph Connection
+
+- Ensure Docker containers are running: `cd ~/.cgr && docker compose ps` (the compose file `cgr daemon up` writes lives there), or `cgr daemon status`
+- Verify Memgraph is accessible on port 7687
+
+![docker compose ps in ~/.cgr listing the memgraph, lab and qdrant containers, then cgr daemon status reporting both stores reachable](../assets/demos/troubleshooting-compose-ps.gif)
+
+## View Database in Memgraph Lab
+
+- Open [http://localhost:3000](http://localhost:3000)
+- Connect to `memgraph:7687`
+
+![Memgraph Lab connected to memgraph:7687, drawing the result of MATCH (n)-[r]->(m) RETURN n,r,m LIMIT 60 on the indexed graph](../assets/demos/troubleshooting-memgraph-lab.png)
+
+## Local Model Issues (Ollama)
+
+- Verify Ollama is running: `ollama list`
+- Check if models are downloaded: `ollama pull qwen2.5-coder`
+- Test Ollama API: `curl http://localhost:11434/v1/models`
+- Check Ollama logs: `ollama logs`
+
+## General Checklist
+
+1. Check the logs for error details
+2. Verify Memgraph connection
+3. Ensure all environment variables are set
+4. Review the graph schema matches your expectations
+5. Run `cgr doctor` to validate your setup
+
+![cgr doctor checking Docker, Memgraph, the configured models and ripgrep](../assets/demos/installation-doctor.gif)
+
+## Language Grammar Issues
+
+**Grammar not found**: Use a custom URL:
+
+```bash
+uv run cgr language add-grammar --grammar-url https://github.com/custom/tree-sitter-mylang
+```
+
+**"modifies a code-graph-rag source checkout"**: `add-grammar` and `remove-language` edit a clone of this repository, not your project. Run them with `uv run cgr` inside a clone, or [request the language](https://github.com/vitali87/code-graph-rag/issues).
+
+**Version incompatibility**: Update tree-sitter:
+
+```bash
+uv add tree-sitter@latest
+```
+
+**Missing node types**: Manually adjust the configuration in `codebase_rag/language_spec.py`.

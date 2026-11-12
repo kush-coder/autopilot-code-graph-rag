@@ -1,0 +1,987 @@
+from __future__ import annotations
+
+from collections.abc import Iterator, Mapping
+from functools import lru_cache
+from types import MappingProxyType
+from typing import NamedTuple
+
+from tree_sitter import Node
+
+from ... import constants as cs
+from ...types_defs import PropertyDict
+from ..utils import safe_decode_text
+
+
+def _first_attribute_list(node: Node) -> Node | None:
+    # First attribute_list in document order anywhere under `node` (pre-order
+    # DFS), so an attribute nested in an inner `#if` (a conditional block
+    # inside another) is still found, not only an immediate grandchild.
+    if node.type == cs.TS_CSHARP_ATTRIBUTE_LIST:
+        return node
+    for child in node.children:
+        if (found := _first_attribute_list(child)) is not None:
+            return found
+    return None
+
+
+def definition_start_point(node: Node) -> tuple[int, int]:
+    """The 1-based line and 0-based column a declaration truly starts at.
+
+    When its attributes are wrapped in a conditional-compilation block
+    (`#if SYMBOL [Attr] #endif`), tree-sitter nests a leading
+    preproc_if_in_attribute_list child, so the declaration's own start_point
+    is the `#if` directive line. Roslyn treats the directives as trivia and
+    starts the span at the conditional attribute, so that attribute's point
+    is returned (else the first non-directive child's).
+
+    The line alone is not enough for a caller that pairs the two: taking the
+    line from a nested attribute and the column from the outer node names a
+    point that is nowhere in the source (issue #1071).
+    """
+    for child in node.children:
+        if child.type == cs.TS_CSHARP_PREPROC_IF_IN_ATTR_LIST:
+            if (attr_list := _first_attribute_list(child)) is not None:
+                return attr_list.start_point[0] + 1, attr_list.start_point[1]
+            continue
+        return child.start_point[0] + 1, child.start_point[1]
+    return node.start_point[0] + 1, node.start_point[1]
+
+
+def _normalize_type_name(text: str) -> str:
+    # Strip generic arguments (`List<int>` -> `List`), a nullable suffix
+    # (`Widget?`/`int?` -> the underlying type, so a nullable receiver still
+    # binds), and whitespace, so a parameter signature is stable and matches
+    # the registered, generic-free type names. Array brackets are kept (they
+    # distinguish overloads).
+    normalized: list[str] = []
+    generic_depth = 0
+    for char in text:
+        if char == cs.CHAR_ANGLE_OPEN:
+            generic_depth += 1
+        elif char == cs.CHAR_ANGLE_CLOSE and generic_depth:
+            generic_depth -= 1
+        elif generic_depth == 0:
+            normalized.append(char)
+    return "".join(normalized).strip().rstrip(cs.CHAR_QUESTION_MARK)
+
+
+def strip_generic_arguments(text: str) -> str:
+    """A type path with every segment's generic arguments removed.
+
+    `Lib.Util<int>.Helper<T>` -> `Lib.Util.Helper`: unlike a cut at the
+    first `<`, a generic NON-LEAF segment keeps the segments after it.
+    """
+    out: list[str] = []
+    depth = 0
+    for ch in text:
+        if ch == cs.CHAR_ANGLE_OPEN:
+            depth += 1
+        elif ch == cs.CHAR_ANGLE_CLOSE:
+            depth = max(depth - 1, 0)
+        elif depth == 0:
+            out.append(ch)
+    return "".join(out).replace(" ", "")
+
+
+def leaf_type_segment(text: str) -> str:
+    """The last segment of a type path, split at the last dot OUTSIDE generic
+    arguments: `Lib.Helper<System.String>` -> `Helper<System.String>`, where a
+    plain rsplit would hand back `String>`.
+    """
+    depth = 0
+    cut = -1
+    for index, ch in enumerate(text):
+        if ch == cs.CHAR_ANGLE_OPEN:
+            depth += 1
+        elif ch == cs.CHAR_ANGLE_CLOSE:
+            depth = max(depth - 1, 0)
+        elif ch == cs.SEPARATOR_DOT and depth == 0:
+            cut = index
+    return text[cut + 1 :]
+
+
+def generic_arity_of_type_text(text: str) -> int:
+    # Number of top-level type arguments in a type reference:
+    # `Builder` -> 0, `Builder<T>` -> 1, `Map<K, List<V>>` -> 2. Used to
+    # disambiguate same-simple-name generic/non-generic type declarations.
+    open_idx = text.find(cs.CHAR_ANGLE_OPEN, _type_leaf_start(text))
+    if open_idx < 0:
+        return 0
+    return _count_top_level_type_args(text[open_idx + 1 :])
+
+
+def _type_leaf_start(text: str) -> int:
+    # Index where the last top-level `.`/`::`-separated segment begins, so
+    # `Outer<A>.Inner<B, C>` counts Inner's arguments, not Outer's.
+    leaf_start = 0
+    depth = 0
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char == cs.CHAR_ANGLE_OPEN:
+            depth += 1
+        elif char == cs.CHAR_ANGLE_CLOSE and depth:
+            depth -= 1
+        elif depth == 0:
+            if text.startswith(cs.SEPARATOR_DOUBLE_COLON, index):
+                leaf_start = index + len(cs.SEPARATOR_DOUBLE_COLON)
+                index += len(cs.SEPARATOR_DOUBLE_COLON) - 1
+            elif char == cs.SEPARATOR_DOT:
+                leaf_start = index + 1
+        index += 1
+    return leaf_start
+
+
+def _count_top_level_type_args(args_text: str) -> int:
+    # Comma-separated arguments up to the `>` closing the list `args_text`
+    # opens after; nested `<>`, `()` and `[]` commas are not counted.
+    depth = 0
+    count = 1
+    for ch in args_text:
+        if ch in "<([":
+            depth += 1
+        elif ch in ")]":
+            depth -= 1
+        elif ch == cs.CHAR_ANGLE_CLOSE:
+            if depth == 0:
+                break
+            depth -= 1
+        elif ch == cs.CHAR_COMMA and depth == 0:
+            count += 1
+    return count
+
+
+def type_argument_count(text_after_name: str) -> int:
+    """The type arguments written right after a type name: `<int, T>` -> 2,
+    anything not opening with `<` -> 0."""
+    text = text_after_name.lstrip()
+    if not text.startswith(cs.CHAR_ANGLE_OPEN):
+        return 0
+    return _count_top_level_type_args(text[1:])
+
+
+GENERIC_ARITY_MARKER = cs.CSHARP_GENERIC_ARITY_MARKER
+
+
+def annotate_type_ref(text: str) -> str:
+    # Normalized type reference carrying its WRITTEN generic arity in CLR
+    # style (`Builder<T>` -> "Builder`1", `Builder` -> "Builder"): a plain
+    # name always means arity 0, so simple-name twins stay distinguishable
+    # through every stored type map without touching method signatures.
+    return type_ref(_normalize_type_name(text), generic_arity_of_type_text(text))
+
+
+def array_element_text(type_text: str) -> str | None:
+    """The element type of an array type: `T[]` and `T[,]` give `T`, a
+    jagged `T[][]` gives `T[]`; a type that is no array gives None."""
+    text = type_text.strip().removesuffix(cs.CHAR_QUESTION_MARK)
+    if not text.endswith(cs.CSHARP_ARRAY_RANK_CLOSE):
+        return None
+    element, rank, _ = text.rpartition(cs.CSHARP_ARRAY_RANK_OPEN)
+    if not rank:
+        return None
+    return element.strip() or None
+
+
+def collection_element_text(type_text: str) -> str | None:
+    """The element type a `foreach` over a value of `type_text` binds: an
+    array's element type, and `T` for a known one-argument collection
+    (`List<T>`, `IEnumerable<T>`); anything else gives None (issue #2938)."""
+    if (element := array_element_text(type_text)) is not None:
+        return element
+    text = type_text.strip().removesuffix(cs.CHAR_QUESTION_MARK)
+    head, angle, rest = text.partition(cs.CHAR_ANGLE_OPEN)
+    if (
+        not angle
+        or not rest.endswith(cs.CHAR_ANGLE_CLOSE)
+        or head.strip().rsplit(cs.SEPARATOR_DOT, 1)[-1]
+        not in cs.CSHARP_ENUMERABLE_GENERICS
+        or generic_arity_of_type_text(text) != 1
+    ):
+        return None
+    return rest[: -len(cs.CHAR_ANGLE_CLOSE)].strip() or None
+
+
+def type_ref(name: str, arity: int) -> str:
+    return f"{name}{GENERIC_ARITY_MARKER}{arity}" if arity else name
+
+
+def split_type_ref(name: str) -> tuple[str, int]:
+    if GENERIC_ARITY_MARKER in name:
+        base, _, tail = name.rpartition(GENERIC_ARITY_MARKER)
+        if tail.isdigit():
+            return base, int(tail)
+    return name, 0
+
+
+def normalize_csharp_type_name(type_node: Node) -> str | None:
+    # A type node's normalized name (generic-free, nullable-stripped) or
+    # None for unnameable types (`void` callers never chain off it, but a
+    # void return is recorded harmlessly and simply never resolves).
+    text = safe_decode_text(type_node)
+    return _normalize_type_name(text) if text else None
+
+
+def extract_parameter_type_names(method_node: Node) -> list[str]:
+    # The declared type of each parameter, in order, for the method-qn
+    # signature that keeps C# overloads distinct. A `params object[]` tail is
+    # not wrapped in a `parameter` node (grammar quirk); its `array_type`
+    # sits directly under the parameter_list, so capture that too.
+    param_list = method_node.child_by_field_name(cs.FIELD_PARAMETERS)
+    if param_list is None:
+        return []
+    types: list[str] = []
+    for child in param_list.children:
+        type_node: Node | None = None
+        if child.type == cs.TS_CSHARP_PARAMETER:
+            type_node = child.child_by_field_name(cs.FIELD_TYPE)
+        elif child.type == cs.TS_CSHARP_ARRAY_TYPE:
+            type_node = child
+        if type_node is not None and type_node.text:
+            if name := safe_decode_text(type_node):
+                types.append(_normalize_type_name(name))
+    return types
+
+
+_CSHARP_TYPE_DECLARATIONS = frozenset(
+    {
+        cs.TS_CSHARP_CLASS_DECLARATION,
+        cs.TS_CSHARP_STRUCT_DECLARATION,
+        cs.TS_CSHARP_RECORD_DECLARATION,
+        cs.TS_CSHARP_INTERFACE_DECLARATION,
+        cs.TS_CSHARP_ENUM_DECLARATION,
+    }
+)
+
+
+def _declared_name(node: Node) -> str | None:
+    name_node = node.child_by_field_name(cs.TS_CSHARP_FIELD_NAME)
+    if name_node is None or not name_node.text:
+        return None
+    return safe_decode_text(name_node)
+
+
+def _file_scoped_namespace(unit: Node) -> str | None:
+    # A file-scoped `namespace N;` is a SIBLING of the declarations it
+    # governs under the compilation unit, not their ancestor.
+    for child in unit.children:
+        if child.type == cs.TS_CSHARP_FILE_SCOPED_NAMESPACE_DECLARATION:
+            return _declared_name(child)
+    return None
+
+
+def _scope_of(node: Node) -> tuple[bool, str] | None:
+    # (is namespace, name) when `node` is a scope the qualified name walks.
+    if node.type == cs.TS_CSHARP_NAMESPACE_DECLARATION:
+        name = _declared_name(node)
+        return (True, name) if name else None
+    if node.type in _CSHARP_TYPE_DECLARATIONS:
+        name = _declared_name(node)
+        return (False, name) if name else None
+    if node.type == cs.TS_CSHARP_COMPILATION_UNIT:
+        name = _file_scoped_namespace(node)
+        return (True, name) if name else None
+    return None
+
+
+def _enclosing_scopes(node: Node) -> tuple[list[str], list[str]]:
+    # (namespace segments, enclosing type names) of `node`, outermost first.
+    # Block namespaces are ancestors and nest; the file-scoped one is read
+    # from the compilation unit.
+    namespaces: list[str] = []
+    types: list[str] = []
+    current = node.parent
+    while current is not None:
+        scope = _scope_of(current)
+        if scope is not None:
+            (namespaces if scope[0] else types).append(scope[1])
+        current = current.parent
+    namespaces.reverse()
+    types.reverse()
+    return namespaces, types
+
+
+def declared_namespace(node: Node) -> str | None:
+    """The dotted namespace `node` is declared in, or None at the top level."""
+    namespaces, _types = _enclosing_scopes(node)
+    return cs.SEPARATOR_DOT.join(namespaces) if namespaces else None
+
+
+def namespace_qualified_name(type_node: Node) -> str | None:
+    """`N1.Outer.Widget` for a type declaration: namespace, enclosing types,
+    own name. Read from the declaration rather than the qualified name,
+    because a namespace the module's directory already spells is not in the
+    qn (issue #1629). None for a declaration with no name: its enclosing
+    path alone would be the key of the type that encloses it (bot review)."""
+    own = _declared_name(type_node)
+    if not own:
+        return None
+    namespaces, types = _enclosing_scopes(type_node)
+    return cs.SEPARATOR_DOT.join([*namespaces, *types, own])
+
+
+def type_parameter_count(type_node: Node) -> int:
+    """How many type parameters a type declares: `Builder<TResult>` -> 1.
+
+    A type's type_parameter_list carries no field name (unlike a method's),
+    so the children are scanned.
+    """
+    for child in type_node.children:
+        if child.type == cs.TS_CSHARP_TYPE_PARAMETER_LIST:
+            return len(child.named_children)
+    return 0
+
+
+def arity_qualified_name(type_node: Node, name: str) -> str:
+    """The qualified-name segment of a type declaration written as `name`.
+
+    C# overloads a type name by generic arity: `PB` and `PB<TResult>` are two
+    types, `PB` and ``PB`1`` in CLR metadata. A generic declaration whose
+    scope also declares its name at another arity takes that CLR spelling,
+    so each twin has a name of its own that an edit moving lines cannot
+    change (issue #2579). Every other declaration keeps the written name, so
+    a type with no such twin is named as it always was.
+    """
+    arity = type_parameter_count(type_node)
+    if not arity:
+        return name
+    root = type_node
+    while root.parent is not None:
+        root = root.parent
+    return type_ref(name, arity) if type_node.id in _arity_twin_ids(root) else name
+
+
+@lru_cache(maxsize=cs.CSHARP_ARITY_TWIN_CACHE_SIZE)
+def _arity_twin_ids(root: Node) -> frozenset[int]:
+    # The generic type declarations of one file whose scope declares their
+    # name at another arity too. A scope is keyed by what the qualified name
+    # is built from, namespaces segment by segment and each enclosing type by
+    # its CLR name, so two blocks of one namespace are one scope exactly when
+    # their types' qualified names would collide.
+    by_name: dict[tuple[tuple[str, ...], str], dict[int, list[int]]] = {}
+    file_namespace = _file_scoped_namespace(root)
+    top = tuple(file_namespace.split(cs.SEPARATOR_DOT)) if file_namespace else ()
+    stack: list[tuple[Node, tuple[str, ...]]] = [(root, top)]
+    while stack:
+        node, scope = stack.pop()
+        for child in node.children:
+            child_scope = _declaration_scope(child, scope, by_name)
+            if child_scope is not None:
+                stack.append((child, child_scope))
+    return frozenset(
+        node_id
+        for arities in by_name.values()
+        if len(arities) > 1
+        for arity, node_ids in arities.items()
+        if arity
+        for node_id in node_ids
+    )
+
+
+def _declaration_scope(
+    child: Node,
+    scope: tuple[str, ...],
+    by_name: dict[tuple[tuple[str, ...], str], dict[int, list[int]]],
+) -> tuple[str, ...] | None:
+    # The scope the declarations inside `child` sit in, or None when it holds
+    # none. A type declaration is first recorded in `by_name` under its scope,
+    # name and arity.
+    if child.type in _CSHARP_TYPE_DECLARATIONS:
+        name = _declared_name(child)
+        if not name:
+            return None
+        arity = type_parameter_count(child)
+        by_name.setdefault((scope, name), {}).setdefault(arity, []).append(child.id)
+        return (*scope, type_ref(name, arity))
+    if child.type == cs.TS_CSHARP_NAMESPACE_DECLARATION:
+        name = _declared_name(child)
+        return (*scope, *name.split(cs.SEPARATOR_DOT)) if name else None
+    if child.type in cs.CSHARP_TYPE_DECLARATION_HOLDERS:
+        return scope
+    return None
+
+
+def unique_carrier(
+    carriers: set[str] | None, partial_groups: dict[str, list[str]]
+) -> str | None:
+    """The one class a declared name (`N.Widget`) names, or None.
+
+    Several carriers are either the parts of ONE partial type, any of which
+    spans the group, or two independent projects that each declare the name
+    in their own directory; the latter must not be merged across assembly
+    boundaries, so it is left unresolved like every other ambiguity here
+    (bot review on #1999).
+    """
+    if not carriers:
+        return None
+    if len(carriers) == 1:
+        return next(iter(carriers))
+    ordered = sorted(carriers)
+    group = partial_groups.get(ordered[0])
+    if group is not None and all(partial_groups.get(qn) is group for qn in ordered):
+        return ordered[0]
+    return None
+
+
+def extension_receiver_type(method_node: Node) -> str | None:
+    # For an extension method, the normalized type of its receiver: the first
+    # parameter, whose first modifier is `this` (`static int WordCount(this
+    # string s)` -> "string"). Only extension methods carry `this` on a
+    # parameter, so its presence both identifies the method and names the
+    # receiver type a call binds against (`s.WordCount()`). Returns None for a
+    # non-extension method.
+    param_list = method_node.child_by_field_name(cs.FIELD_PARAMETERS)
+    if param_list is None:
+        return None
+    first = next(
+        (c for c in param_list.children if c.type == cs.TS_CSHARP_PARAMETER), None
+    )
+    if first is None:
+        return None
+    has_this = any(
+        c.type == cs.TS_CSHARP_MODIFIER and safe_decode_text(c) == cs.TS_CSHARP_THIS
+        for c in first.children
+    )
+    if not has_this:
+        return None
+    type_node = first.child_by_field_name(cs.FIELD_TYPE)
+    name = safe_decode_text(type_node) if type_node and type_node.text else None
+    return annotate_type_ref(name) if name else None
+
+
+def index_extension_method(
+    store: dict[str, list[tuple[str, str, str, int]]],
+    ingested_qn: str,
+    method_node: Node,
+) -> None:
+    # Index an extension method by simple name + receiver type + declaring
+    # namespace so a `recv.Ext()` call binds to the static method even though it
+    # lives on an unrelated static class (not in recv's hierarchy). Shared by the
+    # class-member pass and the `#if`-truncation recovery so both stay in sync.
+    # No-op for a non-extension method (no `this` receiver).
+    if (facts := extension_method_facts(method_node)) is not None:
+        add_extension_method(store, ingested_qn, *facts)
+
+
+def add_extension_method(
+    store: dict[str, list[tuple[str, str, str, int]]],
+    ingested_qn: str,
+    receiver_type: str,
+    ext_namespace: str,
+    receiver_arity: int,
+) -> None:
+    # Strip the parameter signature BEFORE taking the leaf: a qualified param
+    # type (`Poke(N2.Widget)`) contains dots, so an rsplit-then-strip would key
+    # on `Widget)` instead of the method name `Poke` and never match.
+    leaf = ingested_qn.split(cs.CHAR_PAREN_OPEN, 1)[0].rsplit(cs.SEPARATOR_DOT, 1)[-1]
+    store.setdefault(leaf, []).append(
+        (ingested_qn, receiver_type, ext_namespace, receiver_arity)
+    )
+
+
+def extension_method_props(method_node: Node) -> PropertyDict:
+    # The index entry's facts, on the Method node: an incremental run that
+    # does not re-parse the declaring file reads them back (issue #3275).
+    if (facts := extension_method_facts(method_node)) is None:
+        return {}
+    receiver_type, ext_namespace, receiver_arity = facts
+    props: PropertyDict = {cs.KEY_EXTENSION_RECEIVER: receiver_type}
+    if ext_namespace:
+        props[cs.KEY_EXTENSION_NAMESPACE] = ext_namespace
+    if receiver_arity:
+        props[cs.KEY_EXTENSION_RECEIVER_ARITY] = receiver_arity
+    return props
+
+
+def extension_method_facts(method_node: Node) -> tuple[str, str, int] | None:
+    # (receiver type, declaring namespace, receiver generic arity) of an
+    # extension method, or None for any other method.
+    receiver_type = extension_receiver_type(method_node)
+    if not receiver_type:
+        return None
+    # The receiver's WRITTEN generic arity (`this Builder<TResult>` -> 1),
+    # so a call receiver of known arity never binds an extension declared
+    # for the other twin.
+    receiver_arity = 0
+    param_list = method_node.child_by_field_name(cs.FIELD_PARAMETERS)
+    if param_list is not None:
+        first = next(
+            (c for c in param_list.children if c.type == cs.TS_CSHARP_PARAMETER), None
+        )
+        if first is not None:
+            type_node = first.child_by_field_name(cs.FIELD_TYPE)
+            raw = safe_decode_text(type_node) if type_node is not None else None
+            if raw:
+                receiver_arity = generic_arity_of_type_text(raw)
+    # The extension's declaring namespace (its class's namespace-qualified name
+    # minus the class leaf) so an unqualified `this Widget` can resolve to
+    # `<namespace>.Widget` against a qualified call receiver. Empty for a
+    # top-level (namespace-less) class. Read from the declaration: the qn no
+    # longer carries a namespace the directory spells (issue #1629).
+    namespaces, enclosing_types = _enclosing_scopes(method_node)
+    ext_namespace = cs.SEPARATOR_DOT.join([*namespaces, *enclosing_types[:-1]])
+    return receiver_type, ext_namespace, receiver_arity
+
+
+def _property_field(member: Node) -> tuple[str, str] | None:
+    """(name, annotated type) for a property declaration, or None if either is absent."""
+    name = safe_decode_text(member.child_by_field_name(cs.FIELD_NAME))
+    type_text = safe_decode_text(member.child_by_field_name(cs.FIELD_TYPE))
+    if not name or not type_text:
+        return None
+    return name, annotate_type_ref(type_text)
+
+
+def _declared_fields(member: Node) -> list[tuple[str, str]]:
+    """(name, annotated type) for every declarator of one field declaration.
+
+    `private Widget _a, _b;` declares two names sharing one type.
+    """
+    var_decl = next(
+        (c for c in member.children if c.type == cs.TS_CSHARP_VARIABLE_DECLARATION),
+        None,
+    )
+    if var_decl is None:
+        return []
+    type_text = safe_decode_text(var_decl.child_by_field_name(cs.FIELD_TYPE))
+    if not type_text:
+        return []
+    annotated = annotate_type_ref(type_text)
+    declared: list[tuple[str, str]] = []
+    for declarator in var_decl.children:
+        if declarator.type != cs.TS_CSHARP_VARIABLE_DECLARATOR:
+            continue
+        name = safe_decode_text(declarator.child_by_field_name(cs.FIELD_NAME))
+        if name:
+            declared.append((name, annotated))
+    return declared
+
+
+def build_field_type_map(class_node: Node) -> dict[str, str]:
+    # {field-or-property name: type name} for members declared directly on
+    # this class body, recorded at ingestion so a receiver typed to a field
+    # (`_w.M()`) resolves, including a field inherited from a base class in
+    # another file, reached by walking class_inheritance over these maps.
+    body = class_node.child_by_field_name(cs.FIELD_BODY)
+    if body is None:
+        return {}
+    fields: dict[str, str] = {}
+    for member in body.children:
+        if member.type == cs.TS_CSHARP_PROPERTY_DECLARATION:
+            if (prop := _property_field(member)) is not None:
+                fields[prop[0]] = prop[1]
+        elif member.type == cs.TS_CSHARP_FIELD_DECLARATION:
+            fields.update(_declared_fields(member))
+    return fields
+
+
+def _operator_name(method_node: Node) -> str | None:
+    """`operator_<symbol>` / `operator_<target-type>`, or None for a non-operator.
+
+    Operators expose no `name` field, so the leaf is synthesized from the
+    `operator` field (binary and unary) or the `type` field (conversion).
+    """
+    if method_node.type == cs.TS_CSHARP_OPERATOR_DECLARATION:
+        field = cs.TS_CSHARP_FIELD_OPERATOR
+    elif method_node.type == cs.TS_CSHARP_CONVERSION_OPERATOR_DECLARATION:
+        field = cs.TS_CSHARP_FIELD_TYPE
+    else:
+        return None
+    node = method_node.child_by_field_name(field)
+    symbol = safe_decode_text(node) if node is not None and node.text else None
+    return cs.TS_CSHARP_OPERATOR_NAME_PREFIX + symbol if symbol else None
+
+
+def synthesize_method_name(method_node: Node) -> str | None:
+    # The registered leaf name for a C# member. Operators are synthesized (see
+    # _operator_name). A destructor HAS a `name` field equal to the type name,
+    # which would collide with the constructor, so prefix `~`. Everything else
+    # uses the plain `name` leaf. Kept identical to _csharp_get_name so the FQN
+    # scope walk and the node qn agree.
+    if method_node.type in (
+        cs.TS_CSHARP_OPERATOR_DECLARATION,
+        cs.TS_CSHARP_CONVERSION_OPERATOR_DECLARATION,
+    ):
+        return _operator_name(method_node)
+    name_node = method_node.child_by_field_name(cs.FIELD_NAME)
+    name = safe_decode_text(name_node) if name_node and name_node.text else None
+    if name and method_node.type == cs.TS_CSHARP_DESTRUCTOR_DECLARATION:
+        return cs.TS_CSHARP_DESTRUCTOR_NAME_PREFIX + name
+    # A reserved keyword as the name means tree-sitter parse-recovered a broken
+    # construct (e.g. a `#if`-split `else if` chain -> local_function named
+    # `if`); it is never a real member, so drop it rather than pollute the graph.
+    if name in cs.CSHARP_RESERVED_KEYWORDS:
+        return None
+    return name
+
+
+def extract_method_signature(method_node: Node) -> tuple[str | None, list[str]]:
+    # (method name, parameter type names). The name matches the leaf
+    # ingest_method registers (synthesized for operators/destructors), so the
+    # signatured qn stays consistent. Overloaded operators (`operator +` on
+    # two operand types) still get distinct qns via the parameter signature.
+    return synthesize_method_name(method_node), extract_parameter_type_names(
+        method_node
+    )
+
+
+# --- value names at a call site --------------------------------------------
+#
+# Whether a C# name at a call site can name a value (issue #2517).
+#
+# `Util.Ext(s, 1)` calls an extension method through its class and passes the
+# receiver as an argument; `Util.Ext(1, 2)` with a local `string Util` takes
+# the receiver from the left of the dot. Only the bindings around the call
+# tell the two apart, so the structural delta never counts the receiver
+# twice, or not at all, on a valid call.
+#
+# Read syntactically, and per scope once: the parameters, locals, pattern,
+# `foreach`, `catch`, lambda and query variables of the type member holding
+# the call, and the fields, properties and primary-constructor parameters of
+# every enclosing type. A binder counts only at a call its scope holds, so a
+# local in a sibling block leaves `Util` naming the class. An inherited
+# member or one in another partial part does not count either, and the
+# caller reads that name as undecided rather than as a class.
+
+# Nodes whose `name` child binds a value.
+_NAME_BINDERS = frozenset(
+    {
+        cs.TS_CSHARP_VARIABLE_DECLARATOR,
+        cs.TS_CSHARP_PARAMETER,
+        cs.TS_CSHARP_DECLARATION_PATTERN,
+        cs.TS_CSHARP_RECURSIVE_PATTERN,
+        cs.TS_CSHARP_DECLARATION_EXPRESSION,
+        cs.TS_CSHARP_CATCH_DECLARATION,
+        cs.TS_CSHARP_PROPERTY_DECLARATION,
+        cs.TS_CSHARP_FROM_CLAUSE,
+        cs.TS_CSHARP_TUPLE_PATTERN,
+        # A `params T[] xs` tail sits in the list itself, not in a `parameter`.
+        cs.TS_CSHARP_PARAMETER_LIST,
+    }
+)
+# Query clauses whose range variable has no `name` field: `let y = ...`,
+# `join z in zs ...` and `... into g`.
+_UNNAMED_QUERY_BINDERS = frozenset(
+    {cs.TS_CSHARP_LET_CLAUSE, cs.TS_CSHARP_JOIN_CLAUSE, cs.TS_CSHARP_JOIN_INTO_CLAUSE}
+)
+_TYPE_DECLARATIONS = frozenset(
+    {
+        cs.TS_CSHARP_CLASS_DECLARATION,
+        cs.TS_CSHARP_STRUCT_DECLARATION,
+        cs.TS_CSHARP_RECORD_DECLARATION,
+        cs.TS_CSHARP_INTERFACE_DECLARATION,
+    }
+)
+_FIELD_DECLARATIONS = frozenset(
+    {cs.TS_CSHARP_FIELD_DECLARATION, cs.TS_CSHARP_EVENT_FIELD_DECLARATION}
+)
+# Nodes that bound the scope of the names bound inside them, after the local
+# variable declaration spaces of ECMA-334 §7.3: a block, switch block,
+# catch clause, iteration statement and `using` statement each make one. A
+# binder under none is in scope across its member. An `if` or a `lock` is
+# not one: `if (o is not string s) return;` keeps `s` in scope in the
+# enclosing block. A switch section's statements share its switch body's
+# scope.
+_VALUE_SCOPES = frozenset(
+    {
+        cs.TS_CSHARP_BLOCK,
+        cs.TS_CSHARP_FOR_STATEMENT,
+        cs.TS_CSHARP_FOREACH_STATEMENT,
+        cs.TS_CSHARP_USING_STATEMENT,
+        cs.TS_CSHARP_CATCH_CLAUSE,
+        cs.TS_CSHARP_WHILE_STATEMENT,
+        cs.TS_CSHARP_DO_STATEMENT,
+        cs.TS_CSHARP_FIXED_STATEMENT,
+        cs.TS_CSHARP_SWITCH_BODY,
+        cs.TS_CSHARP_SWITCH_EXPRESSION_ARM,
+        cs.TS_CSHARP_QUERY_EXPRESSION,
+        *cs.TS_CSHARP_NESTED_SCOPE_TYPES,
+    }
+)
+# Statements whose embedded statement, not being part of a statement list,
+# is a scope of its own (§7.3): `if (c) M(o is string s);` binds `s` there.
+_EMBEDDING_STATEMENTS = frozenset(
+    {cs.TS_CSHARP_IF_STATEMENT, cs.TS_CSHARP_LOCK_STATEMENT}
+)
+# The scans hold a few trees' nodes at most: one file is parsed at a time.
+_SCOPE_CACHE_SIZE = 64
+# Query clauses that declare a range variable of their own.
+_QUERY_CLAUSES = frozenset(
+    {cs.TS_CSHARP_FROM_CLAUSE, cs.TS_CSHARP_LET_CLAUSE, cs.TS_CSHARP_JOIN_CLAUSE}
+)
+# `join z in zs on x equals z`: past its variable, a join holds its source,
+# then the outer and the inner key; any other count is a malformed parse.
+_JOIN_PARTS = 3
+
+
+class _Binder(NamedTuple):
+    """A binder of a value name and the bytes its name is in scope over."""
+
+    node: Node
+    start: int
+    end: int
+
+
+def _text(node: Node | None) -> str | None:
+    return safe_decode_text(node) if node is not None else None
+
+
+def _binding(node: Node) -> str | None:
+    """The name `node` binds as a value, if it is a binding position."""
+    if node.type == cs.TS_CSHARP_IMPLICIT_PARAMETER:
+        return _text(node)
+    parent = node.parent
+    if node.type != cs.TS_CSHARP_IDENTIFIER or parent is None:
+        return None
+    return _text(node) if _binds_as_name(node, parent) else None
+
+
+def _binds_as_name(node: Node, parent: Node) -> bool:
+    if parent.type in _NAME_BINDERS:
+        # A deconstruction `var (a, b)` names each of its elements.
+        return node in parent.children_by_field_name(cs.FIELD_NAME)
+    if parent.type == cs.TS_CSHARP_FOREACH_STATEMENT:
+        return node == parent.child_by_field_name(cs.FIELD_LEFT)
+    if parent.type in _UNNAMED_QUERY_BINDERS:
+        written = parent.child_by_field_name(cs.FIELD_TYPE)
+        first = next(
+            (
+                c
+                for c in parent.named_children
+                if c.type == cs.TS_CSHARP_IDENTIFIER and c != written
+            ),
+            None,
+        )
+        return node == first
+    # A query continuation's variable sits in the query itself: `into g`.
+    return parent.type == cs.TS_CSHARP_QUERY_EXPRESSION
+
+
+@lru_cache(maxsize=_SCOPE_CACHE_SIZE)
+def _member_binders(member: Node) -> Mapping[str, tuple[_Binder, ...]]:
+    """Every value name bound inside one type member, nested types aside:
+    each binder of it, with the bytes of the scope nearest that binder."""
+    binders: dict[str, list[_Binder]] = {}
+    stack = [(member, member)]
+    while stack:
+        node, scope = stack.pop()
+        if (name := _binding(node)) is not None:
+            start, end = _query_span(node) or (scope.start_byte, scope.end_byte)
+            binders.setdefault(name, []).append(_Binder(node, start, end))
+        inner = node if node.type in _VALUE_SCOPES else scope
+        stack.extend(
+            (child, _child_scope(node, child, inner))
+            for child in node.named_children
+            if child.type not in _TYPE_DECLARATIONS
+        )
+    return MappingProxyType({name: tuple(found) for name, found in binders.items()})
+
+
+def _child_scope(node: Node, child: Node, inner: Node) -> Node:
+    """The scope `child` binds into, `inner` being the one inside `node`.
+
+    A `foreach` variable is in scope in the loop's body alone, so the
+    collection `foreach (var x in x.All())` still reads the outer `x`. An
+    embedded statement of an `if` or a `lock` is its own. A case label's
+    pattern and `when` guard bind into their switch section alone, while
+    the section's statements bind into the switch body (§7.3).
+    """
+    if (
+        node.type == cs.TS_CSHARP_FOREACH_STATEMENT
+        and child == node.child_by_field_name(cs.FIELD_LEFT)
+    ):
+        body = node.child_by_field_name(cs.FIELD_BODY)
+        return body if body is not None else child
+    if node.type in _EMBEDDING_STATEMENTS and (
+        child.type == cs.TS_CSHARP_BLOCK
+        or child.type.endswith(cs.CSHARP_STATEMENT_SUFFIX)
+    ):
+        return child
+    if node.type == cs.TS_CSHARP_SWITCH_SECTION and (
+        child.type == cs.TS_CSHARP_WHEN_CLAUSE
+        or child.type.endswith(cs.CSHARP_PATTERN_SUFFIX)
+    ):
+        return node
+    return inner
+
+
+def _query_clause(binder: Node) -> Node | None:
+    """The child of its query that declares the range variable `binder`."""
+    parent = binder.parent
+    if parent is None:
+        return None
+    if parent.type == cs.TS_CSHARP_QUERY_EXPRESSION:
+        return binder
+    if parent.type == cs.TS_CSHARP_JOIN_INTO_CLAUSE:
+        return parent.parent
+    return parent if parent.type in _QUERY_CLAUSES else None
+
+
+def _join_inner_key(join: Node, binder: Node) -> Node | None:
+    written = join.child_by_field_name(cs.FIELD_TYPE)
+    parts = [
+        c
+        for c in join.named_children
+        if c not in (written, binder) and c.type != cs.TS_CSHARP_JOIN_INTO_CLAUSE
+    ]
+    return parts[-1] if len(parts) == _JOIN_PARTS else None
+
+
+def _query_span(binder: Node) -> tuple[int, int] | None:
+    """The bytes a query's range variable is in scope over: the clauses
+    after the one declaring it, up to the next continuation (`... into g`),
+    which starts afresh. The declaring clause itself is not, so the source
+    of `from x in x.All()` still reads the outer `x` (bot review on PR
+    #2990). A `join` variable is in scope from its `equals` key on, and only
+    there when the join ends `into` a group."""
+    clause = _query_clause(binder)
+    query = clause.parent if clause is not None else None
+    if clause is None or query is None or query.type != cs.TS_CSHARP_QUERY_EXPRESSION:
+        return None
+    start = clause.end_byte
+    if clause.type == cs.TS_CSHARP_JOIN_CLAUSE and binder.parent == clause:
+        key = _join_inner_key(clause, binder)
+        if key is not None:
+            if _first_named_child(clause, cs.TS_CSHARP_JOIN_INTO_CLAUSE) is not None:
+                return key.start_byte, key.end_byte
+            start = key.start_byte
+    end = next(
+        (
+            c.start_byte
+            for c in query.named_children
+            if c.type == cs.TS_CSHARP_IDENTIFIER and c.start_byte >= clause.end_byte
+        ),
+        query.end_byte,
+    )
+    return start, end
+
+
+def _holds(start: int, end: int, site: Node) -> bool:
+    return start <= site.start_byte and site.end_byte <= end
+
+
+def _member_binds(member: Node, name: str, site: Node) -> bool:
+    """Whether a binder of `name` in `member` is in scope at `site`."""
+    return any(
+        _holds(binder.start, binder.end, site)
+        for binder in _member_binders(member).get(name, ())
+    )
+
+
+def _value_member(site: Node) -> Node | None:
+    """The type member holding `site`, the file's root for a top-level
+    statement, or None in a type's own header."""
+    child, current = site, site.parent
+    while current is not None:
+        if current.type in _TYPE_DECLARATIONS:
+            return None
+        if (
+            current.type == cs.TS_CSHARP_DECLARATION_LIST
+            and current.parent is not None
+            and current.parent.type in _TYPE_DECLARATIONS
+        ):
+            return child
+        child, current = current, current.parent
+    return child
+
+
+def _innermost(found: tuple[_Binder, ...], site: Node) -> Node | None:
+    nearest: _Binder | None = None
+    for candidate in found:
+        if _holds(candidate.start, candidate.end, site) and (
+            nearest is None
+            or (nearest.start <= candidate.start and candidate.end <= nearest.end)
+        ):
+            nearest = candidate
+    return nearest.node if nearest is not None else None
+
+
+def value_binders_at(site: Node) -> dict[str, Node]:
+    """The innermost binder in scope at `site` of each value name that the
+    member holding it binds: a parameter, a local, or a `foreach`, pattern,
+    out, deconstruction, `catch`, lambda or query variable (bot review on PR
+    #2990). A field of the type is not among them."""
+    member = _value_member(site)
+    if member is None:
+        return {}
+    binders = {
+        name: _innermost(found, site) for name, found in _member_binders(member).items()
+    }
+    return {name: binder for name, binder in binders.items() if binder is not None}
+
+
+def value_binder_at(site: Node, name: str) -> Node | None:
+    """The innermost binder of `name` in scope at `site`, as in
+    `value_binders_at`."""
+    member = _value_member(site)
+    if member is None:
+        return None
+    return _innermost(_member_binders(member).get(name, ()), site)
+
+
+def _first_named_child(node: Node, node_type: str) -> Node | None:
+    return next((c for c in node.named_children if c.type == node_type), None)
+
+
+def _primary_parameters(type_node: Node) -> Node | None:
+    """A type's primary-constructor parameter list, if it declares one."""
+    params = type_node.child_by_field_name(cs.FIELD_PARAMETERS)
+    if params is None:
+        params = _first_named_child(type_node, cs.TS_CSHARP_PARAMETER_LIST)
+    return params
+
+
+def _declarator_names(field: Node) -> Iterator[str | None]:
+    """The name of each declarator of a field or event field declaration."""
+    for declaration in field.named_children:
+        if declaration.type == cs.TS_CSHARP_VARIABLE_DECLARATION:
+            yield from (
+                _text(declarator.child_by_field_name(cs.FIELD_NAME))
+                for declarator in declaration.named_children
+                if declarator.type == cs.TS_CSHARP_VARIABLE_DECLARATOR
+            )
+
+
+def _value_names(member: Node) -> Iterator[str | None]:
+    """The value names a primary-constructor parameter or type member declares."""
+    if member.type in (cs.TS_CSHARP_PARAMETER, cs.TS_CSHARP_PROPERTY_DECLARATION):
+        yield _text(member.child_by_field_name(cs.FIELD_NAME))
+    elif member.type in _FIELD_DECLARATIONS:
+        yield from _declarator_names(member)
+
+
+@lru_cache(maxsize=_SCOPE_CACHE_SIZE)
+def _type_values(type_node: Node) -> frozenset[str]:
+    """The fields, properties and primary-constructor parameters of a type."""
+    params = _primary_parameters(type_node)
+    members = _first_named_child(type_node, cs.TS_CSHARP_DECLARATION_LIST)
+    candidates = [
+        *(params.named_children if params is not None else ()),
+        *(members.named_children if members is not None else ()),
+    ]
+    return frozenset(
+        name for member in candidates for name in _value_names(member) if name
+    )
+
+
+def binds_value(site: Node, name: str) -> bool:
+    """Whether `name` at `site` may name a parameter, local or member value."""
+    child: Node = site
+    current = site.parent
+    top_level = False
+    while current is not None:
+        if current.type in _TYPE_DECLARATIONS:
+            if name in _type_values(current):
+                return True
+        elif (
+            current.type == cs.TS_CSHARP_DECLARATION_LIST
+            and child.type not in _TYPE_DECLARATIONS
+            and current.parent is not None
+            and current.parent.type in _TYPE_DECLARATIONS
+            and _member_binds(child, name, site)
+        ):
+            return True
+        top_level = top_level or current.type == cs.TS_CSHARP_GLOBAL_STATEMENT
+        child, current = current, current.parent
+    # Top-level statements share their outermost locals across the file.
+    return top_level and _member_binds(child, name, site)

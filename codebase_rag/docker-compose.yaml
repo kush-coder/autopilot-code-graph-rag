@@ -34,7 +34,7 @@ services:
     # ran different servers, and resolving the tag needs a Docker Hub
     # manifest request the pull rate limit can refuse (issue #2409).
     # Dependabot proposes bumps.
-    image: memgraph/lab:3.14.1@sha256:ac7369540cdf39a40167d55279cbee52952c117df75f0c083612ab3663210442
+    image: memgraph/lab:3.14.3@sha256:0d3fa0897b92247532fd6664aae00d7bddf8af77626f24915dd4c9c406899336
     ports:
       - "${CGR_STACK_BIND_HOST:-127.0.0.1}:${LAB_PORT:-3000}:3000"
     environment:
